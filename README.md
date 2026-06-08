@@ -1,6 +1,14 @@
 ![Isaac Sim](docs/readme/hero_shot_compressed.png)
 
 ---
+
+> ### 🤖 This fork adds VR humanoid control for the H1 robot
+> **Headset gait detection · Eye-level first-person camera · OpenXR hand tracking · Behavioral data logger for AI/RL training**
+>
+> 📄 **[See HUMANOID_VR_CONTROL.md for full setup and usage →](HUMANOID_VR_CONTROL.md)**
+
+---
+
 # Isaac Sim
 
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://docs.python.org/3/whatsnew/3.12.html)
