@@ -119,13 +119,23 @@ class HumanoidExample(BaseSample):
         self._first_person_head_up_offset = -0.10     # pull camera down from head prim to eye level
         self._first_person_head_fallback_height = 1.55  # H1 eye height above robot base (~1.55 m)
         self._first_person_head_target_distance = 1.8
-        # Tracking data collection
-        self._tracking_data_enabled = True
-        self._tracking_data_records = []
-        self._tracking_data_step_counter = 0
-        self._tracking_data_log_every_n_steps = 4    # log at ~50 Hz (200 Hz / 4)
-        self._tracking_data_output_dir = Path.home() / "isaac_tracking_data"
-        self._last_headset_raw_position = None       # Gf.Vec3d updated each step from pose reader
+        # Headset velocity and horizontal-motion tracking (gait gate)
+        self._last_headset_raw_position = None       # Gf.Vec3d: position from pose reader
+        self._last_headset_pose_matrix = None        # Gf.Matrix4d: full pose for orientation logging
+        self._headset_prev_position = None           # position from previous step for velocity
+        self._headset_velocity = Gf.Vec3d(0.0, 0.0, 0.0)
+        self._headset_velocity_filter_time = 0.10    # low-pass time constant (s)
+        self._headset_horiz_speed = 0.0              # floor-plane speed magnitude (m/s)
+        self._headset_gait_min_horiz_speed = 0.025   # m/s threshold: suppress gait below this
+        self._headset_gait_horiz_gate = 0.0          # 0-1 multiplier applied to gait output
+        self._headset_gait_step_event = False        # True for one sample when step fires
+        # Behavioral data collection for AI/RL training
+        self._behavioral_data_enabled = True
+        self._behavioral_data_records = []
+        self._behavioral_data_step_counter = 0
+        self._behavioral_data_log_every_n_steps = 2  # ~100 Hz (200 Hz / 2)
+        self._behavioral_data_output_dir = Path.home() / "BehavioralCollection"
+        self._behavioral_dof_names = []              # populated on first sample
         self._head_camera_update_counter = 0
         self._head_camera_update_interval = 1
         self._hand_tracking_arm_control_enabled = True
@@ -619,9 +629,11 @@ class HumanoidExample(BaseSample):
         self._smoothed_arm_rig_targets = {}
         self._active_h1_hand_target_matrices = {}
         self._reset_headset_gait_state()
-        self._tracking_data_records = []
-        self._tracking_data_step_counter = 0
+        self._behavioral_data_records = []
+        self._behavioral_data_step_counter = 0
+        self._behavioral_dof_names = []
         self._last_headset_raw_position = None
+        self._last_headset_pose_matrix = None
 
         torch = import_module("torch")
         self._base_command = torch.tensor([0.0, 0.0, 0.0], device="cuda")
@@ -658,7 +670,7 @@ class HumanoidExample(BaseSample):
 
         self._event_timer_callback = None
         self._unsubscribe_keyboard()
-        self._save_tracking_data()
+        self._save_behavioral_data()
         self.h1 = None
         self._physics_ready = False
         self._restore_physics_simulation_state()
@@ -688,7 +700,7 @@ class HumanoidExample(BaseSample):
             self._update_h1_arms_from_hand_tracking()
             self._update_h1_attached_hands()
             self._update_head_camera_view()
-            self._collect_tracking_sample()
+            self._collect_behavioral_sample()
         else:
             # First physics step after play - initialize the robot
             self._physics_ready = True
@@ -890,6 +902,11 @@ class HumanoidExample(BaseSample):
         self._headset_gait_last_step_time = -999.0
         self._headset_gait_pulse_time_remaining = 0.0
         self._headset_gait_output = 0.0
+        self._headset_prev_position = None
+        self._headset_velocity = Gf.Vec3d(0.0, 0.0, 0.0)
+        self._headset_horiz_speed = 0.0
+        self._headset_gait_horiz_gate = 0.0
+        self._headset_gait_step_event = False
 
     def _get_xr_up_vector(self) -> Gf.Vec3d:
         """Return the XR coordinate system up vector, falling back to the USD Z axis."""
@@ -939,6 +956,7 @@ class HumanoidExample(BaseSample):
                     pose = pose_reader(pose_name) if pose_name else pose_reader()
                     position = pose.ExtractTranslation()
                     self._last_headset_raw_position = Gf.Vec3d(position)
+                    self._last_headset_pose_matrix = Gf.Matrix4d(pose)
                     if not self._headset_gait_status_logged:
                         self._headset_gait_status_logged = True
                         carb.log_info(
@@ -960,6 +978,7 @@ class HumanoidExample(BaseSample):
                     pose = pose_reader(pose_name) if pose_name else pose_reader()
                     position = pose.ExtractTranslation()
                     self._last_headset_raw_position = Gf.Vec3d(position)
+                    self._last_headset_pose_matrix = Gf.Matrix4d(pose)
                     raw_height = float(Gf.Dot(Gf.Vec3d(position), up_vector))
                     robot_head_height = self._get_robot_head_world_height(up_vector)
                     corrected_height = raw_height - robot_head_height if robot_head_height is not None else raw_height
@@ -982,75 +1001,154 @@ class HumanoidExample(BaseSample):
             )
         return None
 
-    def _collect_tracking_sample(self) -> None:
-        """Record one tracking sample: headset pose, robot pose, and locomotion command."""
-        if not self._tracking_data_enabled:
+    def _update_headset_velocity(self, dt: float) -> None:
+        """Compute filtered headset 3-D velocity and horizontal speed from consecutive positions."""
+        pos = self._last_headset_raw_position
+        if pos is None or dt <= 0.0:
             return
-        self._tracking_data_step_counter += 1
-        if self._tracking_data_step_counter % self._tracking_data_log_every_n_steps != 0:
+        if self._headset_prev_position is None:
+            self._headset_prev_position = Gf.Vec3d(pos)
+            return
+        raw_vel = (pos - self._headset_prev_position) * (1.0 / dt)
+        self._headset_prev_position = Gf.Vec3d(pos)
+        alpha = self._clamp_value(dt / self._headset_velocity_filter_time, 0.0, 1.0)
+        self._headset_velocity += (raw_vel - self._headset_velocity) * alpha
+        # Horizontal speed = velocity minus the up-axis component
+        up = self._get_xr_up_vector()
+        vel_up_component = Gf.Dot(self._headset_velocity, up)
+        vel_horiz = self._headset_velocity - up * vel_up_component
+        self._headset_horiz_speed = math.sqrt(
+            vel_horiz[0] ** 2 + vel_horiz[1] ** 2 + vel_horiz[2] ** 2
+        )
+        # Gate: 0 when stationary, reaches 1 at 2× the minimum-speed threshold
+        gate_denom = self._headset_gait_min_horiz_speed * 2.0
+        self._headset_gait_horiz_gate = self._clamp_value(
+            self._headset_horiz_speed / gate_denom if gate_denom > 0.0 else 1.0,
+            0.0, 1.0,
+        )
+
+    def _collect_behavioral_sample(self) -> None:
+        """Record a rich behavioral sample for AI/RL training (100 Hz)."""
+        if not self._behavioral_data_enabled:
+            return
+        self._behavioral_data_step_counter += 1
+        if self._behavioral_data_step_counter % self._behavioral_data_log_every_n_steps != 0:
             return
 
         import time as _time
 
+        unix_now = _time.time()
         record = {
-            "sim_time": round(self._headset_gait_time, 6),
-            "wall_time": round(_time.time(), 6),
-            "headset_x": None,
-            "headset_y": None,
-            "headset_z": None,
-            "robot_x": None,
-            "robot_y": None,
-            "robot_z": None,
+            "unix_time":          round(unix_now, 6),
+            "sim_time":           round(self._headset_gait_time, 6),
+            "step_index":         self._behavioral_data_step_counter,
+            # --- headset position ---
+            "hmd_pos_x": None, "hmd_pos_y": None, "hmd_pos_z": None,
+            # --- headset orientation (quaternion from pose matrix) ---
+            "hmd_qw": None, "hmd_qi": None, "hmd_qj": None, "hmd_qk": None,
+            "hmd_yaw": None,
+            # --- headset velocity ---
+            "hmd_vel_x":          round(float(self._headset_velocity[0]), 6),
+            "hmd_vel_y":          round(float(self._headset_velocity[1]), 6),
+            "hmd_vel_z":          round(float(self._headset_velocity[2]), 6),
+            "hmd_horiz_speed":    round(self._headset_horiz_speed, 6),
+            # --- gait signal state ---
+            "gait_filtered_h":    round(self._headset_gait_filtered_height or 0.0, 6),
+            "gait_vel_sign":      int(self._headset_gait_velocity_sign),
+            "gait_horiz_gate":    round(self._headset_gait_horiz_gate, 6),
+            "gait_output":        round(self._headset_gait_output, 6),
+            "gait_pulse_rem":     round(self._headset_gait_pulse_time_remaining, 6),
+            "step_event":         int(self._headset_gait_step_event),
+            # --- robot base pose ---
+            "robot_pos_x": None, "robot_pos_y": None, "robot_pos_z": None,
+            "robot_qw": None, "robot_qi": None, "robot_qj": None, "robot_qk": None,
             "robot_yaw": None,
-            "cmd_forward": round(float(self._base_command[0]), 6) if self._base_command is not None else 0.0,
-            "cmd_yaw": round(float(self._base_command[2]), 6) if self._base_command is not None else 0.0,
-            "gait_filtered_height": round(self._headset_gait_filtered_height or 0.0, 6),
-            "gait_output": round(self._headset_gait_output, 6),
+            # --- locomotion commands ---
+            "cmd_forward":        round(float(self._base_command[0]), 6) if self._base_command is not None else 0.0,
+            "cmd_lateral":        round(float(self._base_command[1]), 6) if self._base_command is not None else 0.0,
+            "cmd_yaw":            round(float(self._base_command[2]), 6) if self._base_command is not None else 0.0,
         }
 
+        # Headset full pose
         pos = self._last_headset_raw_position
         if pos is not None:
-            record["headset_x"] = round(float(pos[0]), 6)
-            record["headset_y"] = round(float(pos[1]), 6)
-            record["headset_z"] = round(float(pos[2]), 6)
+            record["hmd_pos_x"] = round(float(pos[0]), 6)
+            record["hmd_pos_y"] = round(float(pos[1]), 6)
+            record["hmd_pos_z"] = round(float(pos[2]), 6)
+        mat = self._last_headset_pose_matrix
+        if mat is not None:
+            try:
+                q = mat.ExtractRotationQuat()
+                imag = q.GetImaginary()
+                record["hmd_qw"] = round(float(q.GetReal()), 6)
+                record["hmd_qi"] = round(float(imag[0]), 6)
+                record["hmd_qj"] = round(float(imag[1]), 6)
+                record["hmd_qk"] = round(float(imag[2]), 6)
+                qw, qi, qj, qk = float(q.GetReal()), float(imag[0]), float(imag[1]), float(imag[2])
+                record["hmd_yaw"] = round(math.atan2(2.0 * (qw * qk + qi * qj), 1.0 - 2.0 * (qj * qj + qk * qk)), 6)
+            except Exception:
+                pass
 
+        # Robot base pose + joints
         if self.h1 and self.h1.robot.is_physics_tensor_entity_valid():
             positions, orientations = self.h1.robot.get_world_poses()
             rp = self._first_pose_value(positions)
             ro = self._first_pose_value(orientations)
             if rp is not None and len(rp) >= 3:
-                record["robot_x"] = round(float(rp[0]), 6)
-                record["robot_y"] = round(float(rp[1]), 6)
-                record["robot_z"] = round(float(rp[2]), 6)
+                record["robot_pos_x"] = round(float(rp[0]), 6)
+                record["robot_pos_y"] = round(float(rp[1]), 6)
+                record["robot_pos_z"] = round(float(rp[2]), 6)
             if ro is not None and len(ro) >= 4:
-                qw, qx, qy, qz = float(ro[0]), float(ro[1]), float(ro[2]), float(ro[3])
-                record["robot_yaw"] = round(math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)), 6)
+                qw, qi, qj, qk = float(ro[0]), float(ro[1]), float(ro[2]), float(ro[3])
+                record["robot_qw"] = round(qw, 6)
+                record["robot_qi"] = round(qi, 6)
+                record["robot_qj"] = round(qj, 6)
+                record["robot_qk"] = round(qk, 6)
+                record["robot_yaw"] = round(math.atan2(2.0 * (qw * qk + qi * qj), 1.0 - 2.0 * (qj * qj + qk * qk)), 6)
 
-        self._tracking_data_records.append(record)
+            # Joint positions and velocities
+            try:
+                dof_names = list(getattr(self.h1.robot, "dof_names", []))
+                if dof_names and not self._behavioral_dof_names:
+                    self._behavioral_dof_names = dof_names
+                joint_pos_raw = self.h1.robot.get_dof_positions()
+                joint_vel_raw = self.h1.robot.get_dof_velocities()
+                joint_pos = self._first_pose_value(joint_pos_raw)
+                joint_vel = self._first_pose_value(joint_vel_raw)
+                for i, name in enumerate(self._behavioral_dof_names):
+                    safe = name.replace(" ", "_")
+                    record[f"j_{safe}_pos"] = round(float(joint_pos[i]), 6) if joint_pos is not None and i < len(joint_pos) else None
+                    record[f"j_{safe}_vel"] = round(float(joint_vel[i]), 6) if joint_vel is not None and i < len(joint_vel) else None
+            except Exception:
+                pass
 
-    def _save_tracking_data(self) -> None:
-        """Flush all collected tracking records to a timestamped CSV file."""
-        if not self._tracking_data_enabled or not self._tracking_data_records:
+        self._headset_gait_step_event = False   # consume the flag
+        self._behavioral_data_records.append(record)
+
+    def _save_behavioral_data(self) -> None:
+        """Flush all behavioral records to a timestamped CSV in ~/BehavioralCollection/."""
+        if not self._behavioral_data_enabled or not self._behavioral_data_records:
             return
         import csv
         import time as _time
 
         try:
-            self._tracking_data_output_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = _time.strftime("%Y%m%d_%H%M%S")
-            output_path = self._tracking_data_output_dir / f"tracking_{timestamp}.csv"
-            fieldnames = list(self._tracking_data_records[0].keys())
+            self._behavioral_data_output_dir.mkdir(parents=True, exist_ok=True)
+            unix_ts = int(_time.time())
+            timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
+            output_path = self._behavioral_data_output_dir / f"behavior_{timestamp}_{unix_ts}.csv"
+            fieldnames = list(self._behavioral_data_records[0].keys())
             with open(output_path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(self._tracking_data_records)
+                writer.writerows(self._behavioral_data_records)
             carb.log_info(
-                f"HumanoidExample: saved {len(self._tracking_data_records)} tracking samples to {output_path}"
+                f"HumanoidExample: saved {len(self._behavioral_data_records)} behavioral samples to {output_path}"
             )
         except Exception as e:
-            carb.log_warn(f"HumanoidExample: failed to save tracking data: {e}")
-        self._tracking_data_records = []
-        self._tracking_data_step_counter = 0
+            carb.log_warn(f"HumanoidExample: failed to save behavioral data: {e}")
+        self._behavioral_data_records = []
+        self._behavioral_data_step_counter = 0
 
     def _smooth_headset_gait_output(self, target: float, dt: float) -> float:
         """Smooth the normalized headset-gait forward command."""
@@ -1093,6 +1191,7 @@ class HumanoidExample(BaseSample):
             return
 
         self._headset_gait_last_step_time = time_now
+        self._headset_gait_step_event = True
         self._headset_gait_pulse_time_remaining = max(
             self._headset_gait_pulse_time_remaining,
             self._headset_gait_pulse_duration,
@@ -1107,6 +1206,7 @@ class HumanoidExample(BaseSample):
         self._headset_gait_pulse_time_remaining = max(0.0, self._headset_gait_pulse_time_remaining - max(dt, 0.0))
 
         height = self._get_headset_tracking_height()
+        self._update_headset_velocity(dt)
         if height is None:
             return self._smooth_headset_gait_output(0.0, dt)
 
@@ -1141,6 +1241,8 @@ class HumanoidExample(BaseSample):
             self._headset_gait_velocity_sign = velocity_sign
 
         target = self._headset_gait_forward_intensity if self._headset_gait_pulse_time_remaining > 0.0 else 0.0
+        # Gate: suppress gait when headset is stationary (nodding in place) vs. actually moving
+        target *= self._headset_gait_horiz_gate
         return self._smooth_headset_gait_output(target, dt)
 
     def _log_xr_input_status_once(self, left_xr, right_xr) -> None:
