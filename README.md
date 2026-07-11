@@ -2,10 +2,33 @@
 
 ---
 
-> ### 🤖 This fork adds VR humanoid control for the H1 robot
-> **Headset gait detection · Eye-level first-person camera · OpenXR hand tracking · Behavioral data logger for AI/RL training**
->
-> 📄 **[See HUMANOID_VR_CONTROL.md for full setup and usage →](HUMANOID_VR_CONTROL.md)**
+<div align="center">
+
+# 🥽 VR Humanoid Behavior Lab
+
+### Become a Unitree H1 humanoid — walk it, reach with your hands, look with your eyes.<br>Every signal you produce becomes a time-aligned multimodal dataset for embodied AI.
+
+[![Isaac Sim 6.0](https://img.shields.io/badge/Isaac%20Sim-6.0.0-76b900.svg)](https://github.com/isaac-sim/IsaacSim)
+[![OpenXR](https://img.shields.io/badge/OpenXR-SteamVR%20%2B%20Steam%20Link-1793d1.svg)](HUMANOID_VR_CONTROL.md#quest-pro-eye-tracking-optional)
+[![Quest Pro Eye Tracking](https://img.shields.io/badge/eye%20tracking-Quest%20Pro%20✔%20verified-red.svg)](HUMANOID_VR_CONTROL.md#quest-pro-eye-tracking-optional)
+[![License](https://img.shields.io/badge/license-Apache--2.0-yellow.svg)](LICENSE)
+
+**[📄 Setup & Usage Guide](HUMANOID_VR_CONTROL.md)** · **[🧠 Learning Pipeline](learning/README.md)** · **[📊 Data Schema](HUMANOID_VR_CONTROL.md#behavioral-data-collection)**
+
+</div>
+
+**The idea:** teleoperating a humanoid in VR produces exactly the data embodied-AI research is starving for — synchronized human *intent* (head motion, hand poses, eye gaze) paired with robot *behavior* (full joint states, base trajectory, commands) and *first-person video*. This fork turns the stock Isaac Sim H1 example into that recording instrument, and ships the scaffold of a V-JEPA-based world-model pipeline to consume it.
+
+| | Feature | What it does |
+|---|---------|--------------|
+| 👁️ | **Quest Pro eye tracking** — *verified end-to-end* | Real OpenXR eye gaze over SteamVR + Steam Link, drawn as a red ray with a blood-red marker at the gaze collision; gazed objects highlight yellow; live `[EyeGaze] looking at sample box Box_03 @ (5.2, -0.4, 0.3) m` terminal events |
+| 📼 | **Behavioral session recorder** | Every run auto-creates a session: 5 time-aligned ~100 Hz CSVs (HMD, hands, gaze + collisions, objects, all robot joints) + ~10 Hz first-person frames + metadata — **crash-safe**, flushed to disk every 10 s |
+| 🤲 | **Hand tracking & arm teleop** | OpenXR hand/controller poses drive the H1 arms while the RL policy keeps it balanced; grab system for physics objects |
+| 🎥 | **Eye-level first-person camera** | Viewport/XR camera rides at the robot's eye height — in VR you literally see through the robot's eyes |
+| 🚶 | **Headset gait walking** *(experimental, off by default)* | Step in place (head bob) to walk the robot; peak/trough detection with a horizontal-motion gate against false triggers |
+| 🧠 | **Learning pipeline** ([`learning/`](learning/README.md)) | Phased plan: dataset sync → CSV baselines → frozen V-JEPA 2 embeddings → multimodal predictor → action-conditioned latent world model → MPC planner |
+
+<sub>All of it lives in two files: [`humanoid_example.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py) + [`eye_gaze_tracker.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/eye_gaze_tracker.py) — drop them into a stock Isaac Sim 6.0 install ([3 install options](HUMANOID_VR_CONTROL.md#installation--how-to-apply)). Works desktop-only with keyboard too; VR and eye tracking are optional layers.</sub>
 
 ---
 

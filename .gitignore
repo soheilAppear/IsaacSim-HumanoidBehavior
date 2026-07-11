@@ -6,6 +6,19 @@ _*/
 # exclude local website repo, used for publishing
 website/
 
+# learning/ pipeline: raw/processed data, embeddings, checkpoints, logs
+BehavioralCollection/
+learning/**/*.mp4
+learning/**/*.avi
+learning/**/*.png
+learning/**/*.jpg
+learning/**/*.npz
+learning/**/*.npy
+learning/**/*.pt
+learning/**/*.pth
+learning/**/*.ckpt
+wandb/
+
 .lastrun
 .lastformat
 .lastverify
@@ -21,6 +34,7 @@ exts.deps.generated.kit
 
 # byte-compiled python files
 *.py[cod]
+__pycache__/
 
 # pip cache
 .cache

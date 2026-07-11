@@ -1,7 +1,7 @@
-# Humanoid VR Control — H1 Robot with Gait Detection & Behavioral Data Logger
+# Humanoid VR Control — H1 Robot with VR Gait, Quest Pro Eye Tracking & Behavioral Data Recording
 
 > **Fork of:** [NVIDIA IsaacSim](https://github.com/isaac-sim/IsaacSim) · Isaac Sim 6.0.0 GA  
-> **File modified:** `source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py`  
+> **Files modified/added:** `source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py` · `eye_gaze_tracker.py` (same folder)  
 > **Author:** [@soheilAppear](https://github.com/soheilAppear)
 
 ---
@@ -12,12 +12,16 @@ This fork extends the stock Isaac Sim H1 humanoid interactive example with a ful
 
 | Feature | Description |
 |---------|-------------|
-| **Headset gait detection** | Bob your head up/down in VR to make the robot walk — uses real-time peak/trough signal processing on the HMD height signal |
+| **Headset gait detection** *(disabled by default)* | Bob your head up/down in VR to make the robot walk — real-time peak/trough signal processing on the HMD height signal. Currently off while step detection is tuned; set `_headset_gait_enabled = True` to re-enable |
 | **Horizontal motion gate** | Prevents false walking from pure head nodding — gait is suppressed unless the headset also moves in the floor plane |
-| **Eye-level first-person camera** | Viewport camera placed at robot eye height (not top of skull) |
+| **Eye-level first-person camera** | Viewport/XR camera placed at robot eye height (not top of skull) |
 | **VR hand tracking → arm control** | OpenXR hand/controller poses drive H1 arm joints |
 | **Grab system** | Physical sample boxes in the scene can be grabbed with controllers |
-| **Behavioral data logger** | Every session auto-saves a rich ~100 Hz CSV to `~/BehavioralCollection/` — suitable for AI/RL training |
+| **Quest Pro eye tracking** | Real OpenXR eye gaze (the runtime's calibrated fusion of both eyes) drawn as a **red ray** from your eyes to the gazed collider (sample boxes, ground) with a **large blood-red marker sphere** at the collision point; the looked-at box is tinted yellow; every gaze-target change is printed live to the terminal as `[EyeGaze] looking at ...`; robot self-hits filtered out of the raycast (`eye_gaze_tracker.py`) |
+| **Behavioral session recorder** | Every run creates a session folder under `~/BehavioralCollection/raw_sessions/` with `metadata.json` + five time-aligned ~100 Hz CSVs (behavior, hand tracking, gaze, object states, frame timestamps), flushed to disk every ~10 s during play |
+| **Eye-camera frame capture** | First-person 256×256 PNG frames at ~10 Hz, timestamped for video–sensor sync |
+| **Gaze logging with fallback** | `gaze.csv` uses real eye tracking when available, else HMD-forward direction — tagged per row via `gaze_source` |
+| **Learning pipeline scaffold** | `learning/` folder for the V-JEPA world-model pipeline (data sync → baselines → multimodal predictor → planner) |
 
 ---
 
@@ -42,7 +46,9 @@ IsaacSim-HumanoidBehavior/
 │       └── isaacsim.robot.policy.examples/
 │           └── isaacsim/robot/policy/examples/
 │               └── interactive/humanoid/
-│                   └── humanoid_example.py   ← the modified file
+│                   ├── humanoid_example.py   ← the modified file
+│                   └── eye_gaze_tracker.py   ← Quest Pro eye-gaze module (new)
+├── learning/                                 ← V-JEPA / world-model learning pipeline
 ├── README.md                                 ← NVIDIA's original readme
 └── HUMANOID_VR_CONTROL.md                    ← this file
 ```
@@ -65,8 +71,9 @@ $isaacRoot = "C:\path\to\isaac-sim-standalone-6.0.0-windows-x86_64"
 $extPath   = "exts\isaacsim.robot.policy.examples\isaacsim\robot\policy\examples\interactive\humanoid"
 
 Copy-Item `
-  "source\extensions\isaacsim.robot.policy.examples\isaacsim\robot\policy\examples\interactive\humanoid\humanoid_example.py" `
-  "$isaacRoot\$extPath\humanoid_example.py"
+  "source\extensions\isaacsim.robot.policy.examples\isaacsim\robot\policy\examples\interactive\humanoid\humanoid_example.py", `
+  "source\extensions\isaacsim.robot.policy.examples\isaacsim\robot\policy\examples\interactive\humanoid\eye_gaze_tracker.py" `
+  "$isaacRoot\$extPath\"
 ```
 
 **Linux:**
@@ -75,7 +82,8 @@ ISAAC_ROOT="/path/to/isaac-sim-standalone-6.0.0-linux-x86_64"
 EXT_PATH="exts/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid"
 
 cp source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py \
-   "$ISAAC_ROOT/$EXT_PATH/humanoid_example.py"
+   source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/eye_gaze_tracker.py \
+   "$ISAAC_ROOT/$EXT_PATH/"
 ```
 
 ---
@@ -170,6 +178,11 @@ Once Isaac Sim is open:
 | Right grip (hold) | Arm teleoperation — right arm |
 
 ### VR Headset Gait (step-in-place walking)
+
+> **Disabled by default** since 2026-07 while step detection is stabilized. Re-enable with
+> `self._headset_gait_enabled = True` in `HumanoidExample.__init__()`. The HMD pose is
+> still read every step regardless, so `behavior.csv` and the gaze fallback keep working.
+
 Bob your head up and down rhythmically at ~1 Hz (like walking in place). The system:
 1. Low-pass filters the headset height signal
 2. Detects peaks and troughs (amplitude ≥ 1.2 cm)
@@ -185,15 +198,89 @@ Bob your head up and down rhythmically at ~1 Hz (like walking in place). The sys
 
 ## Behavioral Data Collection
 
-Every simulation session automatically saves a CSV to:
+Every load of the example creates a **session folder**:
 
 ```
-~/BehavioralCollection/behavior_YYYY-MM-DD_HH-MM-SS_<unix_timestamp>.csv
+~/BehavioralCollection/raw_sessions/session_YYYY-MM-DD_HH-MM-SS/
+├── metadata.json           session config: physics/rendering dt, log rates, robot name…
+├── behavior.csv            main ~100 Hz log (schema below)
+├── hand_tracking.csv       left/right hand or controller pose + grip/trigger/buttons (~100 Hz)
+├── gaze.csv                gaze ray + raycast hit point/object (~100 Hz); real Quest Pro
+│                           eye tracking when available, else HMD-forward (see gaze_source)
+├── object_states.csv       sample-box poses, velocities, grab state (~100 Hz)
+├── frame_timestamps.csv    one row per captured camera frame
+└── frames/eye_camera/      PNG frames from the first-person camera (~10 Hz, 256×256)
 ```
 
-The file is written when the simulation stops (clicking Stop or closing Isaac Sim).
+All logs share `unix_time`, `sim_time`, and `step_index` columns, so any row in any
+file can be time-aligned with any other. CSVs are **appended to disk every ~10 s
+during play** and finalized when the simulation is cleared or the example closes,
+so a crash or force-quit loses at most the last few seconds; `metadata.json` is
+written at session start.
 
-### CSV Schema
+> Each gaze row's `gaze_source` column says where it came from: `eye_tracker` (real
+> Quest Pro eye tracking, see below) or `hmd_forward` (HMD position + facing direction —
+> a weaker but still useful intent signal).
+
+### Quest Pro Eye Tracking (optional)
+
+`eye_gaze_tracker.py` reads the runtime's combined ("unified") OpenXR eye-gaze
+pose (`XR_EXT_eye_gaze_interaction`) — already the runtime's calibrated fusion
+of both eyes — raycasts it into the PhysX scene, and draws a **thin red ray
+from your eyes to the gazed point** with a **large blood-red marker sphere** at
+the collision. The per-eye devices are deliberately not mixed in: on
+SteamVR + Steam Link their poses carry a head-like orientation that biased the
+ray toward the view center when gazing near straight ahead. The sample boxes
+and the ground plane are physics colliders, so both are valid gaze targets. On
+top of the visuals:
+
+- The looked-at sample box is tinted yellow.
+- Every change of gaze target prints a live terminal line, e.g.
+  `[EyeGaze] looking at sample box Box_03 @ (5.21, -0.44, 0.31) m, 3.80 m away`
+  (fires on transitions only, so the terminal stays readable).
+- The same data feeds `gaze.csv` at ~100 Hz with `gaze_source=eye_tracker`
+  (robot self-hits filtered out of the raycast).
+
+#### Verified working setup (SteamVR + Steam Link)
+
+> ⚠️ **Quest Link / Air Link cannot deliver eye gaze.** Meta's PC OpenXR runtime
+> never exposes `XR_EXT_eye_gaze_interaction` over Link (only a filtered avatar
+> extension). The working path is SteamVR with the eye data carried by **Steam
+> Link** (free) or **Virtual Desktop** ("Forward tracking data" enabled).
+
+1. **Headset:** Settings → Movement tracking → **Eye tracking: ON** (grant the
+   permission and run the eye calibration once).
+2. **Headset:** Settings → Privacy & Safety → App permissions → **Eye tracking →
+   allow Steam Link**.
+3. **Steam Link app settings** (on the headset): **"Share eye tracking data to
+   other apps on this PC": ON** — off by default, and the switch most people miss.
+4. **PC:** set SteamVR as the active OpenXR runtime (SteamVR → Settings →
+   OpenXR → *Set SteamVR as OpenXR runtime*), connect via Steam Link, then launch
+   `isaac-sim.xr.vr.bat`.
+
+On success the console logs `EyeGazeTracker: using unified eye gaze ...`.
+Kit registers the eye device as `/user/eye/unified` (pose `gaze`).
+
+#### Troubleshooting
+
+- `xrCreateInstance ... XR_ERROR_API_VERSION_UNSUPPORTED` for API 1.1 at startup
+  is **harmless** — Kit retries and creates the session with OpenXR 1.0.
+- If no eye data arrives for ~10 s of play, the tracker logs one warning that
+  **includes the full list of XR devices the session can see** — if
+  `/user/eye/unified` is missing from that list, the streaming app is not
+  forwarding eye tracking (recheck steps 2–3). `gaze.csv` then silently falls
+  back to `hmd_forward` rows.
+- The ray only appears once the eye tracker locks on (the pose reads as identity
+  for the first seconds of a session).
+
+Toggles in `HumanoidExample.__init__()`:
+
+```python
+self._eye_gaze_enabled = True             # master switch for the tracker
+self._eye_gaze_ray_visual_enabled = True  # red ray + hit marker in the scene
+```
+
+### behavior.csv Schema
 
 | Column group | Columns | Description |
 |---|---|---|
@@ -221,7 +308,7 @@ Suggested uses:
 ```python
 import pandas as pd
 
-df = pd.read_csv("~/BehavioralCollection/behavior_2026-06-07_22-30-00_1749340200.csv")
+df = pd.read_csv("~/BehavioralCollection/raw_sessions/session_2026-06-07_22-30-00/behavior.csv")
 
 # Headset gait features (input to model)
 hmd_features = df[["hmd_pos_x","hmd_pos_y","hmd_pos_z",
@@ -266,8 +353,10 @@ self._first_person_head_forward_offset = 0.10   # how far forward the camera sit
 
 ### Data collection
 ```python
-self._behavioral_data_log_every_n_steps = 2     # 1=200Hz, 2=100Hz, 4=50Hz
+self._behavioral_data_log_every_n_steps = 2      # 1=200Hz, 2=100Hz, 4=50Hz
+self._behavioral_frame_log_every_n_steps = 20    # camera frames: 20=10Hz, 10=20Hz
 self._behavioral_data_output_dir = Path.home() / "BehavioralCollection"
+self._gaze_raycast_max_distance = 20.0           # m: range cap for the gaze raycast
 ```
 
 ---
@@ -290,8 +379,9 @@ on_physics_step (200 Hz)
 ├── h1.forward(dt, base_command)          ← H1FlatTerrainPolicy step
 ├── _update_h1_arms_from_hand_tracking()  ← OpenXR hand → arm DOFs
 ├── _update_head_camera_view()            ← move first-person camera
-└── _collect_behavioral_sample()          ← write row to in-memory buffer
-                                             (flushed to CSV on stop)
+└── _collect_all_behavioral_data()        ← behavior/hand/gaze/object rows (~100 Hz)
+                                             + eye-camera PNG frame (~10 Hz)
+                                             (CSVs appended every ~10 s + on stop)
 ```
 
 ---

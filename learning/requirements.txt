@@ -1,0 +1,11 @@
+torch
+numpy
+pandas
+matplotlib
+tqdm
+scikit-learn
+transformers
+accelerate
+opencv-python
+imageio
+pyyaml

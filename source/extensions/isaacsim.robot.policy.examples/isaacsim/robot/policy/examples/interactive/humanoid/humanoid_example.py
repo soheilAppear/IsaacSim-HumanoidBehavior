@@ -15,8 +15,11 @@
 
 """Interactive humanoid robot simulation example using H1 robot with GPU-accelerated physics and keyboard control."""
 
+import csv
+import json
 import math
 import random
+import time
 from pathlib import Path
 
 import carb
@@ -53,6 +56,23 @@ class HumanoidExample(BaseSample):
         - NUMPAD_4 or LEFT: Turn left
         - NUMPAD_6 or RIGHT: Turn right
 
+    VR extensions (this fork — see HUMANOID_VR_CONTROL.md for the full guide):
+        - Headset gait: bob the HMD up/down (step in place) to walk forward; a
+          horizontal-motion gate suppresses false triggers from nodding on the spot.
+          Currently DISABLED by default (_headset_gait_enabled = False) while step
+          detection is tuned; the HMD pose is still read every step for logging.
+        - Quest Pro eye gaze (eye_gaze_tracker.py): the runtime's calibrated unified
+          gaze (its own fusion of both eyes) drawn as a red ray with a large
+          blood-red marker sphere at the gazed collider (boxes, ground), gazed box
+          tinted yellow, and live "[EyeGaze] looking at ..." terminal events on
+          every target change.
+        - First-person eye camera: the viewport/XR camera follows the H1 head at eye height.
+        - Hand-tracking / controller arm teleoperation, plus a grab system for sample boxes.
+        - Behavioral session logging: each load creates a session folder under
+          ~/BehavioralCollection/raw_sessions/ holding behavior.csv, hand_tracking.csv,
+          gaze.csv, object_states.csv, frame_timestamps.csv + eye-camera PNG frames,
+          and metadata.json — the raw input for the learning/ pipeline in this repo.
+
     The example automatically handles robot initialization after scene reset and manages GPU memory resources
     through proper cleanup routines. Physics tensors are validated each step to ensure robust simulation
     restart capabilities.
@@ -86,7 +106,7 @@ class HumanoidExample(BaseSample):
         self._max_forward_speed = 1.0
         self._max_yaw_speed = 1.0
         self._command_response_time = 0.0
-        self._headset_gait_enabled = True
+        self._headset_gait_enabled = False    # temporarily disabled: step detection not yet stable; flip to True to restore
         self._headset_gait_forward_intensity = 1.0    # full speed walk per detected step
         self._headset_gait_min_amplitude = 0.012      # lowered: detect smaller head bobs (~1.2 cm)
         self._headset_gait_min_step_interval = 0.18   # allow faster cadence
@@ -115,6 +135,7 @@ class HumanoidExample(BaseSample):
         self._h1_head_prim_path = None
         self._h1_head_prim_lookup_complete = False
         self._head_camera_transform_op = None
+        self._physics_step_error_logged = set()      # (subsystem, error) pairs already warned about
         self._first_person_head_forward_offset = 0.10
         self._first_person_head_up_offset = -0.10     # pull camera down from head prim to eye level
         self._first_person_head_fallback_height = 1.55  # H1 eye height above robot base (~1.55 m)
@@ -134,8 +155,28 @@ class HumanoidExample(BaseSample):
         self._behavioral_data_records = []
         self._behavioral_data_step_counter = 0
         self._behavioral_data_log_every_n_steps = 2  # ~100 Hz (200 Hz / 2)
+        self._behavioral_flush_every_n_steps = 2000  # ~10 s at 200 Hz: periodic CSV flush during play
+        self._behavioral_csv_fieldnames = {}         # filename -> header columns, fixed at first flush
         self._behavioral_data_output_dir = Path.home() / "BehavioralCollection"
+        self._behavioral_sessions_root = self._behavioral_data_output_dir / "raw_sessions"
+        self._behavioral_session_dir = None           # Path to the current session folder
+        self._behavioral_session_id = None
         self._behavioral_dof_names = []              # populated on first sample
+        # Session-relative logs added alongside behavior.csv
+        self._hand_tracking_records = []
+        self._gaze_records = []
+        self._object_state_records = []
+        self._object_state_prev_positions = {}        # object path -> Gf.Vec3d, for finite-diff velocity
+        self._gaze_raycast_max_distance = 20.0        # m: range cap for the HMD-forward gaze raycast
+        # Meta Quest Pro eye tracking (optional; gaze.csv falls back to HMD-forward without it)
+        self._eye_gaze_enabled = True
+        self._eye_gaze_ray_visual_enabled = True      # draw the red gaze ray + hit marker in the scene
+        self._eye_gaze_tracker = None                 # EyeGazeTracker instance once XR is up
+        # Eye-camera frame capture (~10 Hz PNG sequence)
+        self._behavioral_frame_records = []
+        self._behavioral_frame_dir = None
+        self._behavioral_frame_camera = None          # None = not yet tried, False = failed, else Camera
+        self._behavioral_frame_log_every_n_steps = 20  # ~10 Hz (200 Hz / 20)
         self._head_camera_update_counter = 0
         self._head_camera_update_interval = 1
         self._hand_tracking_arm_control_enabled = True
@@ -613,6 +654,18 @@ class HumanoidExample(BaseSample):
         except Exception as e:
             self._xr_core = None
             carb.log_warn(f"HumanoidExample: XRCore unavailable for VR controller input: {e}")
+        # Quest Pro eye-gaze tracker (optional). Imported lazily so a failure here can
+        # never break example registration; gaze.csv falls back to HMD-forward gaze.
+        self._eye_gaze_tracker = None
+        if self._eye_gaze_enabled and self._xr_core is not None:
+            try:
+                from .eye_gaze_tracker import EyeGazeTracker
+
+                self._eye_gaze_tracker = EyeGazeTracker(
+                    self._xr_core, draw_ray=self._eye_gaze_ray_visual_enabled
+                )
+            except Exception as e:
+                carb.log_warn(f"HumanoidExample: Quest Pro eye-gaze tracker unavailable: {e}")
         self._xr_input_status_logged = False
         self._hand_tracking_status_logged = False
         self._h1_arm_dofs_configured = False
@@ -634,6 +687,14 @@ class HumanoidExample(BaseSample):
         self._behavioral_dof_names = []
         self._last_headset_raw_position = None
         self._last_headset_pose_matrix = None
+        self._hand_tracking_records = []
+        self._gaze_records = []
+        self._object_state_records = []
+        self._object_state_prev_positions = {}
+        self._behavioral_frame_records = []
+        self._behavioral_frame_camera = None
+        self._physics_step_error_logged = set()
+        self._start_behavioral_session()
 
         torch = import_module("torch")
         self._base_command = torch.tensor([0.0, 0.0, 0.0], device="cuda")
@@ -671,8 +732,12 @@ class HumanoidExample(BaseSample):
         self._event_timer_callback = None
         self._unsubscribe_keyboard()
         self._save_behavioral_data()
+        if self._eye_gaze_tracker is not None:
+            self._eye_gaze_tracker.cleanup()
+            self._eye_gaze_tracker = None
         self.h1 = None
         self._physics_ready = False
+        self._head_camera_transform_op = None  # handle dies with the stage; never reuse it
         self._restore_physics_simulation_state()
 
     def on_physics_step(self, dt: float, context: object) -> None:
@@ -697,10 +762,30 @@ class HumanoidExample(BaseSample):
             target_command[2] = target_command[2].clamp(-self._max_yaw_speed, self._max_yaw_speed)
             self._smooth_base_command(target_command, dt)
             self.h1.forward(dt, self._base_command)
-            self._update_h1_arms_from_hand_tracking()
-            self._update_h1_attached_hands()
-            self._update_head_camera_view()
-            self._collect_behavioral_sample()
+            # Stage edits (undo, prim deletion, clears) can invalidate prims any of
+            # these subsystems hold handles to; isolate each one so a single failure
+            # cannot abort the step and silently stop behavioral data collection.
+            try:
+                self._update_h1_arms_from_hand_tracking()
+            except Exception as e:
+                self._log_physics_step_error("arm teleoperation", e)
+            try:
+                self._update_h1_attached_hands()
+            except Exception as e:
+                self._log_physics_step_error("hand attachments", e)
+            try:
+                self._update_head_camera_view()
+            except Exception as e:
+                self._log_physics_step_error("head camera update", e)
+            if self._eye_gaze_tracker is not None:
+                try:
+                    self._eye_gaze_tracker.update(dt)
+                except Exception as e:
+                    self._log_physics_step_error("eye gaze update", e)
+            try:
+                self._collect_all_behavioral_data()
+            except Exception as e:
+                self._log_physics_step_error("behavioral data collection", e)
         else:
             # First physics step after play - initialize the robot
             self._physics_ready = True
@@ -709,6 +794,17 @@ class HumanoidExample(BaseSample):
             self._configure_h1_arm_dofs()
             self._update_h1_attached_hands()
             self._update_head_camera_view(force=True)
+
+    def _log_physics_step_error(self, subsystem: str, error: Exception) -> None:
+        """Warn once per distinct physics-step subsystem failure instead of spamming at 200 Hz."""
+        key = (subsystem, type(error).__name__, str(error))
+        if key in self._physics_step_error_logged:
+            return
+        self._physics_step_error_logged.add(key)
+        carb.log_warn(
+            f"HumanoidExample: {subsystem} failed with {type(error).__name__}: {error} "
+            "(suppressing repeats; physics step continues)"
+        )
 
     def _create_head_camera(self) -> None:
         """Create a USD camera used for robot-head first-person viewing."""
@@ -827,6 +923,20 @@ class HumanoidExample(BaseSample):
         self._head_camera_update_counter += 1
         if not force and self._head_camera_update_counter % self._head_camera_update_interval != 0:
             return
+
+        # Undo or a stage clear can delete the camera prim while physics keeps
+        # stepping; Set() on the stale handle then raises "Accessed schema on
+        # invalid prim" at 200 Hz. GetAttr().IsValid() also catches the
+        # delete-then-recreate case, where a prim exists at the path again but
+        # the cached handle is still dead — so rebuild the camera either way.
+        if not self._head_camera_transform_op.GetAttr().IsValid():
+            carb.log_warn(
+                f"HumanoidExample: head camera prim {self._head_camera_path} vanished; recreating it"
+            )
+            self._head_camera_transform_op = None
+            self._create_head_camera()
+            if self._head_camera_transform_op is None:
+                return
 
         camera_pose = self._get_head_camera_pose()
         if camera_pose is None:
@@ -1027,17 +1137,83 @@ class HumanoidExample(BaseSample):
             0.0, 1.0,
         )
 
-    def _collect_behavioral_sample(self) -> None:
-        """Record a rich behavioral sample for AI/RL training (100 Hz)."""
+    def _start_behavioral_session(self) -> None:
+        """Open a new recording session: create its folder tree and write metadata.json.
+
+        Layout produced under ~/BehavioralCollection/raw_sessions/:
+
+            session_YYYY-MM-DD_HH-MM-SS/
+            ├── metadata.json            (written here, at session start)
+            ├── frames/eye_camera/       (PNG frames appended during the run)
+            ├── behavior.csv             ┐
+            ├── frame_timestamps.csv     │ written by _save_behavioral_data()
+            ├── hand_tracking.csv        │ when the session ends
+            ├── gaze.csv                 │
+            └── object_states.csv        ┘
+        """
         if not self._behavioral_data_enabled:
             return
-        self._behavioral_data_step_counter += 1
-        if self._behavioral_data_step_counter % self._behavioral_data_log_every_n_steps != 0:
+
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        session_id = f"session_{timestamp}"
+        session_dir = self._behavioral_sessions_root / session_id
+        # Uniquify so two loads within the same second never merge into one folder.
+        suffix = 2
+        while session_dir.exists():
+            session_id = f"session_{timestamp}_{suffix}"
+            session_dir = self._behavioral_sessions_root / session_id
+            suffix += 1
+        frame_dir = session_dir / "frames" / "eye_camera"
+        try:
+            frame_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            carb.log_warn(f"HumanoidExample: could not create behavioral session folder: {e}")
+            self._behavioral_session_dir = None
+            self._behavioral_frame_dir = None
             return
 
-        import time as _time
+        self._behavioral_session_dir = session_dir
+        self._behavioral_frame_dir = frame_dir
+        self._behavioral_session_id = session_id
+        self._behavioral_csv_fieldnames = {}
 
-        unix_now = _time.time()
+        physics_dt = self._world_settings.get("physics_dt", 1.0 / 200.0)
+        try:
+            from isaacsim.core.version import get_version
+
+            isaac_sim_version = get_version()[0] or None
+        except Exception:
+            isaac_sim_version = None
+
+        metadata = {
+            "session_id": session_id,
+            "start_unix_time": time.time(),
+            "isaac_sim_version": isaac_sim_version,
+            "physics_dt": physics_dt,
+            "rendering_dt": self._world_settings.get("rendering_dt"),
+            "robot_name": "H1",
+            "headset_gait_enabled": self._headset_gait_enabled,
+            "eye_gaze_enabled": self._eye_gaze_enabled,
+            "behavioral_data_log_rate_hz": (1.0 / physics_dt) / self._behavioral_data_log_every_n_steps,
+            "frame_log_rate_hz": (1.0 / physics_dt) / self._behavioral_frame_log_every_n_steps,
+            "camera_names": ["eye_camera"],
+            "notes": "",
+        }
+        try:
+            with open(session_dir / "metadata.json", "w") as f:
+                json.dump(metadata, f, indent=2)
+        except Exception as e:
+            carb.log_warn(f"HumanoidExample: could not write session metadata.json: {e}")
+
+        carb.log_info(f"HumanoidExample: started behavioral session {session_id} at {session_dir}")
+
+    def _collect_behavioral_sample(self) -> None:
+        """Record one rich behavior.csv row (HMD pose/velocity, gait state, robot pose,
+        commands, and every joint's position/velocity), ~100 Hz.
+
+        Rate gating and dispatch happen in _collect_all_behavioral_data().
+        """
+        unix_now = time.time()
         record = {
             "unix_time":          round(unix_now, 6),
             "sim_time":           round(self._headset_gait_time, 6),
@@ -1125,30 +1301,477 @@ class HumanoidExample(BaseSample):
         self._headset_gait_step_event = False   # consume the flag
         self._behavioral_data_records.append(record)
 
-    def _save_behavioral_data(self) -> None:
-        """Flush all behavioral records to a timestamped CSV in ~/BehavioralCollection/."""
-        if not self._behavioral_data_enabled or not self._behavioral_data_records:
+    def _append_csv(self, path: Path, records: list) -> None:
+        """Append dict records to a session CSV, writing the header on first creation.
+
+        The header is fixed at the first append (union of the buffered rows' keys in
+        first-seen order) and reused for the rest of the session. This matters for
+        behavior.csv: the j_* joint columns only appear on rows logged while the
+        robot's physics tensors were valid. Rows missing a column write an empty
+        cell (restval), and unexpected late-appearing keys are dropped rather than
+        raising (extrasaction) — losing one exotic column beats losing the file.
+        """
+        if not records:
             return
-        import csv
-        import time as _time
+        fieldnames = self._behavioral_csv_fieldnames.get(path.name)
+        if fieldnames is None:
+            seen: dict[str, None] = {}
+            for record in records:
+                for key in record:
+                    seen.setdefault(key)
+            fieldnames = list(seen)
+            self._behavioral_csv_fieldnames[path.name] = fieldnames
+        write_header = not path.exists()
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="", extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerows(records)
+
+    def _flush_behavioral_csvs(self) -> None:
+        """Append all buffered rows to the session CSVs and clear the buffers.
+
+        Called every ~10 s during play and once at session close. Incremental
+        appends mean a crash or force-quit loses at most the last few seconds.
+        (Previously the CSVs were only written at scene clear — which never runs
+        when the app window is simply closed, so whole sessions ended up with
+        camera frames but no sensor logs at all.)
+        """
+        if self._behavioral_session_dir is None:
+            return
+        streams = (
+            ("behavior.csv", self._behavioral_data_records),
+            ("frame_timestamps.csv", self._behavioral_frame_records),
+            ("hand_tracking.csv", self._hand_tracking_records),
+            ("gaze.csv", self._gaze_records),
+            ("object_states.csv", self._object_state_records),
+        )
+        for filename, records in streams:
+            if not records:
+                continue
+            try:
+                self._append_csv(self._behavioral_session_dir / filename, records)
+            except Exception as e:
+                carb.log_warn(f"HumanoidExample: failed to flush {filename}: {e}")
+                continue
+            # clear() keeps the same list object so every collector stays bound to it
+            records.clear()
+
+    def _save_behavioral_data(self) -> None:
+        """Flush any remaining rows and close the current recording session.
+
+        Runs when the scene is cleared or the example is torn down. Idempotent: the
+        buffers and the session handle are reset afterwards, so a second call is a no-op.
+        """
+        if not self._behavioral_data_enabled or self._behavioral_session_dir is None:
+            return
+
+        session_dir = self._behavioral_session_dir
+        self._flush_behavioral_csvs()
+        carb.log_info(
+            f"HumanoidExample: closed behavioral session {self._behavioral_session_id} at {session_dir}"
+        )
+
+        # Reset buffers and close the session.
+        self._behavioral_data_records = []
+        self._behavioral_frame_records = []
+        self._hand_tracking_records = []
+        self._gaze_records = []
+        self._object_state_records = []
+        self._object_state_prev_positions = {}
+        self._behavioral_csv_fieldnames = {}
+        self._behavioral_data_step_counter = 0
+        self._behavioral_session_dir = None
+        self._behavioral_frame_dir = None
+        self._behavioral_frame_camera = None
+
+    def _parse_sample_box_index(self, prim_path) -> int | None:
+        """Extract the numeric index from a sample-box prim path like '.../Box_07', else None."""
+        if not prim_path:
+            return None
+        name = str(prim_path).rsplit("/", 1)[-1]
+        if name.startswith("Box_"):
+            try:
+                return int(name.split("_")[-1])
+            except ValueError:
+                return None
+        return None
+
+    def _ensure_eye_camera_capture_initialized(self) -> None:
+        """Lazily wrap the existing /World/H1_HeadCamera prim in a Camera sensor.
+
+        Camera.initialize() attaches a render product + RGB annotator to the prim.
+        Frame data refreshes at RENDER rate (rendering_dt, ~90 Hz here), not physics
+        rate, so later get_rgba() calls are cheap: they return the most recently
+        rendered frame, or None until the first frame is available. Initialization is
+        deferred to the first capture attempt because the render pipeline is not ready
+        during scene setup.
+        """
+        if self._behavioral_frame_camera is not None:
+            return  # already initialized (Camera instance) or permanently failed (False)
+        try:
+            from isaacsim.sensors.camera import Camera
+
+            camera = Camera(prim_path=self._head_camera_path, resolution=(256, 256))
+            camera.initialize()
+            self._behavioral_frame_camera = camera
+            carb.log_info("HumanoidExample: initialized eye-camera frame capture")
+        except Exception as e:
+            carb.log_warn(f"HumanoidExample: could not initialize eye-camera capture, frames disabled: {e}")
+            self._behavioral_frame_camera = False  # sentinel: tried once, don't retry every step
+
+    def _capture_eye_camera_frame(self) -> None:
+        """Save one PNG frame from the H1 eye camera (~10 Hz) and log it for frame_timestamps.csv.
+
+        Deliberately slower than the 100 Hz sensor logs: PNG encoding is expensive, and
+        the downstream sync tool aligns each frame to the nearest behavior.csv row by
+        sim_time anyway, so a dense frame stream buys nothing.
+        """
+        if self._behavioral_session_dir is None or self._behavioral_frame_dir is None:
+            return
+        if self._behavioral_data_step_counter % self._behavioral_frame_log_every_n_steps != 0:
+            return
+
+        self._ensure_eye_camera_capture_initialized()
+        if not self._behavioral_frame_camera:
+            return
 
         try:
-            self._behavioral_data_output_dir.mkdir(parents=True, exist_ok=True)
-            unix_ts = int(_time.time())
-            timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
-            output_path = self._behavioral_data_output_dir / f"behavior_{timestamp}_{unix_ts}.csv"
-            fieldnames = list(self._behavioral_data_records[0].keys())
-            with open(output_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(self._behavioral_data_records)
-            carb.log_info(
-                f"HumanoidExample: saved {len(self._behavioral_data_records)} behavioral samples to {output_path}"
-            )
+            rgba = self._behavioral_frame_camera.get_rgba()
+        except Exception:
+            rgba = None
+        if rgba is None:
+            # No rendered frame yet (rendering runs slower than physics); skip quietly.
+            return
+
+        frame_id = len(self._behavioral_frame_records)
+        image_name = f"frame_{frame_id:06d}.png"
+        try:
+            from PIL import Image
+
+            Image.fromarray(rgba[:, :, :3]).save(self._behavioral_frame_dir / image_name)
         except Exception as e:
-            carb.log_warn(f"HumanoidExample: failed to save behavioral data: {e}")
-        self._behavioral_data_records = []
-        self._behavioral_data_step_counter = 0
+            carb.log_warn(f"HumanoidExample: failed to save eye-camera frame: {e}")
+            return
+
+        self._behavioral_frame_records.append(
+            {
+                "frame_id": frame_id,
+                "unix_time": round(time.time(), 6),
+                "sim_time": round(self._headset_gait_time, 6),
+                "camera_name": "eye_camera",
+                "image_path": f"frames/eye_camera/{image_name}",
+            }
+        )
+
+    def _get_raw_hand_or_controller_pose(self, input_device):
+        """Return an absolute hand-tracking or controller pose for logging (ignores grip gating)."""
+        if input_device is None:
+            return None
+        hand_pose = self._get_hand_tracking_pose(input_device)
+        if hand_pose is not None:
+            return hand_pose
+        try:
+            pose_names = {str(name) for name in input_device.get_pose_names()}
+        except Exception:
+            pose_names = set()
+        for pose_name in self._controller_pose_candidates:
+            if pose_name and pose_names and pose_name not in pose_names:
+                continue
+            try:
+                return input_device.get_virtual_world_pose(pose_name)
+            except Exception:
+                continue
+        return None
+
+    def _collect_hand_tracking_sample(self) -> None:
+        """Record left/right hand (or controller) pose plus grip/trigger/button values, ~100 Hz.
+
+        Unlike the arm-teleop path, poses here are logged unconditionally — not gated on
+        grip being held — so the dataset always contains raw hand motion whenever
+        tracking is available. valid=0 rows mean the device was absent that sample.
+        """
+        left_xr = self._get_xr_input_device("/user/hand/left")
+        right_xr = self._get_xr_input_device("/user/hand/right")
+
+        def _pose_fields(device):
+            pose = self._get_raw_hand_or_controller_pose(device)
+            if pose is None:
+                return {"valid": 0, "pos_x": None, "pos_y": None, "pos_z": None, "qw": None, "qx": None, "qy": None, "qz": None}
+            position = pose.ExtractTranslation()
+            quat = pose.ExtractRotationQuat()
+            imag = quat.GetImaginary()
+            return {
+                "valid": 1,
+                "pos_x": round(float(position[0]), 6),
+                "pos_y": round(float(position[1]), 6),
+                "pos_z": round(float(position[2]), 6),
+                "qw": round(float(quat.GetReal()), 6),
+                "qx": round(float(imag[0]), 6),
+                "qy": round(float(imag[1]), 6),
+                "qz": round(float(imag[2]), 6),
+            }
+
+        left_fields = _pose_fields(left_xr)
+        right_fields = _pose_fields(right_xr)
+
+        left_grip = max(
+            self._get_xr_gesture_value(left_xr, "squeeze", "value"),
+            self._get_xr_gesture_value(left_xr, "squeeze", "click"),
+            self._get_xr_gesture_value(left_xr, "grip", "value"),
+        )
+        right_grip = max(
+            self._get_xr_gesture_value(right_xr, "squeeze", "value"),
+            self._get_xr_gesture_value(right_xr, "squeeze", "click"),
+            self._get_xr_gesture_value(right_xr, "grip", "value"),
+        )
+        left_trigger = max(
+            self._get_xr_gesture_value(left_xr, "trigger", "value"),
+            self._get_xr_gesture_value(left_xr, "trigger", "click"),
+        )
+        right_trigger = max(
+            self._get_xr_gesture_value(right_xr, "trigger", "value"),
+            self._get_xr_gesture_value(right_xr, "trigger", "click"),
+        )
+        left_button_x = max(
+            self._get_xr_gesture_value(left_xr, "x", "value"),
+            self._get_xr_gesture_value(left_xr, "x", "click"),
+        )
+        right_button_a = max(
+            self._get_xr_gesture_value(right_xr, "a", "value"),
+            self._get_xr_gesture_value(right_xr, "a", "click"),
+        )
+
+        self._hand_tracking_records.append(
+            {
+                "unix_time": round(time.time(), 6),
+                "sim_time": round(self._headset_gait_time, 6),
+                "step_index": self._behavioral_data_step_counter,
+                "left_hand_valid": left_fields["valid"],
+                "left_hand_pos_x": left_fields["pos_x"],
+                "left_hand_pos_y": left_fields["pos_y"],
+                "left_hand_pos_z": left_fields["pos_z"],
+                "left_hand_qw": left_fields["qw"],
+                "left_hand_qx": left_fields["qx"],
+                "left_hand_qy": left_fields["qy"],
+                "left_hand_qz": left_fields["qz"],
+                "right_hand_valid": right_fields["valid"],
+                "right_hand_pos_x": right_fields["pos_x"],
+                "right_hand_pos_y": right_fields["pos_y"],
+                "right_hand_pos_z": right_fields["pos_z"],
+                "right_hand_qw": right_fields["qw"],
+                "right_hand_qx": right_fields["qx"],
+                "right_hand_qy": right_fields["qy"],
+                "right_hand_qz": right_fields["qz"],
+                "left_grip": round(left_grip, 6),
+                "right_grip": round(right_grip, 6),
+                "left_trigger": round(left_trigger, 6),
+                "right_trigger": round(right_trigger, 6),
+                "left_button_x": round(left_button_x, 6),
+                "right_button_a": round(right_button_a, 6),
+            }
+        )
+
+    def _collect_gaze_sample(self) -> None:
+        """Record one gaze ray row (~100 Hz), preferring real eye tracking when present.
+
+        Two sources, distinguished by the gaze_source column:
+        - "eye_tracker": Quest Pro OpenXR eye gaze via EyeGazeTracker, including its
+          raycast hit (already robot-body filtered).
+        - "hmd_forward": fallback — HMD position + facing (-Z) direction as a weak
+          intent proxy, with a local PhysX raycast capped at _gaze_raycast_max_distance.
+        Sample-box hits also get their numeric object_id in both cases.
+        """
+        record = {
+            "unix_time": round(time.time(), 6),
+            "sim_time": round(self._headset_gait_time, 6),
+            "step_index": self._behavioral_data_step_counter,
+            "gaze_source": None,
+            "gaze_valid": 0,
+            "gaze_origin_x": None,
+            "gaze_origin_y": None,
+            "gaze_origin_z": None,
+            "gaze_dir_x": None,
+            "gaze_dir_y": None,
+            "gaze_dir_z": None,
+            "gaze_hit_valid": 0,
+            "gaze_hit_x": None,
+            "gaze_hit_y": None,
+            "gaze_hit_z": None,
+            "gaze_hit_distance": None,
+            "gaze_hit_object_path": None,
+            "gaze_hit_object_id": None,
+        }
+
+        # Preferred source: real Quest Pro eye tracking (raycast already done there).
+        gaze = self._eye_gaze_tracker.latest if self._eye_gaze_tracker is not None else None
+        if gaze is not None and gaze.valid and gaze.origin is not None and gaze.direction is not None:
+            record["gaze_source"] = "eye_tracker"
+            record["gaze_valid"] = 1
+            record["gaze_origin_x"] = round(float(gaze.origin[0]), 6)
+            record["gaze_origin_y"] = round(float(gaze.origin[1]), 6)
+            record["gaze_origin_z"] = round(float(gaze.origin[2]), 6)
+            record["gaze_dir_x"] = round(float(gaze.direction[0]), 6)
+            record["gaze_dir_y"] = round(float(gaze.direction[1]), 6)
+            record["gaze_dir_z"] = round(float(gaze.direction[2]), 6)
+            if gaze.hit_valid and gaze.hit_position is not None:
+                record["gaze_hit_valid"] = 1
+                record["gaze_hit_x"] = round(float(gaze.hit_position[0]), 6)
+                record["gaze_hit_y"] = round(float(gaze.hit_position[1]), 6)
+                record["gaze_hit_z"] = round(float(gaze.hit_position[2]), 6)
+                if gaze.hit_distance is not None:
+                    record["gaze_hit_distance"] = round(float(gaze.hit_distance), 6)
+                record["gaze_hit_object_path"] = gaze.hit_object_path
+                record["gaze_hit_object_id"] = self._parse_sample_box_index(gaze.hit_object_path)
+            self._gaze_records.append(record)
+            return
+
+        # Fallback source: HMD position + facing direction.
+        origin = self._last_headset_raw_position
+        mat = self._last_headset_pose_matrix
+        if origin is not None and mat is not None:
+            try:
+                forward = mat.ExtractRotation().TransformDir(Gf.Vec3d(0.0, 0.0, -1.0))
+                length = forward.GetLength()
+            except Exception:
+                length = 0.0
+            if length > 0.0:
+                forward = forward / length
+                record["gaze_source"] = "hmd_forward"
+                record["gaze_valid"] = 1
+                record["gaze_origin_x"] = round(float(origin[0]), 6)
+                record["gaze_origin_y"] = round(float(origin[1]), 6)
+                record["gaze_origin_z"] = round(float(origin[2]), 6)
+                record["gaze_dir_x"] = round(float(forward[0]), 6)
+                record["gaze_dir_y"] = round(float(forward[1]), 6)
+                record["gaze_dir_z"] = round(float(forward[2]), 6)
+
+                try:
+                    # Imported lazily: physics extension load order is not guaranteed at module import time.
+                    import omni.physics.core
+
+                    query = omni.physics.core.get_physics_scene_query_interface()
+                    origin_t = (float(origin[0]), float(origin[1]), float(origin[2]))
+                    forward_t = (float(forward[0]), float(forward[1]), float(forward[2]))
+                    try:
+                        # both_sides is required on this API; omitting it raised
+                        # TypeError and silently blanked every gaze_hit_* column.
+                        ret, hit = query.raycast_closest(
+                            origin_t, forward_t, self._gaze_raycast_max_distance, False
+                        )
+                    except TypeError:
+                        ret, hit = query.raycast_closest(origin_t, forward_t, self._gaze_raycast_max_distance)
+                    if ret:
+                        record["gaze_hit_valid"] = 1
+                        hit_pos = getattr(hit, "position", None)
+                        if hit_pos is not None:
+                            record["gaze_hit_x"] = round(float(hit_pos[0]), 6)
+                            record["gaze_hit_y"] = round(float(hit_pos[1]), 6)
+                            record["gaze_hit_z"] = round(float(hit_pos[2]), 6)
+                        record["gaze_hit_distance"] = round(float(hit.distance), 6)
+
+                        # PhysX reports the hit body either as an Sdf path string or as an
+                        # encoded int that PhysicsSchemaTools can decode back into a path.
+                        # Imported lazily: pxr.PhysicsSchemaTools is registered by the PhysX
+                        # schema extension, which this extension does not depend on at load
+                        # time — a module-level import would break extension startup and
+                        # remove the Humanoid example from the menu.
+                        rigid_body = getattr(hit, "rigid_body", None)
+                        hit_path = None
+                        if isinstance(rigid_body, str):
+                            hit_path = rigid_body
+                        elif rigid_body is not None:
+                            try:
+                                from pxr import PhysicsSchemaTools
+
+                                hit_path = str(PhysicsSchemaTools.intToSdfPath(rigid_body))
+                            except Exception:
+                                hit_path = None
+                        record["gaze_hit_object_path"] = hit_path
+                        record["gaze_hit_object_id"] = self._parse_sample_box_index(hit_path)
+                except Exception:
+                    pass
+
+        self._gaze_records.append(record)
+
+    def _collect_object_state_sample(self) -> None:
+        """Record one row per sample box: world pose, velocity, and grab state, ~100 Hz.
+
+        Velocity is a finite difference between consecutive logged positions (the boxes
+        are plain USD rigid bodies, not tensor-API entities, so there is no cheap
+        velocity getter). The first row for each box therefore reports zero velocity.
+        """
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath(self._sample_box_root_path)
+        if not root.IsValid():
+            return
+
+        unix_now = round(time.time(), 6)
+        sim_now = round(self._headset_gait_time, 6)
+        dt = self._world_settings.get("physics_dt", 1.0 / 200.0) * self._behavioral_data_log_every_n_steps
+
+        grabbed_by_path = {path: side for side, path in self._grabbed_objects_by_side.items()}
+        xform_cache = UsdGeom.XformCache()
+        for prim in root.GetChildren():
+            path = str(prim.GetPath())
+            try:
+                world_matrix = xform_cache.GetLocalToWorldTransform(prim)
+                position = world_matrix.ExtractTranslation()
+                quat = world_matrix.ExtractRotationQuat()
+            except Exception:
+                continue
+            imag = quat.GetImaginary()
+
+            prev_position = self._object_state_prev_positions.get(path)
+            if prev_position is not None and dt > 0.0:
+                velocity = (position - prev_position) * (1.0 / dt)
+            else:
+                velocity = Gf.Vec3d(0.0, 0.0, 0.0)
+            self._object_state_prev_positions[path] = Gf.Vec3d(position)
+
+            self._object_state_records.append(
+                {
+                    "unix_time": unix_now,
+                    "sim_time": sim_now,
+                    "step_index": self._behavioral_data_step_counter,
+                    "object_id": self._parse_sample_box_index(path),
+                    "object_path": path,
+                    "pos_x": round(float(position[0]), 6),
+                    "pos_y": round(float(position[1]), 6),
+                    "pos_z": round(float(position[2]), 6),
+                    "qw": round(float(quat.GetReal()), 6),
+                    "qx": round(float(imag[0]), 6),
+                    "qy": round(float(imag[1]), 6),
+                    "qz": round(float(imag[2]), 6),
+                    "vel_x": round(float(velocity[0]), 6),
+                    "vel_y": round(float(velocity[1]), 6),
+                    "vel_z": round(float(velocity[2]), 6),
+                    "is_grabbed": int(path in grabbed_by_path),
+                    "grabbed_by": grabbed_by_path.get(path),
+                }
+            )
+
+    def _collect_all_behavioral_data(self) -> None:
+        """Advance the shared logging counter and dispatch every per-modality collector.
+
+        Called once per physics step (200 Hz). One counter drives all modalities so
+        their rows stay aligned by step_index:
+        - eye-camera frames: every 20 steps (~10 Hz) — PNG encode is comparatively slow
+        - behavior / hand / gaze / object rows: every 2 steps (~100 Hz)
+        - CSV flush to disk: every 2000 steps (~10 s), so a crash loses seconds, not the session
+        """
+        if not self._behavioral_data_enabled:
+            return
+        self._behavioral_data_step_counter += 1
+        self._capture_eye_camera_frame()
+        if self._behavioral_data_step_counter % self._behavioral_flush_every_n_steps == 0:
+            self._flush_behavioral_csvs()
+        if self._behavioral_data_step_counter % self._behavioral_data_log_every_n_steps != 0:
+            return
+        self._collect_behavioral_sample()
+        self._collect_hand_tracking_sample()
+        self._collect_gaze_sample()
+        self._collect_object_state_sample()
 
     def _smooth_headset_gait_output(self, target: float, dt: float) -> float:
         """Smooth the normalized headset-gait forward command."""
@@ -1199,15 +1822,15 @@ class HumanoidExample(BaseSample):
 
     def _update_headset_gait_command(self, dt: float) -> float:
         """Convert headset vertical peaks/troughs into a normalized forward walking command."""
-        if not self._headset_gait_enabled:
-            return self._smooth_headset_gait_output(0.0, dt)
-
         self._headset_gait_time += max(float(dt), 0.0)
         self._headset_gait_pulse_time_remaining = max(0.0, self._headset_gait_pulse_time_remaining - max(dt, 0.0))
 
+        # Read the HMD pose and velocity even when gait walking is disabled:
+        # sim_time and the hmd_* columns in behavior.csv, plus the HMD-forward
+        # fallback in gaze.csv, come from these reads — not from the detector.
         height = self._get_headset_tracking_height()
         self._update_headset_velocity(dt)
-        if height is None:
+        if not self._headset_gait_enabled or height is None:
             return self._smooth_headset_gait_output(0.0, dt)
 
         if self._headset_gait_height_baseline is None:
@@ -1862,8 +2485,15 @@ class HumanoidExample(BaseSample):
 
         self._event_timer_callback = None
         self._unsubscribe_keyboard()
+        # Flush the recorded session even when the example is closed without a scene
+        # clear (setup_post_clear also saves; the call is idempotent, so both are safe).
+        self._save_behavioral_data()
+        if self._eye_gaze_tracker is not None:
+            self._eye_gaze_tracker.cleanup()
+            self._eye_gaze_tracker = None
         self.h1 = None
         self._physics_ready = False
+        self._head_camera_transform_op = None  # handle dies with the stage; never reuse it
         self._restore_physics_simulation_state()
 
     def _restore_physics_simulation_state(self) -> None:
