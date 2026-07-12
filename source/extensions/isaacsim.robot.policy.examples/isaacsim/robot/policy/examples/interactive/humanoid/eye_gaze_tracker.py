@@ -270,7 +270,12 @@ class EyeGazeTracker:
 
             hit_path = self._decode_hit_path(hit)
             hit_distance = float(getattr(hit, "distance", 0.0))
-            if hit_path is not None and hit_path.startswith(self._robot_root_path):
+            # Match the robot prim SUBTREE only ("/World/H1" or "/World/H1/...").
+            # A bare startswith("/World/H1") also matched "/World/H1_SampleBoxes/..."
+            # and silently discarded every box hit as a self-hit.
+            if hit_path is not None and (
+                hit_path == self._robot_root_path or hit_path.startswith(self._robot_root_path + "/")
+            ):
                 # Own-body hit: continue the ray from just past it.
                 start = start + direction * (hit_distance + 0.05)
                 remaining -= hit_distance + 0.05

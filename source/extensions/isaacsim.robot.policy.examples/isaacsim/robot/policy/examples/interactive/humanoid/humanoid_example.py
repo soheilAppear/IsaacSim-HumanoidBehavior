@@ -137,8 +137,13 @@ class HumanoidExample(BaseSample):
         self._head_camera_transform_op = None
         self._physics_step_error_logged = set()      # (subsystem, error) pairs already warned about
         self._first_person_head_forward_offset = 0.14   # sit at the face, not inside the skull
-        self._first_person_head_up_offset = -0.18       # drop from the head prim origin (top) to eye level
-        self._first_person_head_fallback_height = 1.50  # H1 eye height above robot base when no head prim found
+        self._first_person_head_up_offset = 0.0         # extra fine-tune on top of the eye height below
+        self._first_person_eye_height_above_base = 0.45  # m: H1 eyes sit ~0.45 m above the pelvis/base link.
+                                                         # (The old code added ~1.5 m to the pelvis — which is
+                                                         # already ~1 m up — parking the camera above the head.)
+        self._head_camera_yaw_sign = -1.0               # the yaw extracted from the base quaternion turned the
+                                                        # camera opposite to the robot's real rotation; set 1.0
+                                                        # to undo the flip if your build behaves differently
         self._first_person_head_target_distance = 1.8
         # Headset velocity and horizontal-motion tracking (gait gate)
         self._last_headset_raw_position = None       # Gf.Vec3d: position from pose reader
@@ -898,27 +903,35 @@ class HumanoidExample(BaseSample):
 
         qw, qx, qy, qz = (float(orientation[0]), float(orientation[1]), float(orientation[2]), float(orientation[3]))
         yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        yaw *= self._head_camera_yaw_sign  # user-verified: raw yaw turned the view the wrong way
         forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
         base = Gf.Vec3d(float(position[0]), float(position[1]), float(position[2]))
 
         if not self._h1_head_prim_lookup_complete:
             self._h1_head_prim_path = self._find_h1_head_prim_path()
 
-        eye_anchor = None
+        # Horizontal anchor: the head prim when available (so the view tracks
+        # torso lean); HEIGHT is always base + eye offset. Head-link origins sit
+        # at the top of the skull and vary between assets, so deriving height
+        # from them kept parking the camera above the robot's head.
+        anchor = None
         if self._h1_head_prim_path is not None:
             stage = omni.usd.get_context().get_stage()
             head_prim = stage.GetPrimAtPath(self._h1_head_prim_path)
             if head_prim.IsValid():
                 try:
-                    eye_anchor = UsdGeom.XformCache().GetLocalToWorldTransform(head_prim).ExtractTranslation()
+                    anchor = UsdGeom.XformCache().GetLocalToWorldTransform(head_prim).ExtractTranslation()
                 except Exception:
-                    eye_anchor = None
+                    anchor = None
+        if anchor is None:
+            anchor = base
 
-        if eye_anchor is None:
-            eye_anchor = base + Gf.Vec3d(0.0, 0.0, self._first_person_head_fallback_height)
-
-        eye = eye_anchor + forward * self._first_person_head_forward_offset
-        eye += Gf.Vec3d(0.0, 0.0, self._first_person_head_up_offset)
+        eye = Gf.Vec3d(
+            float(anchor[0]),
+            float(anchor[1]),
+            base[2] + self._first_person_eye_height_above_base + self._first_person_head_up_offset,
+        )
+        eye += forward * self._first_person_head_forward_offset
         target = eye + forward * self._first_person_head_target_distance
         return Gf.Matrix4d().SetLookAt(eye, target, Gf.Vec3d(0.0, 0.0, 1.0)).GetInverse()
 
@@ -1045,7 +1058,7 @@ class HumanoidExample(BaseSample):
         if position is None or len(position) < 3:
             return None
         head_pos = Gf.Vec3d(float(position[0]), float(position[1]), float(position[2]))
-        head_pos += Gf.Vec3d(0.0, 0.0, self._first_person_head_fallback_height)
+        head_pos += Gf.Vec3d(0.0, 0.0, self._first_person_eye_height_above_base)
         return float(Gf.Dot(head_pos, up_vector))
 
     def _get_headset_tracking_height(self) -> float | None:

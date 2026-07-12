@@ -346,12 +346,14 @@ self._headset_gait_max_extremum_gap   = 0.95    # max seconds between peak and n
 
 ### Camera
 ```python
-self._first_person_head_up_offset     = -0.18   # camera height offset from head prim (m, negative = lower)
-self._first_person_head_fallback_height = 1.50  # eye height above robot base when no head prim found (m)
-self._first_person_head_forward_offset = 0.14   # how far forward the camera sits from head origin (m)
+self._first_person_eye_height_above_base = 0.45  # eye height above the H1 pelvis/base link (m)
+self._first_person_head_forward_offset   = 0.14  # forward from the head, out of the skull mesh (m)
+self._first_person_head_up_offset        = 0.0   # extra fine-tune on top of the eye height (m)
+self._head_camera_yaw_sign               = -1.0  # set 1.0 if the view turns opposite to the robot
 ```
-More negative `up_offset` = lower on the face; larger `forward_offset` = further out
-of the head mesh. Adjust in ±0.02 steps until the view matches the robot's eyes.
+The camera height is always `base_z + eye_height (+ up_offset)` — deterministic
+regardless of how the asset's head-link origin is placed. Adjust `eye_height` in
+±0.02 steps until the view matches the robot's eyes.
 
 ### Data collection
 ```python
