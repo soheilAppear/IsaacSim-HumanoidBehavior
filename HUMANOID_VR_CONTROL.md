@@ -346,10 +346,12 @@ self._headset_gait_max_extremum_gap   = 0.95    # max seconds between peak and n
 
 ### Camera
 ```python
-self._first_person_head_up_offset     = -0.10   # camera height offset from head prim (m, negative = lower)
-self._first_person_head_fallback_height = 1.55  # eye height above robot base when no head prim found (m)
-self._first_person_head_forward_offset = 0.10   # how far forward the camera sits from head origin (m)
+self._first_person_head_up_offset     = -0.18   # camera height offset from head prim (m, negative = lower)
+self._first_person_head_fallback_height = 1.50  # eye height above robot base when no head prim found (m)
+self._first_person_head_forward_offset = 0.14   # how far forward the camera sits from head origin (m)
 ```
+More negative `up_offset` = lower on the face; larger `forward_offset` = further out
+of the head mesh. Adjust in ±0.02 steps until the view matches the robot's eyes.
 
 ### Data collection
 ```python

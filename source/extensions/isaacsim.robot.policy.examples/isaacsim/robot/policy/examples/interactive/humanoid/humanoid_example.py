@@ -136,9 +136,9 @@ class HumanoidExample(BaseSample):
         self._h1_head_prim_lookup_complete = False
         self._head_camera_transform_op = None
         self._physics_step_error_logged = set()      # (subsystem, error) pairs already warned about
-        self._first_person_head_forward_offset = 0.10
-        self._first_person_head_up_offset = -0.10     # pull camera down from head prim to eye level
-        self._first_person_head_fallback_height = 1.55  # H1 eye height above robot base (~1.55 m)
+        self._first_person_head_forward_offset = 0.14   # sit at the face, not inside the skull
+        self._first_person_head_up_offset = -0.18       # drop from the head prim origin (top) to eye level
+        self._first_person_head_fallback_height = 1.50  # H1 eye height above robot base when no head prim found
         self._first_person_head_target_distance = 1.8
         # Headset velocity and horizontal-motion tracking (gait gate)
         self._last_headset_raw_position = None       # Gf.Vec3d: position from pose reader
@@ -155,7 +155,8 @@ class HumanoidExample(BaseSample):
         self._behavioral_data_records = []
         self._behavioral_data_step_counter = 0
         self._behavioral_data_log_every_n_steps = 2  # ~100 Hz (200 Hz / 2)
-        self._behavioral_flush_every_n_steps = 2000  # ~10 s at 200 Hz: periodic CSV flush during play
+        self._behavioral_flush_every_n_steps = 500   # ~2.5 s at 200 Hz: short sessions keep their
+                                                     # data even when the app closes without teardown
         self._behavioral_csv_fieldnames = {}         # filename -> header columns, fixed at first flush
         self._behavioral_data_output_dir = Path.home() / "BehavioralCollection"
         self._behavioral_sessions_root = self._behavioral_data_output_dir / "raw_sessions"
@@ -177,6 +178,8 @@ class HumanoidExample(BaseSample):
         self._behavioral_frame_dir = None
         self._behavioral_frame_camera = None          # None = not yet tried, False = failed, else Camera
         self._behavioral_frame_log_every_n_steps = 20  # ~10 Hz (200 Hz / 20)
+        self._behavioral_frame_counter = 0            # persistent PNG index: the records buffer is
+                                                      # cleared on every flush, so len() must not name files
         self._head_camera_update_counter = 0
         self._head_camera_update_interval = 1
         self._hand_tracking_arm_control_enabled = True
@@ -682,6 +685,9 @@ class HumanoidExample(BaseSample):
         self._smoothed_arm_rig_targets = {}
         self._active_h1_hand_target_matrices = {}
         self._reset_headset_gait_state()
+        # Flush any session left open by an unclean teardown (e.g. a reload that
+        # skipped the scene clear) so its buffered rows are saved, not discarded.
+        self._save_behavioral_data()
         self._behavioral_data_records = []
         self._behavioral_data_step_counter = 0
         self._behavioral_dof_names = []
@@ -1176,6 +1182,7 @@ class HumanoidExample(BaseSample):
         self._behavioral_frame_dir = frame_dir
         self._behavioral_session_id = session_id
         self._behavioral_csv_fieldnames = {}
+        self._behavioral_frame_counter = 0
 
         physics_dt = self._world_settings.get("physics_dt", 1.0 / 200.0)
         try:
@@ -1381,6 +1388,7 @@ class HumanoidExample(BaseSample):
         self._object_state_prev_positions = {}
         self._behavioral_csv_fieldnames = {}
         self._behavioral_data_step_counter = 0
+        self._behavioral_frame_counter = 0
         self._behavioral_session_dir = None
         self._behavioral_frame_dir = None
         self._behavioral_frame_camera = None
@@ -1444,7 +1452,7 @@ class HumanoidExample(BaseSample):
             # No rendered frame yet (rendering runs slower than physics); skip quietly.
             return
 
-        frame_id = len(self._behavioral_frame_records)
+        frame_id = self._behavioral_frame_counter
         image_name = f"frame_{frame_id:06d}.png"
         try:
             from PIL import Image
@@ -1463,6 +1471,7 @@ class HumanoidExample(BaseSample):
                 "image_path": f"frames/eye_camera/{image_name}",
             }
         )
+        self._behavioral_frame_counter += 1
 
     def _get_raw_hand_or_controller_pose(self, input_device):
         """Return an absolute hand-tracking or controller pose for logging (ignores grip gating)."""
