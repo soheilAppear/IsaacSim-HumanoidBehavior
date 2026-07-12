@@ -136,14 +136,29 @@ class HumanoidExample(BaseSample):
         self._h1_head_prim_lookup_complete = False
         self._head_camera_transform_op = None
         self._physics_step_error_logged = set()      # (subsystem, error) pairs already warned about
-        self._first_person_head_forward_offset = 0.14   # sit at the face, not inside the skull
+        self._first_person_head_forward_offset = 0.20   # sit ahead of the face so the head/torso mesh
+                                                         # cannot block the lower half of the view
         self._first_person_head_up_offset = 0.0         # extra fine-tune on top of the eye height below
         self._first_person_eye_height_above_base = 0.45  # m: H1 eyes sit ~0.45 m above the pelvis/base link.
                                                          # (The old code added ~1.5 m to the pelvis — which is
                                                          # already ~1 m up — parking the camera above the head.)
-        self._head_camera_yaw_sign = -1.0               # the yaw extracted from the base quaternion turned the
-                                                        # camera opposite to the robot's real rotation; set 1.0
-                                                        # to undo the flip if your build behaves differently
+        self._head_camera_yaw_sign = 1.0                # flip to -1.0 only if the DESKTOP view turns opposite
+                                                        # to the robot; the in-VR reversal was caused by
+                                                        # per-step camera forcing, fixed by the XR anchor below
+        # XR rig anchor: forcing the camera with schedule_set_camera every physics
+        # step re-locks the view to the robot each frame, cancelling the user's own
+        # head rotation (turning your head makes the world appear to counter-rotate).
+        # Instead the rig is anchored to a prim that moves with the robot, and the
+        # OpenXR runtime composes the real head pose on top — natural head tracking.
+        self._xr_use_custom_anchor = True
+        self._xr_anchor_path = "/World/H1_XRAnchor"
+        self._xr_anchor_op = None
+        self._xr_anchor_configured = False
+        self._xr_anchor_forward_offset = 0.10           # m: anchor slightly ahead of the base so the robot's
+                                                        # head mesh stays out of the user's face
+        self._xr_anchor_yaw_offset_deg = 0.0            # tune if "forward" in VR ends up rotated vs the robot
+        self._head_camera_last_base = None              # stashed by _get_head_camera_pose for the anchor
+        self._head_camera_last_yaw = None
         self._first_person_head_target_distance = 1.8
         # Headset velocity and horizontal-motion tracking (gait gate)
         self._last_headset_raw_position = None       # Gf.Vec3d: position from pose reader
@@ -647,6 +662,7 @@ class HumanoidExample(BaseSample):
         self._create_arm_control_rig()
         self._create_h1_attached_hands()
         self._create_head_camera()
+        self._create_xr_anchor()
 
     async def setup_post_load(self):
         """Setup keyboard input and physics callback after initial load."""
@@ -705,6 +721,9 @@ class HumanoidExample(BaseSample):
         self._behavioral_frame_records = []
         self._behavioral_frame_camera = None
         self._physics_step_error_logged = set()
+        self._xr_anchor_configured = False  # re-apply anchor settings on every load
+        self._head_camera_last_base = None
+        self._head_camera_last_yaw = None
         self._start_behavioral_session()
 
         torch = import_module("torch")
@@ -748,7 +767,8 @@ class HumanoidExample(BaseSample):
             self._eye_gaze_tracker = None
         self.h1 = None
         self._physics_ready = False
-        self._head_camera_transform_op = None  # handle dies with the stage; never reuse it
+        self._head_camera_transform_op = None  # handles die with the stage; never reuse them
+        self._xr_anchor_op = None
         self._restore_physics_simulation_state()
 
     def on_physics_step(self, dt: float, context: object) -> None:
@@ -829,6 +849,64 @@ class HumanoidExample(BaseSample):
         self._head_camera_transform_op = xformable.AddTransformOp()
         carb.log_info(f"HumanoidExample: created H1 head camera at {self._head_camera_path}")
 
+    def _create_xr_anchor(self) -> None:
+        """Create the Xform prim the VR rig anchors to (XR custom-anchor mode).
+
+        The rig origin corresponds to the physical floor of the playspace, so the
+        anchor sits at ground level under the robot; the user's real standing
+        height then puts their eyes near the robot's eye level, with full natural
+        head tracking on top.
+        """
+        stage = omni.usd.get_context().get_stage()
+        anchor = UsdGeom.Xform.Define(stage, self._xr_anchor_path)
+        anchor.ClearXformOpOrder()
+        self._xr_anchor_op = anchor.AddTransformOp()
+        carb.log_info(f"HumanoidExample: created XR rig anchor at {self._xr_anchor_path}")
+
+    def _configure_xr_custom_anchor(self) -> None:
+        """Switch the VR profile to custom-anchor mode, pointed at the H1 anchor prim.
+
+        Both the live and the persistent settings variants are written so the
+        viewport XR controller picks the change up regardless of which one it
+        watches in this Kit version.
+        """
+        if self._xr_anchor_configured:
+            return
+        self._xr_anchor_configured = True
+        try:
+            settings = carb.settings.get_settings()
+            for path in ("/persistent/xr/profile/vr/anchorMode", "/xr/profile/vr/anchorMode"):
+                settings.set(path, "custom anchor")
+            for path in ("/persistent/xr/profile/vr/stage/customAnchor", "/xr/profile/vr/stage/customAnchor"):
+                settings.set(path, self._xr_anchor_path)
+            carb.log_info(
+                f"HumanoidExample: XR anchor mode set to 'custom anchor' -> {self._xr_anchor_path}"
+            )
+        except Exception as e:
+            carb.log_warn(f"HumanoidExample: could not configure XR custom anchor: {e}")
+
+    def _update_xr_anchor(self, base: Gf.Vec3d, yaw: float) -> None:
+        """Move the XR anchor with the robot: ground position under the base + robot yaw.
+
+        Assumes flat ground at z=0 (this scene). The user rides the anchor like a
+        platform: walking/turning the robot carries them, while their own head
+        motion stays fully tracked by the runtime.
+        """
+        if self._xr_anchor_op is None or not self._xr_anchor_op.GetAttr().IsValid():
+            self._xr_anchor_op = None
+            self._create_xr_anchor()
+            if self._xr_anchor_op is None:
+                return
+        yaw_deg = math.degrees(yaw) + self._xr_anchor_yaw_offset_deg
+        forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
+        position = Gf.Vec3d(float(base[0]), float(base[1]), 0.0) + forward * self._xr_anchor_forward_offset
+        rot_m = Gf.Matrix4d(1.0).SetRotate(Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), yaw_deg))
+        trans_m = Gf.Matrix4d(1.0).SetTranslate(position)
+        try:
+            self._xr_anchor_op.Set(rot_m * trans_m)
+        except Exception:
+            self._xr_anchor_op = None  # stage changed under us; recreate next update
+
     def _set_active_head_camera(self) -> None:
         """Switch the active viewport to the H1 head camera when the viewport API is present."""
         try:
@@ -903,9 +981,13 @@ class HumanoidExample(BaseSample):
 
         qw, qx, qy, qz = (float(orientation[0]), float(orientation[1]), float(orientation[2]), float(orientation[3]))
         yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-        yaw *= self._head_camera_yaw_sign  # user-verified: raw yaw turned the view the wrong way
+        yaw *= self._head_camera_yaw_sign
         forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
         base = Gf.Vec3d(float(position[0]), float(position[1]), float(position[2]))
+        # Stash for the XR anchor update, which needs the raw base/yaw rather
+        # than the finished camera matrix.
+        self._head_camera_last_base = base
+        self._head_camera_last_yaw = yaw
 
         if not self._h1_head_prim_lookup_complete:
             self._h1_head_prim_path = self._find_h1_head_prim_path()
@@ -962,10 +1044,19 @@ class HumanoidExample(BaseSample):
             return
         self._head_camera_transform_op.Set(camera_pose)
         if self._xr_core is not None:
-            try:
-                self._xr_core.schedule_set_camera(camera_pose)
-            except Exception:
-                pass
+            if self._xr_use_custom_anchor:
+                # Rig rides the anchor prim; the runtime adds the user's real
+                # head pose on top, so head tracking stays natural.
+                self._configure_xr_custom_anchor()
+                if self._head_camera_last_base is not None and self._head_camera_last_yaw is not None:
+                    self._update_xr_anchor(self._head_camera_last_base, self._head_camera_last_yaw)
+            else:
+                # Legacy path: force the camera pose directly. Known problem:
+                # this cancels the user's own head rotation each frame.
+                try:
+                    self._xr_core.schedule_set_camera(camera_pose)
+                except Exception:
+                    pass
 
     def _get_gamepad_value(self, gamepad_input: carb.input.GamepadInput) -> float:
         """Return a gamepad/VR-controller input value if a controller is available."""
@@ -2515,7 +2606,8 @@ class HumanoidExample(BaseSample):
             self._eye_gaze_tracker = None
         self.h1 = None
         self._physics_ready = False
-        self._head_camera_transform_op = None  # handle dies with the stage; never reuse it
+        self._head_camera_transform_op = None  # handles die with the stage; never reuse them
+        self._xr_anchor_op = None
         self._restore_physics_simulation_state()
 
     def _restore_physics_simulation_state(self) -> None:

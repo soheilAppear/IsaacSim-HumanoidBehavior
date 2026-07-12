@@ -28,6 +28,16 @@
 | 🚶 | **Headset gait walking** *(experimental, off by default)* | Step in place (head bob) to walk the robot; peak/trough detection with a horizontal-motion gate against false triggers |
 | 🧠 | **Learning pipeline** ([`learning/`](learning/README.md)) | Phased plan: dataset sync → CSV baselines → frozen V-JEPA 2 embeddings → multimodal predictor → action-conditioned latent world model → MPC planner |
 
+### 🔬 The innovation: gaze-raycast object selection
+
+The eye tracker is not just a visualization — it is a **gaze-driven object-selection and auto-annotation method**:
+
+1. **Embodied gaze ray** — the Quest Pro's calibrated binocular gaze (`XR_EXT_eye_gaze_interaction`) is read in the *robot's* world frame: the XR rig rides the robot, so your gaze ray physically originates at the robot's eyes.
+2. **Self-hit-filtered raycast** — the ray is cast into the PhysX scene with subtree-aware filtering: collisions with the robot's own body are re-cast past, so the selected object is always what you *meant* to look at, never the embodiment itself.
+3. **Selection = annotation** — the first real collider along the ray (sample box, ground, …) becomes the selected object: tinted yellow in-scene, marked with a blood-red collision sphere, announced live on the terminal (`[EyeGaze] looking at sample box Box_03 @ (5.2, -0.4, 0.3) m, 3.8 m away`), and logged to `gaze.csv` at ~100 Hz with hit position, distance, and prim path.
+
+Because every gaze-selection event is time-aligned with hand poses, robot joint states, and first-person video, each session yields **ground-truth "what the human is attending to" labels for free** — visual-attention supervision for imitation learning and intent prediction, with zero manual annotation.
+
 <sub>All of it lives in two files: [`humanoid_example.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py) + [`eye_gaze_tracker.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/eye_gaze_tracker.py) — drop them into a stock Isaac Sim 6.0 install ([3 install options](HUMANOID_VR_CONTROL.md#installation--how-to-apply)). Works desktop-only with keyboard too; VR and eye tracking are optional layers.</sub>
 
 ---
