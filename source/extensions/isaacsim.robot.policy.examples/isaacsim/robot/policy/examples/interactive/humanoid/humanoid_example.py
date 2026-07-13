@@ -145,18 +145,25 @@ class HumanoidExample(BaseSample):
         self._head_camera_yaw_sign = 1.0                # flip to -1.0 only if the DESKTOP view turns opposite
                                                         # to the robot; the in-VR reversal was caused by
                                                         # per-step camera forcing, fixed by the XR anchor below
-        # XR rig anchor: forcing the camera with schedule_set_camera every physics
-        # step re-locks the view to the robot each frame, cancelling the user's own
-        # head rotation (turning your head makes the world appear to counter-rotate).
-        # Instead the rig is anchored to a prim that moves with the robot, and the
-        # OpenXR runtime composes the real head pose on top — natural head tracking.
-        self._xr_use_custom_anchor = True
+        # XR camera modes (the reversal/frozen-camera saga, in order of discovery):
+        #   "camera_lock"   - schedule_set_camera(robot head pose) every step. Follows
+        #                     the robot but cancels the user's own head rotation.
+        #   "custom_anchor" - XR custom-anchor prim. Natural head tracking, but this
+        #                     Kit build does not track a MOVING anchor prim, so the
+        #                     camera stays behind while the robot walks.
+        #   "head_compose"  - schedule_set_camera(physical_head_pose · axis_fix · anchor).
+        #                     The runtime internally subtracts the current head pose;
+        #                     pre-multiplying it in makes that subtraction cancel
+        #                     itself instead of the head motion. Follows the robot AND
+        #                     keeps natural head tracking. Absolute, so no drift.
+        self._xr_camera_mode = "head_compose"
         self._xr_anchor_path = "/World/H1_XRAnchor"
         self._xr_anchor_op = None
         self._xr_anchor_configured = False
         self._xr_anchor_forward_offset = 0.10           # m: anchor slightly ahead of the base so the robot's
                                                         # head mesh stays out of the user's face
-        self._xr_anchor_yaw_offset_deg = 0.0            # tune if "forward" in VR ends up rotated vs the robot
+        self._xr_anchor_yaw_offset_deg = -90.0          # aligns physical "room forward" with robot +X in
+                                                        # head_compose mode; try 0/90/180 if you spawn rotated
         self._head_camera_last_base = None              # stashed by _get_head_camera_pose for the anchor
         self._head_camera_last_yaw = None
         self._first_person_head_target_distance = 1.8
@@ -932,6 +939,57 @@ class HumanoidExample(BaseSample):
         except Exception:
             self._xr_anchor_op = None  # stage changed under us; recreate next update
 
+    def _schedule_composed_xr_camera(self) -> None:
+        """Follow the robot AND keep natural head tracking with one schedule_set_camera call.
+
+        schedule_set_camera(M) makes the final rendered view equal M by internally
+        subtracting the user's current physical head pose. Passing
+
+            M = physical_head_pose · (Y-up→Z-up axis fix) · robot_anchor
+
+        means that internal subtraction cancels the head term we injected — the
+        effective rig origin becomes the robot anchor, and the runtime keeps
+        compositing the LIVE head pose on top. The user rides the robot with full
+        natural head tracking. The math is absolute (recomputed from the current
+        poses every step, never integrated), so timing mismatches between our
+        read and the runtime's latch produce at most a transient, never drift.
+        """
+        if self._head_camera_last_base is None or self._head_camera_last_yaw is None:
+            return
+        headset = self._get_xr_input_device("/user/head")
+        if headset is None:
+            return
+
+        head_pose = None
+        for reader_name in ("get_pose", "get_raw_pose"):
+            reader = getattr(headset, reader_name, None)
+            if reader is None:
+                continue
+            try:
+                head_pose = Gf.Matrix4d(reader())
+                break
+            except Exception:
+                continue
+        if head_pose is None:
+            return
+
+        base = self._head_camera_last_base
+        yaw = self._head_camera_last_yaw
+        yaw_deg = math.degrees(yaw) + self._xr_anchor_yaw_offset_deg
+        forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
+        position = Gf.Vec3d(float(base[0]), float(base[1]), 0.0) + forward * self._xr_anchor_forward_offset
+
+        anchor_m = Gf.Matrix4d(1.0).SetRotate(
+            Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), yaw_deg)
+        ) * Gf.Matrix4d(1.0).SetTranslate(position)
+        # Physical (OpenXR) space is Y-up; the stage is Z-up. Rotate +90° about X
+        # so the head pose composes correctly under the Z-up anchor.
+        yup_to_zup = Gf.Matrix4d(1.0).SetRotate(Gf.Rotation(Gf.Vec3d(1.0, 0.0, 0.0), 90.0))
+        try:
+            self._xr_core.schedule_set_camera(head_pose * yup_to_zup * anchor_m)
+        except Exception:
+            pass
+
     def _set_active_head_camera(self) -> None:
         """Switch the active viewport to the H1 head camera when the viewport API is present."""
         try:
@@ -1069,15 +1127,13 @@ class HumanoidExample(BaseSample):
             return
         self._head_camera_transform_op.Set(camera_pose)
         if self._xr_core is not None:
-            if self._xr_use_custom_anchor:
-                # Rig rides the anchor prim; the runtime adds the user's real
-                # head pose on top, so head tracking stays natural.
+            if self._xr_camera_mode == "head_compose":
+                self._schedule_composed_xr_camera()
+            elif self._xr_camera_mode == "custom_anchor":
                 self._configure_xr_custom_anchor()
                 if self._head_camera_last_base is not None and self._head_camera_last_yaw is not None:
                     self._update_xr_anchor(self._head_camera_last_base, self._head_camera_last_yaw)
-            else:
-                # Legacy path: force the camera pose directly. Known problem:
-                # this cancels the user's own head rotation each frame.
+            else:  # "camera_lock" — follows the robot but cancels user head rotation
                 try:
                     self._xr_core.schedule_set_camera(camera_pose)
                 except Exception:
