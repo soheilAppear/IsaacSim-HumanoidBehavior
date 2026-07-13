@@ -61,6 +61,7 @@ __pycache__/
 # *.ico
 *.bmp
 *.gif
+!docs/readme/*.gif
 *.jpg
 *.jpeg
 *.tga
