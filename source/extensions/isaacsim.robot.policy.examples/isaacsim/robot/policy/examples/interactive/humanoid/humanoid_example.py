@@ -136,8 +136,8 @@ class HumanoidExample(BaseSample):
         self._h1_head_prim_lookup_complete = False
         self._head_camera_transform_op = None
         self._physics_step_error_logged = set()      # (subsystem, error) pairs already warned about
-        self._first_person_head_forward_offset = 0.20   # sit ahead of the face so the head/torso mesh
-                                                         # cannot block the lower half of the view
+        self._first_person_head_forward_offset = 0.35   # well ahead of the head so the camera never meets
+                                                         # the robot mesh and the view stays fully clear
         self._first_person_head_up_offset = 0.0         # extra fine-tune on top of the eye height below
         self._first_person_eye_height_above_base = 0.75  # m above the pelvis/base link: ~5 cm above the top of
                                                          # the H1 head — close to first-person but clear of the
@@ -160,8 +160,8 @@ class HumanoidExample(BaseSample):
         self._xr_anchor_path = "/World/H1_XRAnchor"
         self._xr_anchor_op = None
         self._xr_anchor_configured = False
-        self._xr_anchor_forward_offset = 0.10           # m: anchor slightly ahead of the base so the robot's
-                                                        # head mesh stays out of the user's face
+        self._xr_anchor_forward_offset = 0.25           # m: anchor ahead of the base so the robot's head and
+                                                        # shoulders stay out of the user's view
         self._xr_anchor_height_offset = 0.5             # m: lifts the whole VR rig; your real eye height adds
                                                         # on top, putting the view above the robot's head
         self._xr_anchor_yaw_offset_deg = -90.0          # aligns physical "room forward" with robot +X in
