@@ -139,9 +139,9 @@ class HumanoidExample(BaseSample):
         self._first_person_head_forward_offset = 0.20   # sit ahead of the face so the head/torso mesh
                                                          # cannot block the lower half of the view
         self._first_person_head_up_offset = 0.0         # extra fine-tune on top of the eye height below
-        self._first_person_eye_height_above_base = 0.45  # m: H1 eyes sit ~0.45 m above the pelvis/base link.
-                                                         # (The old code added ~1.5 m to the pelvis — which is
-                                                         # already ~1 m up — parking the camera above the head.)
+        self._first_person_eye_height_above_base = 0.85  # m above the pelvis/base link: ~0.15 m above the top
+                                                         # of the H1 head, per user preference (0.45 = true eye
+                                                         # level if you want the strict first-person view back)
         self._head_camera_yaw_sign = 1.0                # flip to -1.0 only if the DESKTOP view turns opposite
                                                         # to the robot; the in-VR reversal was caused by
                                                         # per-step camera forcing, fixed by the XR anchor below
@@ -162,6 +162,8 @@ class HumanoidExample(BaseSample):
         self._xr_anchor_configured = False
         self._xr_anchor_forward_offset = 0.10           # m: anchor slightly ahead of the base so the robot's
                                                         # head mesh stays out of the user's face
+        self._xr_anchor_height_offset = 0.5             # m: lifts the whole VR rig; your real eye height adds
+                                                        # on top, putting the view above the robot's head
         self._xr_anchor_yaw_offset_deg = -90.0          # aligns physical "room forward" with robot +X in
                                                         # head_compose mode; try 0/90/180 if you spawn rotated
         self._head_camera_last_base = None              # stashed by _get_head_camera_pose for the anchor
@@ -931,7 +933,10 @@ class HumanoidExample(BaseSample):
                 return
         yaw_deg = math.degrees(yaw) + self._xr_anchor_yaw_offset_deg
         forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
-        position = Gf.Vec3d(float(base[0]), float(base[1]), 0.0) + forward * self._xr_anchor_forward_offset
+        position = (
+            Gf.Vec3d(float(base[0]), float(base[1]), self._xr_anchor_height_offset)
+            + forward * self._xr_anchor_forward_offset
+        )
         rot_m = Gf.Matrix4d(1.0).SetRotate(Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), yaw_deg))
         trans_m = Gf.Matrix4d(1.0).SetTranslate(position)
         try:
@@ -977,7 +982,10 @@ class HumanoidExample(BaseSample):
         yaw = self._head_camera_last_yaw
         yaw_deg = math.degrees(yaw) + self._xr_anchor_yaw_offset_deg
         forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
-        position = Gf.Vec3d(float(base[0]), float(base[1]), 0.0) + forward * self._xr_anchor_forward_offset
+        position = (
+            Gf.Vec3d(float(base[0]), float(base[1]), self._xr_anchor_height_offset)
+            + forward * self._xr_anchor_forward_offset
+        )
 
         anchor_m = Gf.Matrix4d(1.0).SetRotate(
             Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), yaw_deg)
