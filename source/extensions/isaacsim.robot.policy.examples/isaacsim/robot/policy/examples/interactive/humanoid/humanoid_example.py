@@ -874,13 +874,38 @@ class HumanoidExample(BaseSample):
             return
         self._xr_anchor_configured = True
         try:
+            import carb.settings
+
+            profile = "vr"
+            try:
+                name = str(self._xr_core.get_current_profile().get_name())
+                if name:
+                    profile = name
+            except Exception:
+                pass
+
             settings = carb.settings.get_settings()
-            for path in ("/persistent/xr/profile/vr/anchorMode", "/xr/profile/vr/anchorMode"):
+            # The XR settings wrapper resolves "profile/persistent/anchorMode" to
+            # "/xr/profile/<name>/persistent/anchorMode" — note the "persistent/"
+            # SEGMENT inside the path (it is part of the setting name, not just a
+            # settings hive). Every plausible variant is written; extras are inert.
+            anchor_mode_paths = (
+                f"/xr/profile/{profile}/persistent/anchorMode",
+                f"/persistent/xr/profile/{profile}/persistent/anchorMode",
+                f"/xr/profile/{profile}/anchorMode",
+                f"/persistent/xr/profile/{profile}/anchorMode",
+            )
+            custom_anchor_paths = (
+                f"/xr/profile/{profile}/stage/customAnchor",
+                f"/persistent/xr/profile/{profile}/stage/customAnchor",
+            )
+            for path in anchor_mode_paths:
                 settings.set(path, "custom anchor")
-            for path in ("/persistent/xr/profile/vr/stage/customAnchor", "/xr/profile/vr/stage/customAnchor"):
+            for path in custom_anchor_paths:
                 settings.set(path, self._xr_anchor_path)
             carb.log_info(
-                f"HumanoidExample: XR anchor mode set to 'custom anchor' -> {self._xr_anchor_path}"
+                f"HumanoidExample: XR profile '{profile}' anchor mode set to 'custom anchor' "
+                f"-> {self._xr_anchor_path}"
             )
         except Exception as e:
             carb.log_warn(f"HumanoidExample: could not configure XR custom anchor: {e}")
