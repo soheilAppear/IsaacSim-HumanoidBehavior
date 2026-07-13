@@ -15,6 +15,10 @@
 
 **[📄 Setup & Usage Guide](HUMANOID_VR_CONTROL.md)** · **[🧠 Learning Pipeline](learning/README.md)** · **[📊 Data Schema](HUMANOID_VR_CONTROL.md#behavioral-data-collection)**
 
+<img src="docs/readme/vr_gaze_showcase.gif" alt="VR view: eye gaze selects a sample box (highlighted yellow), the red collision marker pins the exact gaze point, and the H1's hands reach for it" width="640">
+
+*Live capture through the headset: eye gaze selects the box (yellow), the red marker pins the exact gaze-collision point, the H1's arms follow the user's hands — all while every signal streams into the dataset.*
+
 </div>
 
 **The idea:** teleoperating a humanoid in VR produces exactly the data embodied-AI research is starving for — synchronized human *intent* (head motion, hand poses, eye gaze) paired with robot *behavior* (full joint states, base trajectory, commands) and *first-person video*. This fork turns the stock Isaac Sim H1 example into that recording instrument, and ships the scaffold of a V-JEPA-based world-model pipeline to consume it.

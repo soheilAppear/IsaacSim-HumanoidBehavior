@@ -6,6 +6,9 @@ _*/
 # exclude local website repo, used for publishing
 website/
 
+# raw OBS/VR screen recordings (showcase clips are cut into docs/readme/)
+videos/
+
 # learning/ pipeline: raw/processed data, embeddings, checkpoints, logs
 BehavioralCollection/
 learning/**/*.mp4
