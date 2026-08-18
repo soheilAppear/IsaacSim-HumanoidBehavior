@@ -6,7 +6,7 @@
 
 # 🥽 VR Humanoid Behavior Lab
 
-### Become a Unitree H1 humanoid — walk it, reach with your hands, look with your eyes.<br>Every signal you produce becomes a time-aligned multimodal dataset for embodied AI.
+### Become a Unitree G1 humanoid — move it, reach with your hands, grasp with your fingers, look with your eyes.<br>Every signal you produce becomes a time-aligned multimodal dataset for embodied AI.
 
 [![Isaac Sim 6.0](https://img.shields.io/badge/Isaac%20Sim-6.0.0-76b900.svg)](https://github.com/isaac-sim/IsaacSim)
 [![OpenXR](https://img.shields.io/badge/OpenXR-SteamVR%20%2B%20Steam%20Link-1793d1.svg)](HUMANOID_VR_CONTROL.md#quest-pro-eye-tracking-optional)
@@ -15,21 +15,23 @@
 
 **[📄 Setup & Usage Guide](HUMANOID_VR_CONTROL.md)** · **[🧠 Learning Pipeline](learning/README.md)** · **[📊 Data Schema](HUMANOID_VR_CONTROL.md#behavioral-data-collection)**
 
-<img src="docs/readme/vr_gaze_showcase.gif" alt="VR view: eye gaze selects a sample box (highlighted yellow), the red collision marker pins the exact gaze point, and the H1's hands reach for it" width="640">
+<img src="docs/readme/vr_gaze_showcase.gif" alt="VR view: eye gaze selects a sample box (highlighted yellow), the red collision marker pins the exact gaze point, and the robot's hands reach for it" width="640">
 
-*Live capture through the headset: eye gaze selects the box (yellow), the red marker pins the exact gaze-collision point, the H1's arms follow the user's hands — all while every signal streams into the dataset.*
+*Live capture through the headset: eye gaze selects the box (yellow), the red marker pins the exact gaze-collision point, the robot's arms follow the user's hands — all while every signal streams into the dataset. (Recorded on the earlier H1 build; the robot is now the G1 with dexterous hands.)*
 
 </div>
 
-**The idea:** teleoperating a humanoid in VR produces exactly the data embodied-AI research is starving for — synchronized human *intent* (head motion, hand poses, eye gaze) paired with robot *behavior* (full joint states, base trajectory, commands) and *first-person video*. This fork turns the stock Isaac Sim H1 example into that recording instrument, and ships the scaffold of a V-JEPA-based world-model pipeline to consume it.
+**The idea:** teleoperating a humanoid in VR produces exactly the data embodied-AI research is starving for — synchronized human *intent* (head motion, hand poses, eye gaze) paired with robot *behavior* (full joint states, base trajectory, commands) and *first-person video*. This fork turns the stock Isaac Sim humanoid example into that recording instrument — retargeted onto the **Unitree G1 with Inspire five-finger hands**, the Unitree humanoid [Isaac Teleop](https://github.com/NVIDIA/IsaacTeleop) drives for dexterous manipulation — and ships the scaffold of a V-JEPA-based world-model pipeline to consume it.
 
 | | Feature | What it does |
 |---|---------|--------------|
 | 👁️ | **Quest Pro eye tracking** — *verified end-to-end* | Real OpenXR eye gaze over SteamVR + Steam Link, drawn as a red ray with a blood-red marker at the gaze collision; gazed objects highlight yellow; live `[EyeGaze] looking at sample box Box_03 @ (5.2, -0.4, 0.3) m` terminal events |
 | 📼 | **Behavioral session recorder** | Every run auto-creates a session: 5 time-aligned ~100 Hz CSVs (HMD, hands, gaze + collisions, objects, all robot joints) + ~10 Hz first-person frames + metadata — **crash-safe**, flushed to disk every 10 s |
-| 🤲 | **Hand tracking & arm teleop** | OpenXR hand/controller poses drive the H1 arms while the RL policy keeps it balanced; grab system for physics objects |
+| 🤲 | **Hand tracking & arm teleop** | OpenXR hand/controller poses drive the G1 arms; grab system for physics objects |
+| ✋ | **Dexterous finger control** | The G1's real Inspire hand joints open and close from your own fingers: per-finger curl is measured from the OpenXR hand skeleton, or from trigger (index) and grip (the rest) on controllers |
 | 🎥 | **Eye-level first-person camera** | Viewport/XR camera rides at the robot's eye height — in VR you literally see through the robot's eyes |
-| 🚶 | **Headset gait walking** *(experimental, off by default)* | Step in place (head bob) to walk the robot; peak/trough detection with a horizontal-motion gate against false triggers |
+| 🚶 | **Real walking gait** | Unitree's own pretrained G1 policy (BSD-3-Clause) drives the legs at 50 Hz — measured 2.69 m in 5 s on a 0.5 m/s command with genuinely alternating feet. It controls *only* the legs, so your arms and fingers never fight the balance controller. A kinematic glide mode is available as a can't-fall fallback |
+| 🧍 | **Headset gait walking** *(experimental, off by default)* | Step in place (head bob) to move the robot; peak/trough detection with a horizontal-motion gate against false triggers |
 | 🧠 | **Learning pipeline** ([`learning/`](learning/README.md)) | Phased plan: dataset sync → CSV baselines → frozen V-JEPA 2 embeddings → multimodal predictor → action-conditioned latent world model → MPC planner |
 
 ### 🔬 The innovation: gaze-raycast object selection

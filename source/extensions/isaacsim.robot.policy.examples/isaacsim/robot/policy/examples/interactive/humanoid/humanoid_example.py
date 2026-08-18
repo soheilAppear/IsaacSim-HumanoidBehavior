@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Interactive humanoid robot simulation example using H1 robot with GPU-accelerated physics and keyboard control."""
+"""Interactive humanoid simulation example: Unitree G1 with dexterous hands, VR teleoperated."""
 
 import csv
 import json
@@ -34,22 +34,24 @@ from isaacsim.robot.policy.examples.interactive.utils import (
     restore_physics_simulation_state,
     snapshot_physics_simulation_state,
 )
-from isaacsim.robot.policy.examples.robots import H1FlatTerrainPolicy
+from isaacsim.robot.policy.examples.robots import G1TeleopRobot
 from isaacsim.storage.native import get_assets_root_path
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
+from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 
 class HumanoidExample(BaseSample):
-    """A humanoid robot simulation example using H1 robot with GPU-accelerated physics.
+    """A humanoid robot simulation example using the Unitree G1 with dexterous hands.
 
-    This class demonstrates a complete humanoid robot simulation setup with real-time control capabilities.
-    It configures a high-frequency physics simulation (200 Hz) with GPU acceleration and provides keyboard-based
-    control for the H1 humanoid robot. The example includes proper scene setup, physics callbacks, and cleanup
-    management.
+    This class demonstrates a complete humanoid teleoperation setup with real-time control
+    capabilities. It configures a high-frequency physics simulation (200 Hz) with GPU
+    acceleration and provides keyboard, gamepad and VR control of the G1 humanoid.
 
-    The simulation uses optimized settings with 200 Hz physics timestep and 25 Hz rendering to ensure smooth
-    real-time performance. The H1 robot is controlled through a policy-based system that processes movement
-    commands and maintains balance during locomotion.
+    The robot is the 29-DOF G1 fitted with Inspire five-finger hands — the Unitree humanoid
+    that Isaac Teleop drives for dexterous manipulation. Isaac Sim ships no trained
+    locomotion policy for the G1, so ``G1TeleopRobot`` holds the standing posture on the
+    joint drives and integrates the base pose kinematically from the locomotion command:
+    the robot glides and turns on command and never falls mid-session. Upper-body joints
+    and every finger stay free for the teleoperation layer below.
 
     Keyboard controls:
         - NUMPAD_8 or UP: Move forward
@@ -57,6 +59,9 @@ class HumanoidExample(BaseSample):
         - NUMPAD_6 or RIGHT: Turn right
 
     VR extensions (this fork — see HUMANOID_VR_CONTROL.md for the full guide):
+        - Finger teleoperation: OpenXR hand-tracking joints give a per-finger curl that
+          drives the G1's real finger joints; with controllers, the trigger curls the
+          index finger and the grip closes the remaining fingers and thumb.
         - Headset gait: bob the HMD up/down (step in place) to walk forward; a
           horizontal-motion gate suppresses false triggers from nodding on the spot.
           Currently DISABLED by default (_headset_gait_enabled = False) while step
@@ -66,7 +71,7 @@ class HumanoidExample(BaseSample):
           blood-red marker sphere at the gazed collider (boxes, ground), gazed box
           tinted yellow, and live "[EyeGaze] looking at ..." terminal events on
           every target change.
-        - First-person eye camera: the viewport/XR camera follows the H1 head at eye height.
+        - First-person eye camera: the viewport/XR camera follows the G1 head at eye height.
         - Hand-tracking / controller arm teleoperation, plus a grab system for sample boxes.
         - Behavioral session logging: each load creates a session folder under
           ~/BehavioralCollection/raw_sessions/ holding behavior.csv, hand_tracking.csv,
@@ -89,7 +94,7 @@ class HumanoidExample(BaseSample):
 
         self._base_command = None
         self._physics_ready = False
-        self.h1 = None
+        self.g1 = None
         self._physics_callback_id = None
         self._event_timer_callback = None
         self._sub_keyboard = None
@@ -131,17 +136,17 @@ class HumanoidExample(BaseSample):
         self._headset_gait_last_step_time = -999.0
         self._headset_gait_pulse_time_remaining = 0.0
         self._headset_gait_output = 0.0
-        self._head_camera_path = "/World/H1_HeadCamera"
-        self._h1_head_prim_path = None
-        self._h1_head_prim_lookup_complete = False
+        self._head_camera_path = "/World/G1_HeadCamera"
         self._head_camera_transform_op = None
         self._physics_step_error_logged = set()      # (subsystem, error) pairs already warned about
-        self._first_person_head_forward_offset = 0.35   # well ahead of the head so the camera never meets
+        # Camera geometry, re-tuned for the G1: it stands 1.32 m tall against the H1's
+        # 1.80 m, so every offset that was measured against the H1 skull had to shrink.
+        self._first_person_head_forward_offset = 0.26   # well ahead of the head so the camera never meets
                                                          # the robot mesh and the view stays fully clear
         self._first_person_head_up_offset = 0.0         # extra fine-tune on top of the eye height below
-        self._first_person_eye_height_above_base = 0.75  # m above the pelvis/base link: ~5 cm above the top of
-                                                         # the H1 head — close to first-person but clear of the
-                                                         # head mesh (0.45 = strict eye level inside the head)
+        self._first_person_eye_height_above_base = 0.58  # m above the pelvis/base link: ~5 cm above the top of
+                                                         # the G1 head — close to first-person but clear of the
+                                                         # head mesh (0.46 = strict eye level inside the head)
         self._head_camera_yaw_sign = 1.0                # flip to -1.0 only if the DESKTOP view turns opposite
                                                         # to the robot; the in-VR reversal was caused by
                                                         # per-step camera forcing, fixed by the XR anchor below
@@ -157,13 +162,16 @@ class HumanoidExample(BaseSample):
         #                     itself instead of the head motion. Follows the robot AND
         #                     keeps natural head tracking. Absolute, so no drift.
         self._xr_camera_mode = "head_compose"
-        self._xr_anchor_path = "/World/H1_XRAnchor"
+        self._xr_anchor_path = "/World/G1_XRAnchor"
         self._xr_anchor_op = None
         self._xr_anchor_configured = False
-        self._xr_anchor_forward_offset = 0.25           # m: anchor ahead of the base so the robot's head and
+        self._xr_anchor_forward_offset = 0.18           # m: anchor ahead of the base so the robot's head and
                                                         # shoulders stay out of the user's view
-        self._xr_anchor_height_offset = 0.5             # m: lifts the whole VR rig; your real eye height adds
-                                                        # on top, putting the view above the robot's head
+        self._xr_anchor_height_offset = -0.30           # m: shifts the whole VR rig; your real standing eye
+                                                        # height adds on top. NEGATIVE for the G1: it is only
+                                                        # 1.32 m tall, so the rig must sink below the floor for
+                                                        # your eyes to land near the robot's (~1.25 m). Raise
+                                                        # towards 0 if you are shorter, lower if you are taller.
         self._xr_anchor_yaw_offset_deg = -90.0          # aligns physical "room forward" with robot +X in
                                                         # head_compose mode; try 0/90/180 if you spawn rotated
         self._head_camera_last_base = None              # stashed by _get_head_camera_pose for the anchor
@@ -214,11 +222,11 @@ class HumanoidExample(BaseSample):
         self._hand_tracking_arm_control_enabled = True
         self._controller_arm_control_enabled = True
         self._hand_tracking_status_logged = False
-        self._h1_arm_dofs_configured = False
-        self._h1_arm_dof_indices_by_side = {}
-        self._h1_arm_joint_names_by_side = {}
-        self._h1_arm_joint_defaults = {}
-        self._h1_arm_joint_limits = {}
+        self._g1_arm_dofs_configured = False
+        self._g1_arm_dof_indices_by_side = {}
+        self._g1_arm_joint_names_by_side = {}
+        self._g1_arm_joint_defaults = {}
+        self._g1_arm_joint_limits = {}
         self._hand_pose_candidates = ("palm", "wrist", "grip", "aim", "")
         self._controller_pose_candidates = ("grip", "aim", "")
         self._arm_smoothing = 0.34
@@ -226,49 +234,69 @@ class HumanoidExample(BaseSample):
         self._arm_rig_smoothing = 0.38
         self._smoothed_arm_rig_targets = {}
         self._controller_arm_neutral_positions = {}
-        self._grab_radius = 0.42
+        self._grab_radius = 0.30       # m: scaled to the G1's smaller hand and reach
         self._grabbed_objects_by_side = {}
         self._grabbed_object_offsets = {}
         self._grabbed_object_was_kinematic = {}
-        self._arm_rig_root_path = "/World/H1_ArmControlRig"
+        self._arm_rig_root_path = "/World/G1_ArmControlRig"
         self._arm_rig_target_paths = {
             "left": f"{self._arm_rig_root_path}/LeftHandTarget",
             "right": f"{self._arm_rig_root_path}/RightHandTarget",
         }
         self._arm_rig_target_ops = {}
-        self._sample_box_root_path = "/World/H1_SampleBoxes"
+        self._sample_box_root_path = "/World/G1_SampleBoxes"
         self._sample_box_count = 10
         self._sample_box_seed = 12
         self._sample_box_density = 5.0
         self._sample_box_min_mass = 0.45
         self._sample_box_max_mass = 4.5
-        self._spawn_g1_hand_reference = False
-        self._g1_reference_path = "/World/G1_HandReference"
-        self._g1_reference_usd_path = (
-            Path(__file__).resolve().parents[7] / "isaacsim.asset.transformer.rules" / "data" / "tests" / "G1" / "g1.usda"
-        )
-        self._h1_attached_hands_enabled = True
-        self._h1_attached_hands_root_path = "/World/H1_AttachedHands"
-        self._h1_hand_target_paths = {
-            "left": f"{self._h1_attached_hands_root_path}/LeftHand",
-            "right": f"{self._h1_attached_hands_root_path}/RightHand",
-        }
-        self._h1_hand_target_ops = {}
-        self._h1_hand_attachment_paths = {}
-        self._h1_hand_attachment_ops = {}
-        self._h1_link_hands_created = False
-        self._h1_terminal_arm_prim_paths = {}
-        self._h1_terminal_arm_lookup_complete = False
-        self._h1_hand_local_offsets = {
-            "left": Gf.Vec3d(0.13, 0.035, 0.0),
-            "right": Gf.Vec3d(0.13, -0.035, 0.0),
-        }
-        self._h1_wrist_bottom_hand_offset = Gf.Vec3d(0.24, 0.0, -0.035)
-        self._active_h1_hand_target_matrices = {}
+        self._active_g1_hand_target_matrices = {}
         self._preserve_existing_rig_calibration = True
-        self._snap_h1_hands_to_wrist_connections = True
         self._manual_arm_rig_target_world_positions = {}
         self._arm_rig_world_offsets = {}
+        # G1 robot configuration. Unlike the H1 this asset carries real articulated hands,
+        # so the fake box-hand attachments the H1 needed are gone entirely.
+        self._g1_prim_path = "/World/G1"
+        self._g1_hand_variant = "Inspire"             # "Inspire" (5 fingers) or "ThreeFinger" (Dex3)
+        self._g1_spawn_position = [0.0, 0.0, 0.80]    # pelvis height of the standing posture:
+                                                       # the lowest spawn whose feet rest on the
+                                                       # ground instead of penetrating it
+        # Locomotion mode:
+        #   "policy"    - Unitree's pretrained G1 walking policy drives the 12 leg joints
+        #                 with real physics-based gait; waist and arms stay free for
+        #                 teleoperation. Needs robots/data/g1_unitree_motion.pt.
+        #   "kinematic" - no policy: the posture is held and the base glides on command.
+        #                 Cannot fall over; use it if the gait misbehaves.
+        self._g1_locomotion = "policy"
+        # Finger teleoperation
+        self._finger_control_enabled = True
+        self._finger_smoothing = 0.35                 # low-pass on curl, per physics step
+        self._finger_curl_deadzone = 0.04             # ignore controller/tracking noise near open
+        self._smoothed_finger_curls = {}              # side -> {finger role: curl}
+        self._latest_finger_curls = {}                # side -> {finger role: curl}, for hand_tracking.csv
+        self._finger_curl_source = {}                 # side -> "hand_tracking" | "controller" | "none"
+        self._finger_grab_threshold = 0.55            # mean curl at which a nearby box is grabbed
+        self._finger_roles = ("thumb", "index", "middle", "ring", "little")
+        # Hand-tracking joint triplets used to measure each finger's flexion angle. Bones
+        # are compared rather than distances so the metric is independent of hand size.
+        self._finger_curl_joint_chains = {
+            "thumb": ("thumb_metacarpal", "thumb_proximal", "thumb_distal", "thumb_tip"),
+            "index": ("index_metacarpal", "index_proximal", "index_distal", "index_tip"),
+            "middle": ("middle_metacarpal", "middle_proximal", "middle_distal", "middle_tip"),
+            "ring": ("ring_metacarpal", "ring_proximal", "ring_distal", "ring_tip"),
+            "little": ("little_metacarpal", "little_proximal", "little_distal", "little_tip"),
+        }
+        # Bone angle counted as a fully closed finger. The thumb only folds about halfway
+        # as far as the fingers do, so sharing one threshold would leave it half open in
+        # a fist. Measured metacarpal-bone to distal-phalanx, matching the chains above.
+        self._finger_curl_full_flexion_rad = {
+            "thumb": math.radians(95.0),
+            "index": math.radians(150.0),
+            "middle": math.radians(150.0),
+            "ring": math.radians(150.0),
+            "little": math.radians(150.0),
+        }
+        self._finger_tracking_status_logged = False
         self._prev_physics_sim_device: str | None = None
         self._prev_fabric_enabled: bool | None = None
 
@@ -309,7 +337,7 @@ class HumanoidExample(BaseSample):
             binding_api.Bind(material)
 
     def _create_sample_boxes(self) -> None:
-        """Create physical boxes in front of H1 for controller/arm interaction testing."""
+        """Create physical boxes in front of G1 for controller/arm interaction testing."""
         stage = omni.usd.get_context().get_stage()
         UsdGeom.Xform.Define(stage, self._sample_box_root_path)
         rng = random.Random(self._sample_box_seed)
@@ -337,15 +365,15 @@ class HumanoidExample(BaseSample):
                 self._sample_box_max_mass,
             )
             mass_api.CreateMassAttr().Set(package_mass)
-            prim.CreateAttribute("h1:packageSize", Sdf.ValueTypeNames.Float).Set(size)
-            prim.CreateAttribute("h1:packageMass", Sdf.ValueTypeNames.Float).Set(package_mass)
+            prim.CreateAttribute("g1:packageSize", Sdf.ValueTypeNames.Float).Set(size)
+            prim.CreateAttribute("g1:packageMass", Sdf.ValueTypeNames.Float).Set(package_mass)
 
         carb.log_info(
             f"HumanoidExample: created {self._sample_box_count} sample boxes under {self._sample_box_root_path}"
         )
 
     def _create_arm_control_rig(self) -> None:
-        """Create visible controller target markers and hand meshes used as the H1 arm-control rig."""
+        """Create visible controller target markers and hand meshes used as the G1 arm-control rig."""
         stage = omni.usd.get_context().get_stage()
         UsdGeom.Xform.Define(stage, self._arm_rig_root_path)
         colors = {"left": Gf.Vec3f(0.1, 0.55, 1.0), "right": Gf.Vec3f(1.0, 0.25, 0.15)}
@@ -373,54 +401,19 @@ class HumanoidExample(BaseSample):
             marker.CreateDisplayColorAttr().Set([colors[side]])
             UsdGeom.Imageable(marker.GetPrim()).MakeInvisible()
 
-        carb.log_info(f"HumanoidExample: created H1 arm-control rig under {self._arm_rig_root_path}")
-
-    def _create_h1_rig_hand_mesh(self, parent_path: str, side: str, color: Gf.Vec3f) -> None:
-        """Create a simple hand mesh as a child of the arm rig target."""
-        stage = omni.usd.get_context().get_stage()
-        side_sign = 1.0 if side == "left" else -1.0
-        hand_path = f"{parent_path}/HandMesh"
-        if stage.GetPrimAtPath(hand_path).IsValid():
-            carb.log_info(f"HumanoidExample: preserving existing calibrated hand mesh at {hand_path}")
-            return
-
-        UsdGeom.Xform.Define(stage, hand_path)
-
-        palm = UsdGeom.Cube.Define(stage, f"{hand_path}/Palm")
-        palm.CreateSizeAttr(1.0)
-        palm.CreateDisplayColorAttr().Set([color])
-        palm.ClearXformOpOrder()
-        palm.AddTranslateOp().Set(Gf.Vec3d(0.035, 0.0, 0.0))
-        palm.AddScaleOp().Set(Gf.Vec3f(0.14, 0.065, 0.035))
-
-        finger_offsets = (-0.042, -0.014, 0.014, 0.042)
-        for index, y_offset in enumerate(finger_offsets):
-            finger = UsdGeom.Cube.Define(stage, f"{hand_path}/Finger_{index}")
-            finger.CreateSizeAttr(1.0)
-            finger.CreateDisplayColorAttr().Set([color])
-            finger.ClearXformOpOrder()
-            finger.AddTranslateOp().Set(Gf.Vec3d(0.15, y_offset, 0.018))
-            finger.AddScaleOp().Set(Gf.Vec3f(0.09, 0.012, 0.014))
-
-        thumb = UsdGeom.Cube.Define(stage, f"{hand_path}/Thumb")
-        thumb.CreateSizeAttr(1.0)
-        thumb.CreateDisplayColorAttr().Set([color])
-        thumb.ClearXformOpOrder()
-        thumb.AddTranslateOp().Set(Gf.Vec3d(0.06, 0.073 * side_sign, -0.005))
-        thumb.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, -35.0 * side_sign))
-        thumb.AddScaleOp().Set(Gf.Vec3f(0.075, 0.016, 0.014))
+        carb.log_info(f"HumanoidExample: created G1 arm-control rig under {self._arm_rig_root_path}")
 
     def _ensure_scene_lighting(self) -> None:
         """Add explicit lights so referenced robot assets are visible in flat/new stages."""
         stage = omni.usd.get_context().get_stage()
 
-        dome_path = "/World/H1_VR_DomeLight"
+        dome_path = "/World/G1_VR_DomeLight"
         if not stage.GetPrimAtPath(dome_path).IsValid():
             dome = UsdLux.DomeLight.Define(stage, dome_path)
             dome.CreateIntensityAttr().Set(1200.0)
             dome.CreateExposureAttr().Set(0.0)
 
-        distant_path = "/World/H1_VR_DistantLight"
+        distant_path = "/World/G1_VR_DistantLight"
         if not stage.GetPrimAtPath(distant_path).IsValid():
             distant = UsdLux.DistantLight.Define(stage, distant_path)
             distant.CreateIntensityAttr().Set(2500.0)
@@ -428,214 +421,6 @@ class HumanoidExample(BaseSample):
             distant_xform = UsdGeom.Xformable(distant.GetPrim())
             distant_xform.ClearXformOpOrder()
             distant_xform.AddRotateXYZOp().Set(Gf.Vec3f(-45.0, 0.0, 35.0))
-
-    def _create_g1_hand_reference(self) -> None:
-        """Reference the local G1 humanoid-with-hands asset next to the H1 policy robot."""
-        if not self._spawn_g1_hand_reference:
-            return
-
-        stage = omni.usd.get_context().get_stage()
-        if stage.GetPrimAtPath(self._g1_reference_path).IsValid():
-            return
-
-        if not self._g1_reference_usd_path.exists():
-            carb.log_warn(f"HumanoidExample: G1 hand asset not found: {self._g1_reference_usd_path}")
-            return
-
-        stage_utils.add_reference_to_stage(
-            usd_path=str(self._g1_reference_usd_path).replace("\\", "/"),
-            path=self._g1_reference_path,
-        )
-
-        g1_prim = stage.GetPrimAtPath(self._g1_reference_path)
-        variant_choices = {
-            "Physics": "None",
-            "Sensor": "None",
-            "left_hand": "Inspire",
-            "right_hand": "Inspire",
-            "Thor": "None",
-        }
-        for set_name, selection in variant_choices.items():
-            variant_set = g1_prim.GetVariantSets().GetVariantSet(set_name)
-            if variant_set and selection in variant_set.GetVariantNames():
-                variant_set.SetVariantSelection(selection)
-
-        g1_xform = UsdGeom.Xformable(g1_prim)
-        g1_xform.ClearXformOpOrder()
-        g1_xform.AddTranslateOp().Set(Gf.Vec3d(0.0, -2.75, 0.0))
-        g1_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 90.0))
-
-        carb.log_info(
-            f"HumanoidExample: referenced G1 Inspire-hand humanoid at {self._g1_reference_path} from {self._g1_reference_usd_path}"
-        )
-
-    def _apply_hand_part_physics(self, prim) -> None:
-        """Give H1 hand parts simple collision so they can touch scene objects."""
-        UsdPhysics.CollisionAPI.Apply(prim)
-        rigid_body = UsdPhysics.RigidBodyAPI.Apply(prim)
-        try:
-            rigid_body.CreateKinematicEnabledAttr().Set(True)
-        except Exception:
-            pass
-
-    def _create_h1_attached_hands(self) -> None:
-        """Create simple hand-shaped attachments under H1's own arm end-link hierarchy."""
-        if not self._h1_attached_hands_enabled:
-            return
-
-        stage = omni.usd.get_context().get_stage()
-        self._find_h1_terminal_arm_prim_paths()
-        if not self._h1_terminal_arm_prim_paths:
-            return
-
-        side_colors = {"left": Gf.Vec3f(0.15, 0.45, 1.0), "right": Gf.Vec3f(1.0, 0.35, 0.18)}
-        xform_cache = UsdGeom.XformCache()
-        created_sides = []
-        for side, terminal_path in self._h1_terminal_arm_prim_paths.items():
-            terminal_prim = stage.GetPrimAtPath(terminal_path)
-            if not terminal_prim.IsValid():
-                continue
-
-            attachment_path = f"{terminal_path}/H1_{side.capitalize()}HandAttachment"
-            attachment_exists = stage.GetPrimAtPath(attachment_path).IsValid()
-            attachment = UsdGeom.Xform.Define(stage, attachment_path)
-            if self._snap_h1_hands_to_wrist_connections:
-                local_matrix = self._get_h1_wrist_connection_hand_local_matrix(side)
-                carb.log_info(
-                    f"HumanoidExample: snapped {side} hand attachment to wrist connection at {attachment_path}"
-                )
-            elif attachment_exists:
-                terminal_world = xform_cache.GetLocalToWorldTransform(terminal_prim)
-                attachment_world = xform_cache.GetLocalToWorldTransform(attachment.GetPrim())
-                local_matrix = attachment_world * terminal_world.GetInverse()
-                carb.log_info(
-                    f"HumanoidExample: preserving existing H1-local {side} hand attachment transform at {attachment_path}"
-                )
-            else:
-                local_matrix = self._get_saved_h1_hand_local_matrix(side, terminal_prim, xform_cache)
-
-            attachment.ClearXformOpOrder()
-            attachment_op = attachment.AddTransformOp()
-            self._h1_hand_attachment_paths[side] = attachment_path
-            self._h1_hand_attachment_ops[side] = attachment_op
-
-            attachment_op.Set(local_matrix)
-            self._create_h1_rig_hand_mesh(attachment_path, side, side_colors[side])
-            self._remove_legacy_hand_duplicates(side)
-            created_sides.append(side)
-
-        self._h1_link_hands_created = bool(created_sides)
-        carb.log_info(
-            f"HumanoidExample: created H1 link-parented hand attachments for {created_sides}: "
-            f"{self._h1_hand_attachment_paths}"
-        )
-
-    def _get_saved_h1_hand_local_matrix(self, side: str, terminal_prim, xform_cache: UsdGeom.XformCache) -> Gf.Matrix4d:
-        """Convert an existing manually placed hand/rig transform into the H1 terminal link frame."""
-        stage = omni.usd.get_context().get_stage()
-        terminal_world = xform_cache.GetLocalToWorldTransform(terminal_prim)
-
-        calibration_paths = (
-            f"{self._arm_rig_target_paths[side]}/HandMesh",
-            self._h1_hand_target_paths[side],
-        )
-        for path in calibration_paths:
-            prim = stage.GetPrimAtPath(path)
-            if not prim.IsValid():
-                continue
-            try:
-                hand_world = xform_cache.GetLocalToWorldTransform(prim)
-                local_matrix = hand_world * terminal_world.GetInverse()
-                carb.log_info(
-                    f"HumanoidExample: saved {side} hand calibration from {path} into H1 link local transform"
-                )
-                return local_matrix
-            except Exception:
-                continue
-
-        if side in self._manual_arm_rig_target_world_positions:
-            hand_world = Gf.Matrix4d().SetTranslate(self._manual_arm_rig_target_world_positions[side])
-            local_matrix = hand_world * terminal_world.GetInverse()
-            carb.log_info(
-                f"HumanoidExample: saved {side} hand calibration from current rig target into H1 link local transform"
-            )
-            return local_matrix
-
-        side_sign = 1.0 if side == "left" else -1.0
-        return Gf.Matrix4d().SetTranslate(Gf.Vec3d(0.12, 0.02 * side_sign, 0.0))
-
-    def _get_h1_wrist_connection_hand_local_matrix(self, side: str) -> Gf.Matrix4d:
-        """Place the hand base below the H1 wrist/terminal arm link origin."""
-        return Gf.Matrix4d().SetTranslate(self._h1_wrist_bottom_hand_offset)
-
-    def _remove_legacy_hand_duplicates(self, side: str) -> None:
-        """Remove old world/rig-parented hand meshes after their pose has been migrated under H1."""
-        stage = omni.usd.get_context().get_stage()
-        legacy_paths = (
-            f"{self._arm_rig_target_paths[side]}/HandMesh",
-            self._h1_hand_target_paths[side],
-        )
-        for path in legacy_paths:
-            if stage.GetPrimAtPath(path).IsValid():
-                stage.RemovePrim(path)
-                carb.log_info(f"HumanoidExample: removed duplicate legacy hand prim {path}")
-
-        root_prim = stage.GetPrimAtPath(self._h1_attached_hands_root_path)
-        if root_prim.IsValid() and not any(root_prim.GetChildren()):
-            stage.RemovePrim(self._h1_attached_hands_root_path)
-
-    def _find_h1_terminal_arm_prim_paths(self) -> None:
-        """Find the best terminal arm link prims for attaching visual hands."""
-        if self._h1_terminal_arm_lookup_complete:
-            return
-
-        stage = omni.usd.get_context().get_stage()
-        h1_root = stage.GetPrimAtPath("/World/H1")
-        if not h1_root.IsValid():
-            return
-        self._h1_terminal_arm_lookup_complete = True
-
-        for side in ("left", "right"):
-            best_score = -999
-            best_path = None
-            for prim in Usd.PrimRange(h1_root):
-                name = prim.GetName().lower()
-                path = str(prim.GetPath())
-                path_lower = path.lower()
-                if side not in path_lower and side not in name:
-                    continue
-                if "h1_" in name or "handattachment" in path_lower or "handmesh" in path_lower:
-                    continue
-                score = 0
-                if "wrist_yaw_link" in name or "wrist_yaw_link" in path_lower:
-                    score += 80
-                elif "wrist" in name or "wrist" in path_lower:
-                    score += 70
-                if "hand" in name or "hand" in path_lower:
-                    score += 25
-                if "forearm" in name or "lower_arm" in path_lower:
-                    score += 20
-                if "elbow" in name or "elbow" in path_lower:
-                    score += 12
-                if "link" in name:
-                    score += 8
-                if "collision" in path_lower or "collisions" in path_lower:
-                    score -= 20
-                if "visual" in path_lower or "mesh" in path_lower:
-                    score -= 8
-                if score > best_score:
-                    best_score = score
-                    best_path = path
-
-            if best_path is not None and best_score > 0:
-                self._h1_terminal_arm_prim_paths[side] = best_path
-
-        carb.log_info(f"HumanoidExample H1 hand attachment links: {self._h1_terminal_arm_prim_paths}")
-
-    def _update_h1_attached_hands(self) -> None:
-        """Ensure H1 link-parented hands are created after the robot asset is available."""
-        if self._h1_attached_hands_enabled and not self._h1_link_hands_created:
-            self._create_h1_attached_hands()
 
     def setup_scene(self):
         """Set up the scene with robot and environment."""
@@ -661,15 +446,17 @@ class HumanoidExample(BaseSample):
         # Apply physics material to ground to match training configuration
         self._apply_ground_material(static_friction=1.0, dynamic_friction=1.0, restitution=0.0)
         self._create_sample_boxes()
-        self._create_g1_hand_reference()
 
-        # Create H1 robot (auto-detects active physics engine for policy selection)
-        self.h1 = H1FlatTerrainPolicy(
-            prim_path="/World/H1",
-            position=[0, 0, 1.05],
+        # Create the Unitree G1 with dexterous hands. Isaac Sim ships no G1 locomotion
+        # policy, so walking comes from Unitree's own pretrained one, which drives the
+        # legs and leaves the arms to the operator (see G1TeleopRobot).
+        self.g1 = G1TeleopRobot(
+            prim_path=self._g1_prim_path,
+            position=list(self._g1_spawn_position),
+            hand_variant=self._g1_hand_variant,
+            locomotion=self._g1_locomotion,
         )
         self._create_arm_control_rig()
-        self._create_h1_attached_hands()
         self._create_head_camera()
         self._create_xr_anchor()
 
@@ -701,19 +488,16 @@ class HumanoidExample(BaseSample):
                 carb.log_warn(f"HumanoidExample: Quest Pro eye-gaze tracker unavailable: {e}")
         self._xr_input_status_logged = False
         self._hand_tracking_status_logged = False
-        self._h1_arm_dofs_configured = False
-        self._h1_head_prim_path = None
-        self._h1_head_prim_lookup_complete = False
-        self._h1_terminal_arm_prim_paths = {}
-        self._h1_terminal_arm_lookup_complete = False
-        self._h1_hand_attachment_paths = {}
-        self._h1_hand_attachment_ops = {}
-        self._h1_link_hands_created = False
+        self._g1_arm_dofs_configured = False
         self._grabbed_objects_by_side = {}
         self._grabbed_object_offsets = {}
         self._controller_arm_neutral_positions = {}
         self._smoothed_arm_rig_targets = {}
-        self._active_h1_hand_target_matrices = {}
+        self._active_g1_hand_target_matrices = {}
+        self._smoothed_finger_curls = {}
+        self._latest_finger_curls = {}
+        self._finger_curl_source = {}
+        self._finger_tracking_status_logged = False
         self._reset_headset_gait_state()
         # Flush any session left open by an unclean teardown (e.g. a reload that
         # skipped the scene clear) so its buffered rows are saved, not discarded.
@@ -774,45 +558,46 @@ class HumanoidExample(BaseSample):
         if self._eye_gaze_tracker is not None:
             self._eye_gaze_tracker.cleanup()
             self._eye_gaze_tracker = None
-        self.h1 = None
+        self.g1 = None
         self._physics_ready = False
         self._head_camera_transform_op = None  # handles die with the stage; never reuse them
         self._xr_anchor_op = None
         self._restore_physics_simulation_state()
 
     def on_physics_step(self, dt: float, context: object) -> None:
-        """Physics step callback - initialize on first step, then run policy.
+        """Physics step callback - initialize on first step, then drive the robot.
 
         Args:
             dt: Delta time for the physics step.
             context: Physics step context.
         """
-        if not self.h1:
+        if not self.g1:
             return
 
         # Check if physics tensors are valid, if not, reinitialize
-        if not self.h1.robot.is_physics_tensor_entity_valid():
+        if not self.g1.robot.is_physics_tensor_entity_valid():
             self._physics_ready = False
 
         if self._physics_ready:
-            # Robot is initialized, run the policy
+            # Robot is initialized: advance the base and hold the posture, then let the
+            # teleoperation layer below override the arm and finger DOFs it owns.
             self._update_controller_command(dt)
             target_command = self._keyboard_command + self._controller_command
             target_command[0] = target_command[0].clamp(-self._max_forward_speed, self._max_forward_speed)
             target_command[2] = target_command[2].clamp(-self._max_yaw_speed, self._max_yaw_speed)
             self._smooth_base_command(target_command, dt)
-            self.h1.forward(dt, self._base_command)
+            self.g1.forward(dt, self._base_command)
             # Stage edits (undo, prim deletion, clears) can invalidate prims any of
             # these subsystems hold handles to; isolate each one so a single failure
             # cannot abort the step and silently stop behavioral data collection.
             try:
-                self._update_h1_arms_from_hand_tracking()
+                self._update_g1_arms_from_hand_tracking()
             except Exception as e:
                 self._log_physics_step_error("arm teleoperation", e)
             try:
-                self._update_h1_attached_hands()
+                self._update_g1_fingers()
             except Exception as e:
-                self._log_physics_step_error("hand attachments", e)
+                self._log_physics_step_error("finger teleoperation", e)
             try:
                 self._update_head_camera_view()
             except Exception as e:
@@ -829,10 +614,9 @@ class HumanoidExample(BaseSample):
         else:
             # First physics step after play - initialize the robot
             self._physics_ready = True
-            self.h1.initialize()  # This already sets default state internally
-            self.h1.post_reset()
-            self._configure_h1_arm_dofs()
-            self._update_h1_attached_hands()
+            self.g1.initialize()  # This already sets default state internally
+            self.g1.post_reset()
+            self._configure_g1_arm_dofs()
             self._update_head_camera_view(force=True)
 
     def _log_physics_step_error(self, subsystem: str, error: Exception) -> None:
@@ -856,7 +640,7 @@ class HumanoidExample(BaseSample):
         xformable = UsdGeom.Xformable(camera.GetPrim())
         xformable.ClearXformOpOrder()
         self._head_camera_transform_op = xformable.AddTransformOp()
-        carb.log_info(f"HumanoidExample: created H1 head camera at {self._head_camera_path}")
+        carb.log_info(f"HumanoidExample: created G1 head camera at {self._head_camera_path}")
 
     def _create_xr_anchor(self) -> None:
         """Create the Xform prim the VR rig anchors to (XR custom-anchor mode).
@@ -873,7 +657,7 @@ class HumanoidExample(BaseSample):
         carb.log_info(f"HumanoidExample: created XR rig anchor at {self._xr_anchor_path}")
 
     def _configure_xr_custom_anchor(self) -> None:
-        """Switch the VR profile to custom-anchor mode, pointed at the H1 anchor prim.
+        """Switch the VR profile to custom-anchor mode, pointed at the G1 anchor prim.
 
         Both the live and the persistent settings variants are written so the
         viewport XR controller picks the change up regardless of which one it
@@ -999,7 +783,7 @@ class HumanoidExample(BaseSample):
             pass
 
     def _set_active_head_camera(self) -> None:
-        """Switch the active viewport to the H1 head camera when the viewport API is present."""
+        """Switch the active viewport to the G1 head camera when the viewport API is present."""
         try:
             from omni.kit.viewport.utility import get_active_viewport
 
@@ -1009,38 +793,6 @@ class HumanoidExample(BaseSample):
                 carb.log_info(f"HumanoidExample: active viewport camera set to {self._head_camera_path}")
         except Exception as e:
             carb.log_warn(f"HumanoidExample: could not set active viewport camera: {e}")
-
-    def _find_h1_head_prim_path(self) -> str | None:
-        """Find a likely H1 head prim when the asset exposes one."""
-        self._h1_head_prim_lookup_complete = True
-        stage = omni.usd.get_context().get_stage()
-        h1_root = stage.GetPrimAtPath("/World/H1")
-        if not h1_root.IsValid():
-            return None
-
-        candidates = []
-        for prim in Usd.PrimRange(h1_root):
-            name = prim.GetName().lower()
-            path = str(prim.GetPath())
-            path_lower = path.lower()
-            if "head" not in name and "head" not in path_lower:
-                continue
-            score = 0
-            if name in ("head", "head_link"):
-                score += 10
-            if "collision" in path_lower:
-                score -= 2
-            if "visual" in path_lower:
-                score -= 1
-            candidates.append((score, path))
-
-        if not candidates:
-            carb.log_info("HumanoidExample: no explicit H1 head prim found; using base-offset head camera")
-            return None
-        candidates.sort(reverse=True)
-        head_path = candidates[0][1]
-        carb.log_info(f"HumanoidExample: using H1 head prim for camera: {head_path}")
-        return head_path
 
     def _first_pose_value(self, values):
         """Convert a Warp/Torch pose array to the first [x, y, z] or [w, x, y, z] row."""
@@ -1060,11 +812,11 @@ class HumanoidExample(BaseSample):
             return None
 
     def _get_head_camera_pose(self):
-        """Compute a first-person camera pose from the H1 head/eye position."""
-        if not self.h1 or not self.h1.robot.is_physics_tensor_entity_valid():
+        """Compute a first-person camera pose from the G1 head/eye position."""
+        if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
 
-        positions, orientations = self.h1.robot.get_world_poses()
+        positions, orientations = self.g1.robot.get_world_poses()
         position = self._first_pose_value(positions)
         orientation = self._first_pose_value(orientations)
         if position is None or orientation is None or len(position) < 3 or len(orientation) < 4:
@@ -1080,28 +832,15 @@ class HumanoidExample(BaseSample):
         self._head_camera_last_base = base
         self._head_camera_last_yaw = yaw
 
-        if not self._h1_head_prim_lookup_complete:
-            self._h1_head_prim_path = self._find_h1_head_prim_path()
-
-        # Horizontal anchor: the head prim when available (so the view tracks
-        # torso lean); HEIGHT is always base + eye offset. Head-link origins sit
-        # at the top of the skull and vary between assets, so deriving height
-        # from them kept parking the camera above the robot's head.
-        anchor = None
-        if self._h1_head_prim_path is not None:
-            stage = omni.usd.get_context().get_stage()
-            head_prim = stage.GetPrimAtPath(self._h1_head_prim_path)
-            if head_prim.IsValid():
-                try:
-                    anchor = UsdGeom.XformCache().GetLocalToWorldTransform(head_prim).ExtractTranslation()
-                except Exception:
-                    anchor = None
-        if anchor is None:
-            anchor = base
-
+        # The whole pose is derived from the articulation root read through the physics
+        # tensor API. The G1 does expose a head_link, but reading its transform through
+        # UsdGeom.XformCache would return the authored pose, not the simulated one: this
+        # example runs on the GPU pipeline with fabric enabled, which keeps live
+        # transforms out of USD. The base is exact and the posture is held, so
+        # base + eye offset is both correct and cheaper.
         eye = Gf.Vec3d(
-            float(anchor[0]),
-            float(anchor[1]),
+            float(base[0]),
+            float(base[1]),
             base[2] + self._first_person_eye_height_above_base + self._first_person_head_up_offset,
         )
         eye += forward * self._first_person_head_forward_offset
@@ -1109,7 +848,7 @@ class HumanoidExample(BaseSample):
         return Gf.Matrix4d().SetLookAt(eye, target, Gf.Vec3d(0.0, 0.0, 1.0)).GetInverse()
 
     def _update_head_camera_view(self, force: bool = False) -> None:
-        """Move the viewport/XR camera to the H1 head pose."""
+        """Move the viewport/XR camera to the G1 head pose."""
         if self._head_camera_transform_op is None:
             return
         self._head_camera_update_counter += 1
@@ -1165,7 +904,7 @@ class HumanoidExample(BaseSample):
         return max(lower, min(upper, value))
 
     def _smooth_base_command(self, target_command, dt: float) -> None:
-        """Ramp locomotion commands so the H1 policy does not get abrupt step inputs."""
+        """Ramp locomotion commands so the G1 policy does not get abrupt step inputs."""
         if self._base_command is None:
             return
         if self._command_response_time <= 0.0:
@@ -1230,10 +969,10 @@ class HumanoidExample(BaseSample):
         return Gf.Vec3d(0.0, 0.0, 1.0)
 
     def _get_robot_head_world_height(self, up_vector: Gf.Vec3d) -> float | None:
-        """Return H1 head position projected onto up_vector for virtual-world-pose gait correction."""
-        if not self.h1 or not self.h1.robot.is_physics_tensor_entity_valid():
+        """Return G1 head position projected onto up_vector for virtual-world-pose gait correction."""
+        if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
-        positions, _ = self.h1.robot.get_world_poses()
+        positions, _ = self.g1.robot.get_world_poses()
         position = self._first_pose_value(positions)
         if position is None or len(position) < 3:
             return None
@@ -1391,7 +1130,11 @@ class HumanoidExample(BaseSample):
             "isaac_sim_version": isaac_sim_version,
             "physics_dt": physics_dt,
             "rendering_dt": self._world_settings.get("rendering_dt"),
-            "robot_name": "H1",
+            "robot_name": "G1",
+            "robot_hand_variant": self._g1_hand_variant,
+            "robot_locomotion": "kinematic_base",   # no G1 policy ships with Isaac Sim
+            "finger_control_enabled": self._finger_control_enabled,
+            "finger_roles": list(self._finger_roles),
             "headset_gait_enabled": self._headset_gait_enabled,
             "eye_gaze_enabled": self._eye_gaze_enabled,
             "behavioral_data_log_rate_hz": (1.0 / physics_dt) / self._behavioral_data_log_every_n_steps,
@@ -1466,8 +1209,8 @@ class HumanoidExample(BaseSample):
                 pass
 
         # Robot base pose + joints
-        if self.h1 and self.h1.robot.is_physics_tensor_entity_valid():
-            positions, orientations = self.h1.robot.get_world_poses()
+        if self.g1 and self.g1.robot.is_physics_tensor_entity_valid():
+            positions, orientations = self.g1.robot.get_world_poses()
             rp = self._first_pose_value(positions)
             ro = self._first_pose_value(orientations)
             if rp is not None and len(rp) >= 3:
@@ -1484,11 +1227,11 @@ class HumanoidExample(BaseSample):
 
             # Joint positions and velocities
             try:
-                dof_names = list(getattr(self.h1.robot, "dof_names", []))
+                dof_names = list(getattr(self.g1.robot, "dof_names", []))
                 if dof_names and not self._behavioral_dof_names:
                     self._behavioral_dof_names = dof_names
-                joint_pos_raw = self.h1.robot.get_dof_positions()
-                joint_vel_raw = self.h1.robot.get_dof_velocities()
+                joint_pos_raw = self.g1.robot.get_dof_positions()
+                joint_vel_raw = self.g1.robot.get_dof_velocities()
                 joint_pos = self._first_pose_value(joint_pos_raw)
                 joint_vel = self._first_pose_value(joint_vel_raw)
                 for i, name in enumerate(self._behavioral_dof_names):
@@ -1599,7 +1342,7 @@ class HumanoidExample(BaseSample):
         return None
 
     def _ensure_eye_camera_capture_initialized(self) -> None:
-        """Lazily wrap the existing /World/H1_HeadCamera prim in a Camera sensor.
+        """Lazily wrap the existing /World/G1_HeadCamera prim in a Camera sensor.
 
         Camera.initialize() attaches a render product + RGB annotator to the prim.
         Frame data refreshes at RENDER rate (rendering_dt, ~90 Hz here), not physics
@@ -1622,7 +1365,7 @@ class HumanoidExample(BaseSample):
             self._behavioral_frame_camera = False  # sentinel: tried once, don't retry every step
 
     def _capture_eye_camera_frame(self) -> None:
-        """Save one PNG frame from the H1 eye camera (~10 Hz) and log it for frame_timestamps.csv.
+        """Save one PNG frame from the G1 eye camera (~10 Hz) and log it for frame_timestamps.csv.
 
         Deliberately slower than the 100 Hz sensor logs: PNG encoding is expensive, and
         the downstream sync tool aligns each frame to the nearest behavior.csv row by
@@ -1744,8 +1487,7 @@ class HumanoidExample(BaseSample):
             self._get_xr_gesture_value(right_xr, "a", "click"),
         )
 
-        self._hand_tracking_records.append(
-            {
+        record = {
                 "unix_time": round(time.time(), 6),
                 "sim_time": round(self._headset_gait_time, 6),
                 "step_index": self._behavioral_data_step_counter,
@@ -1771,8 +1513,20 @@ class HumanoidExample(BaseSample):
                 "right_trigger": round(right_trigger, 6),
                 "left_button_x": round(left_button_x, 6),
                 "right_button_a": round(right_button_a, 6),
-            }
-        )
+        }
+
+        # Per-finger curl actually sent to the robot's hands, 0 = open, 1 = closed, plus
+        # the source that produced it ("hand_tracking", "controller" or "none"). These
+        # are the finger columns the manipulation half of the dataset needs.
+        for side in ("left", "right"):
+            curls = self._latest_finger_curls.get(side, {})
+            record[f"{side}_finger_source"] = self._finger_curl_source.get(side, "none")
+            for role in self._finger_roles:
+                value = curls.get(role)
+                record[f"{side}_finger_{role}"] = round(float(value), 6) if value is not None else None
+            record[f"{side}_hand_closure"] = round(self._get_hand_closure(side), 6)
+
+        self._hand_tracking_records.append(record)
 
     def _collect_gaze_sample(self) -> None:
         """Record one gaze ray row (~100 Hz), preferring real eye tracking when present.
@@ -2108,12 +1862,12 @@ class HumanoidExample(BaseSample):
                 f"HumanoidExample XR {label} hand tracking source='{source}', pose_names={pose_names}"
             )
 
-    def _configure_h1_arm_dofs(self) -> None:
-        """Find H1 arm DOFs so hand tracking can override only the arms."""
-        if self._h1_arm_dofs_configured or not self.h1:
+    def _configure_g1_arm_dofs(self) -> None:
+        """Find G1 arm DOFs so hand tracking can override only the arms."""
+        if self._g1_arm_dofs_configured or not self.g1:
             return
 
-        dof_names = list(getattr(self.h1.robot, "dof_names", []))
+        dof_names = list(getattr(self.g1.robot, "dof_names", []))
         if not dof_names:
             return
 
@@ -2133,46 +1887,46 @@ class HumanoidExample(BaseSample):
         }
 
         for side, joints in arm_name_map.items():
-            self._h1_arm_dof_indices_by_side[side] = {}
-            self._h1_arm_joint_names_by_side[side] = {}
+            self._g1_arm_dof_indices_by_side[side] = {}
+            self._g1_arm_joint_names_by_side[side] = {}
             for joint_key, candidates in joints.items():
                 match = next((name for name in candidates if name in dof_names), None)
                 if match is None:
                     match = next((name for name in dof_names if any(candidate in name for candidate in candidates)), None)
                 if match is None:
                     continue
-                self._h1_arm_dof_indices_by_side[side][joint_key] = dof_names.index(match)
-                self._h1_arm_joint_names_by_side[side][joint_key] = match
+                self._g1_arm_dof_indices_by_side[side][joint_key] = dof_names.index(match)
+                self._g1_arm_joint_names_by_side[side][joint_key] = match
 
         all_indices = sorted(
             {
                 index
-                for side_indices in self._h1_arm_dof_indices_by_side.values()
+                for side_indices in self._g1_arm_dof_indices_by_side.values()
                 for index in side_indices.values()
             }
         )
-        self._h1_arm_joint_defaults = {}
-        self._h1_arm_joint_limits = {}
+        self._g1_arm_joint_defaults = {}
+        self._g1_arm_joint_limits = {}
         if all_indices:
             try:
-                default_pos = self.h1.default_pos.detach().cpu().numpy()
+                default_pos = self.g1.default_pos.detach().cpu().numpy()
             except Exception:
                 default_pos = None
             try:
-                lower_limits, upper_limits = self.h1.robot.get_dof_limits(dof_indices=all_indices)
+                lower_limits, upper_limits = self.g1.robot.get_dof_limits(dof_indices=all_indices)
                 lower_limits = lower_limits.numpy()[0]
                 upper_limits = upper_limits.numpy()[0]
             except Exception:
                 lower_limits = None
                 upper_limits = None
             for i, dof_index in enumerate(all_indices):
-                self._h1_arm_joint_defaults[dof_index] = float(default_pos[dof_index]) if default_pos is not None else 0.0
+                self._g1_arm_joint_defaults[dof_index] = float(default_pos[dof_index]) if default_pos is not None else 0.0
                 if lower_limits is not None and upper_limits is not None:
-                    self._h1_arm_joint_limits[dof_index] = (float(lower_limits[i]), float(upper_limits[i]))
+                    self._g1_arm_joint_limits[dof_index] = (float(lower_limits[i]), float(upper_limits[i]))
 
-        self._h1_arm_dofs_configured = True
-        carb.log_info(f"HumanoidExample H1 DOFs: {dof_names}")
-        carb.log_info(f"HumanoidExample H1 hand-tracked arm DOFs: {self._h1_arm_joint_names_by_side}")
+        self._g1_arm_dofs_configured = True
+        carb.log_info(f"HumanoidExample G1 DOFs: {dof_names}")
+        carb.log_info(f"HumanoidExample G1 hand-tracked arm DOFs: {self._g1_arm_joint_names_by_side}")
 
     def _get_hand_tracking_pose(self, input_device):
         """Return a tracked hand pose matrix from the best available hand pose name."""
@@ -2235,11 +1989,11 @@ class HumanoidExample(BaseSample):
         grip = self._get_xr_gesture_value(input_device, "grip", "value")
         return max(squeeze, squeeze_click, grip) >= self._arm_pose_enable_threshold
 
-    def _get_h1_base_pose_for_arms(self):
-        """Return H1 base position and yaw for body-frame arm mapping."""
-        if not self.h1 or not self.h1.robot.is_physics_tensor_entity_valid():
+    def _get_g1_base_pose_for_arms(self):
+        """Return G1 base position and yaw for body-frame arm mapping."""
+        if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
-        positions, orientations = self.h1.robot.get_world_poses()
+        positions, orientations = self.g1.robot.get_world_poses()
         position = self._first_pose_value(positions)
         orientation = self._first_pose_value(orientations)
         if position is None or orientation is None or len(position) < 3 or len(orientation) < 4:
@@ -2249,8 +2003,8 @@ class HumanoidExample(BaseSample):
         yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
         return Gf.Vec3d(float(position[0]), float(position[1]), float(position[2])), yaw
 
-    def _stage_vector_to_h1_body(self, vector: Gf.Vec3d, yaw: float) -> Gf.Vec3d:
-        """Rotate a world-space vector into the H1 base frame using base yaw."""
+    def _stage_vector_to_g1_body(self, vector: Gf.Vec3d, yaw: float) -> Gf.Vec3d:
+        """Rotate a world-space vector into the G1 base frame using base yaw."""
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
         return Gf.Vec3d(
@@ -2259,7 +2013,7 @@ class HumanoidExample(BaseSample):
             vector[2],
         )
 
-    def _h1_body_point_to_stage(self, point: Gf.Vec3d, base_position: Gf.Vec3d, yaw: float) -> Gf.Vec3d:
+    def _g1_body_point_to_stage(self, point: Gf.Vec3d, base_position: Gf.Vec3d, yaw: float) -> Gf.Vec3d:
         """Transform a body-frame point into stage coordinates."""
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
@@ -2276,15 +2030,18 @@ class HumanoidExample(BaseSample):
         side_sign = 1.0 if side == "left" else -1.0
         hand_position = hand_pose.ExtractTranslation()
         if pose_is_relative:
-            controller_delta = self._stage_vector_to_h1_body(hand_position, yaw)
-            hand_body = Gf.Vec3d(0.38, 0.38 * side_sign, 0.18)
+            # Neutral hand pose and travel limits are sized to the G1's workspace: its
+            # arm spans ~0.185 m upper + ~0.185 m forearm, roughly 0.6x the H1's, so the
+            # H1's offsets would have driven every target past the shoulder's reach.
+            controller_delta = self._stage_vector_to_g1_body(hand_position, yaw)
+            hand_body = Gf.Vec3d(0.24, 0.24 * side_sign, 0.08)
             hand_body += Gf.Vec3d(
-                self._clamp_value(controller_delta[0] * 1.6, -0.45, 0.70),
-                self._clamp_value(controller_delta[1] * 1.5, -0.60, 0.60),
-                self._clamp_value(controller_delta[2] * 1.8, -0.65, 0.65),
+                self._clamp_value(controller_delta[0] * 1.3, -0.28, 0.42),
+                self._clamp_value(controller_delta[1] * 1.2, -0.36, 0.36),
+                self._clamp_value(controller_delta[2] * 1.5, -0.40, 0.40),
             )
         else:
-            hand_body = self._stage_vector_to_h1_body(hand_position - base_position, yaw)
+            hand_body = self._stage_vector_to_g1_body(hand_position - base_position, yaw)
         return hand_body
 
     def _set_arm_rig_target_visible(self, side: str, visible: bool) -> None:
@@ -2300,7 +2057,7 @@ class HumanoidExample(BaseSample):
             imageable.MakeInvisible()
 
     def _smooth_arm_rig_target(self, side: str, target_body: Gf.Vec3d) -> Gf.Vec3d:
-        """Smooth the visible arm-rig target in H1 body coordinates."""
+        """Smooth the visible arm-rig target in G1 body coordinates."""
         previous = self._smoothed_arm_rig_targets.get(side)
         if previous is None:
             self._smoothed_arm_rig_targets[side] = Gf.Vec3d(target_body)
@@ -2314,7 +2071,7 @@ class HumanoidExample(BaseSample):
         target_op = self._arm_rig_target_ops.get(side)
         if target_op is None:
             return
-        target_world = self._h1_body_point_to_stage(target_body, base_position, yaw)
+        target_world = self._g1_body_point_to_stage(target_body, base_position, yaw)
         if side not in self._arm_rig_world_offsets and side in self._manual_arm_rig_target_world_positions:
             self._arm_rig_world_offsets[side] = self._manual_arm_rig_target_world_positions[side] - target_world
             carb.log_info(
@@ -2323,26 +2080,20 @@ class HumanoidExample(BaseSample):
         target_world += self._arm_rig_world_offsets.get(side, Gf.Vec3d(0.0, 0.0, 0.0))
         target_matrix = Gf.Matrix4d().SetTranslate(target_world)
         target_op.Set(target_matrix)
-        self._active_h1_hand_target_matrices[side] = target_matrix
+        self._active_g1_hand_target_matrices[side] = target_matrix
         self._set_arm_rig_target_visible(side, True)
 
     def _get_active_hand_world_position(self, side: str):
-        """Return the controller hand target position used for grabbing."""
-        active_matrix = self._active_h1_hand_target_matrices.get(side)
-        if active_matrix is not None:
-            return active_matrix.ExtractTranslation()
+        """Return the hand target position used for grabbing, or None when that hand is idle.
 
-        stage = omni.usd.get_context().get_stage()
-        attachment_path = self._h1_hand_attachment_paths.get(side)
-        if attachment_path is None:
+        This is the arm-rig target the teleoperation layer computed this step, not a USD
+        read of the robot's palm link: fabric keeps the simulated link transforms out of
+        USD, so a stale authored pose would be all a prim read could return.
+        """
+        active_matrix = self._active_g1_hand_target_matrices.get(side)
+        if active_matrix is None:
             return None
-        attachment_prim = stage.GetPrimAtPath(attachment_path)
-        if not attachment_prim.IsValid():
-            return None
-        try:
-            return UsdGeom.XformCache().GetLocalToWorldTransform(attachment_prim).ExtractTranslation()
-        except Exception:
-            return None
+        return active_matrix.ExtractTranslation()
 
     def _set_rigid_body_kinematic(self, prim, enabled: bool) -> None:
         """Toggle kinematic mode for an object being carried by the hand."""
@@ -2364,7 +2115,7 @@ class HumanoidExample(BaseSample):
     def _get_grabbable_object_size(self, prim) -> float:
         """Return the authored sample-box size when available."""
         try:
-            attr = prim.GetAttribute("h1:packageSize")
+            attr = prim.GetAttribute("g1:packageSize")
             if attr and attr.HasAuthoredValueOpinion():
                 return float(attr.Get())
         except Exception:
@@ -2402,56 +2153,27 @@ class HumanoidExample(BaseSample):
 
         return best_path, best_position
 
-    def _set_visual_grip_pose(self, side: str, closed: bool) -> None:
-        """Curl or open the simple visual fingers on the H1 hand attachment."""
-        stage = omni.usd.get_context().get_stage()
-        attachment_path = self._h1_hand_attachment_paths.get(side)
-        if attachment_path is None:
-            return
-        hand_path = f"{attachment_path}/HandMesh"
-        side_sign = 1.0 if side == "left" else -1.0
-
-        for index, y_offset in enumerate((-0.042, -0.014, 0.014, 0.042)):
-            finger_prim = stage.GetPrimAtPath(f"{hand_path}/Finger_{index}")
-            if not finger_prim.IsValid():
-                continue
-            finger = UsdGeom.Cube(finger_prim)
-            finger.ClearXformOpOrder()
-            if closed:
-                finger.AddTranslateOp().Set(Gf.Vec3d(0.075, y_offset, -0.018))
-                finger.AddRotateXYZOp().Set(Gf.Vec3f(0.0, -62.0, 0.0))
-            else:
-                finger.AddTranslateOp().Set(Gf.Vec3d(0.15, y_offset, 0.018))
-            finger.AddScaleOp().Set(Gf.Vec3f(0.09, 0.012, 0.014))
-
-        thumb_prim = stage.GetPrimAtPath(f"{hand_path}/Thumb")
-        if thumb_prim.IsValid():
-            thumb = UsdGeom.Cube(thumb_prim)
-            thumb.ClearXformOpOrder()
-            if closed:
-                thumb.AddTranslateOp().Set(Gf.Vec3d(0.055, 0.052 * side_sign, -0.018))
-                thumb.AddRotateXYZOp().Set(Gf.Vec3f(0.0, -45.0, -55.0 * side_sign))
-            else:
-                thumb.AddTranslateOp().Set(Gf.Vec3d(0.06, 0.073 * side_sign, -0.005))
-                thumb.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, -35.0 * side_sign))
-            thumb.AddScaleOp().Set(Gf.Vec3f(0.075, 0.016, 0.014))
-
     def _release_grabbed_object(self, side: str) -> None:
         """Release an object currently held by one hand."""
         object_path = self._grabbed_objects_by_side.pop(side, None)
         self._grabbed_object_offsets.pop(side, None)
         if object_path is None:
-            self._set_visual_grip_pose(side, False)
             return
         stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(object_path)
         if prim.IsValid():
             self._set_rigid_body_kinematic(prim, False)
             carb.log_info(f"HumanoidExample: released {object_path} from {side} hand")
-        self._set_visual_grip_pose(side, False)
 
     def _update_grabbed_object(self, side: str, grip_active: bool) -> None:
-        """Attach a nearby sample object to the hand while grip is held."""
+        """Attach a nearby sample object to the hand while the hand is closed.
+
+        Args:
+            side: ``"left"`` or ``"right"``.
+            grip_active: Whether that hand is currently closed enough to hold an object —
+                a squeezed controller grip, or fingers curled past
+                ``_finger_grab_threshold`` when hand tracking is driving them.
+        """
         if not grip_active:
             self._release_grabbed_object(side)
             return
@@ -2465,7 +2187,6 @@ class HumanoidExample(BaseSample):
         if object_path is None:
             object_path, object_position = self._find_nearest_grabbable_object(hand_position)
             if object_path is None or object_position is None:
-                self._set_visual_grip_pose(side, False)
                 return
             self._grabbed_objects_by_side[side] = object_path
             self._grabbed_object_offsets[side] = object_position - hand_position
@@ -2481,40 +2202,48 @@ class HumanoidExample(BaseSample):
 
         hold_offset = self._grabbed_object_offsets.get(side, Gf.Vec3d(0.0, 0.0, 0.0))
         self._set_prim_world_translation(prim, hand_position + hold_offset)
-        self._set_visual_grip_pose(side, True)
 
     def _compute_arm_targets_from_body_position(self, side: str, hand_body: Gf.Vec3d):
-        """Map an arm-control rig target point into rough H1 shoulder/elbow joint targets."""
+        """Map an arm-control rig target point into rough G1 shoulder/elbow joint targets.
+
+        A heuristic map, not an IK solve: hand offset from the shoulder is turned
+        straight into shoulder and elbow angles. Every constant is sized to the G1's
+        measured geometry — the shoulder joint sits at (0, ±0.10-0.14, 0.29) from the
+        pelvis, with a ~0.185 m upper arm and ~0.185 m forearm — so the workspace is
+        about 0.6x the H1's and the metres-to-radians gains are correspondingly larger.
+        """
         side_sign = 1.0 if side == "left" else -1.0
-        shoulder_body = Gf.Vec3d(0.05, 0.22 * side_sign, 0.35)
+        shoulder_body = Gf.Vec3d(0.0, 0.13 * side_sign, 0.29)
         arm_vector = hand_body - shoulder_body
 
-        forward = self._clamp_value(float(arm_vector[0]), -0.25, 0.70)
-        outward = self._clamp_value(float(arm_vector[1]) * side_sign, -0.15, 0.65)
-        up = self._clamp_value(float(arm_vector[2]), -0.55, 0.55)
+        forward = self._clamp_value(float(arm_vector[0]), -0.15, 0.42)
+        outward = self._clamp_value(float(arm_vector[1]) * side_sign, -0.10, 0.40)
+        up = self._clamp_value(float(arm_vector[2]), -0.33, 0.33)
         reach = math.sqrt(forward * forward + outward * outward + up * up)
 
-        indices = self._h1_arm_dof_indices_by_side.get(side, {})
+        indices = self._g1_arm_dof_indices_by_side.get(side, {})
         targets = {}
         if "shoulder_pitch" in indices:
             dof_index = indices["shoulder_pitch"]
-            targets[dof_index] = self._h1_arm_joint_defaults.get(dof_index, 0.0) + self._clamp_value(
-                -1.35 * forward + 0.65 * up, -1.2, 1.2
+            targets[dof_index] = self._g1_arm_joint_defaults.get(dof_index, 0.0) + self._clamp_value(
+                -2.25 * forward + 1.10 * up, -1.4, 1.4
             )
         if "shoulder_roll" in indices:
             dof_index = indices["shoulder_roll"]
-            targets[dof_index] = self._h1_arm_joint_defaults.get(dof_index, 0.0) + side_sign * self._clamp_value(
-                1.45 * outward + 0.20 * up, -0.9, 0.9
+            targets[dof_index] = self._g1_arm_joint_defaults.get(dof_index, 0.0) + side_sign * self._clamp_value(
+                2.40 * outward + 0.35 * up, -1.0, 1.0
             )
         if "shoulder_yaw" in indices:
             dof_index = indices["shoulder_yaw"]
-            targets[dof_index] = self._h1_arm_joint_defaults.get(dof_index, 0.0) + side_sign * self._clamp_value(
-                0.85 * outward + 0.35 * forward, -0.8, 0.8
+            targets[dof_index] = self._g1_arm_joint_defaults.get(dof_index, 0.0) + side_sign * self._clamp_value(
+                1.40 * outward + 0.58 * forward, -0.9, 0.9
             )
         if "elbow" in indices:
             dof_index = indices["elbow"]
-            bend = self._clamp_value((0.75 - reach) * 2.0, 0.0, 1.25)
-            targets[dof_index] = self._h1_arm_joint_defaults.get(dof_index, 0.0) + bend
+            # 0.45 m is roughly the G1's shoulder-to-palm reach: the closer the target is
+            # to the shoulder, the more the elbow folds.
+            bend = self._clamp_value((0.45 - reach) * 3.3, 0.0, 1.5)
+            targets[dof_index] = self._g1_arm_joint_defaults.get(dof_index, 0.0) + bend
         return targets
 
     def _smooth_and_clamp_arm_targets(self, raw_targets: dict[int, float]) -> dict[int, float]:
@@ -2523,26 +2252,26 @@ class HumanoidExample(BaseSample):
         for dof_index, raw_target in raw_targets.items():
             previous = self._smoothed_arm_targets.get(dof_index, raw_target)
             smoothed = previous + self._arm_smoothing * (raw_target - previous)
-            lower, upper = self._h1_arm_joint_limits.get(dof_index, (-math.inf, math.inf))
+            lower, upper = self._g1_arm_joint_limits.get(dof_index, (-math.inf, math.inf))
             smoothed = self._clamp_value(smoothed, lower, upper)
             self._smoothed_arm_targets[dof_index] = smoothed
             targets[dof_index] = smoothed
         return targets
 
-    def _update_h1_arms_from_hand_tracking(self) -> None:
-        """Override H1 arm DOF targets from Meta/OpenXR hand-tracking poses."""
-        if not self._hand_tracking_arm_control_enabled or self._xr_core is None or not self.h1:
+    def _update_g1_arms_from_hand_tracking(self) -> None:
+        """Override G1 arm DOF targets from Meta/OpenXR hand-tracking poses."""
+        if not self._hand_tracking_arm_control_enabled or self._xr_core is None or not self.g1:
             return
 
-        self._configure_h1_arm_dofs()
-        if not self._h1_arm_dofs_configured:
+        self._configure_g1_arm_dofs()
+        if not self._g1_arm_dofs_configured:
             return
 
         left_xr = self._get_xr_input_device("/user/hand/left")
         right_xr = self._get_xr_input_device("/user/hand/right")
         self._log_hand_tracking_status_once(left_xr, right_xr)
 
-        base_pose = self._get_h1_base_pose_for_arms()
+        base_pose = self._get_g1_base_pose_for_arms()
         if base_pose is None:
             return
         base_position, yaw = base_pose
@@ -2561,21 +2290,172 @@ class HumanoidExample(BaseSample):
             target_body = self._compute_arm_target_body_position(side, hand_pose, base_position, yaw, pose_is_relative)
             target_body = self._smooth_arm_rig_target(side, target_body)
             self._update_arm_rig_target(side, target_body, base_position, yaw)
-            self._update_grabbed_object(side, self._is_controller_arm_pose_enabled(device))
+            self._update_grabbed_object(side, self._is_hand_closed(side, device))
             raw_targets.update(self._compute_arm_targets_from_body_position(side, target_body))
 
         for side in ("left", "right"):
             if side not in active_sides:
                 self._set_arm_rig_target_visible(side, False)
                 self._smoothed_arm_rig_targets.pop(side, None)
-                self._active_h1_hand_target_matrices.pop(side, None)
+                self._active_g1_hand_target_matrices.pop(side, None)
                 self._release_grabbed_object(side)
 
         if not raw_targets:
             return
         targets = self._smooth_and_clamp_arm_targets(raw_targets)
         dof_indices = sorted(targets)
-        self.h1.robot.set_dof_position_targets([targets[index] for index in dof_indices], dof_indices=dof_indices)
+        self.g1.robot.set_dof_position_targets([targets[index] for index in dof_indices], dof_indices=dof_indices)
+
+    def _update_g1_fingers(self) -> None:
+        """Drive the G1's real finger joints from hand tracking or the controllers.
+
+        Runs every physics step, after the arm teleoperation. Each hand independently
+        prefers OpenXR hand tracking (per-finger flexion measured from the tracked hand
+        skeleton) and falls back to the controller's trigger and grip. The resulting
+        curls are smoothed, sent to the robot, and kept for hand_tracking.csv.
+        """
+        if not self._finger_control_enabled or not self.g1 or not self.g1.has_finger_control():
+            return
+        if self._xr_core is None:
+            # Desktop session: nothing can move the fingers, and the hands already load
+            # open, so writing open targets 200 times a second would buy nothing.
+            return
+
+        for side in ("left", "right"):
+            device = self._get_xr_input_device(f"/user/hand/{side}")
+            curls = self._get_hand_tracking_finger_curls(device)
+            source = "hand_tracking"
+            if curls is None:
+                curls = self._get_controller_finger_curls(device)
+                source = "controller"
+            if curls is None:
+                # No device on this side: let the hand relax open rather than freezing
+                # it in whatever pose it held when tracking was lost.
+                curls = {role: 0.0 for role in self._finger_roles}
+                source = "none"
+
+            curls = self._smooth_finger_curls(side, curls)
+            self._latest_finger_curls[side] = curls
+            self._finger_curl_source[side] = source
+            self.g1.set_finger_curls(side, curls)
+
+    def _smooth_finger_curls(self, side: str, curls: dict[str, float]) -> dict[str, float]:
+        """Low-pass the per-finger curls so tracking jitter does not buzz the joints."""
+        previous = self._smoothed_finger_curls.get(side, {})
+        smoothed = {}
+        for role, target in curls.items():
+            target = self._clamp_value(float(target), 0.0, 1.0)
+            if target < self._finger_curl_deadzone:
+                target = 0.0
+            last = previous.get(role, target)
+            smoothed[role] = last + (target - last) * self._finger_smoothing
+        self._smoothed_finger_curls[side] = smoothed
+        return smoothed
+
+    def _get_hand_tracking_finger_curls(self, input_device) -> dict[str, float] | None:
+        """Measure each finger's curl from the OpenXR tracked hand skeleton.
+
+        Returns None unless the device is actually delivering hand tracking (rather than
+        a controller), so the caller can fall back to the trigger/grip mapping.
+
+        Curl is the angle between the finger's proximal bone and its distal bone, which
+        is independent of hand size and of where the hand is in the room — unlike a
+        fingertip-to-palm distance, which changes with both.
+        """
+        if input_device is None:
+            return None
+        try:
+            if str(input_device.get_hand_tracking_data_source()) != "hand":
+                return None
+        except Exception:
+            return None
+        try:
+            pose_names = {str(name) for name in input_device.get_pose_names()}
+        except Exception:
+            return None
+
+        curls = {}
+        for role, chain in self._finger_curl_joint_chains.items():
+            if not all(name in pose_names for name in chain):
+                continue
+            positions = [self._get_hand_joint_position(input_device, name) for name in chain]
+            if any(position is None for position in positions):
+                continue
+            proximal_bone = positions[1] - positions[0]
+            distal_bone = positions[3] - positions[2]
+            angle = self._angle_between(proximal_bone, distal_bone)
+            if angle is None:
+                continue
+            full_flexion = self._finger_curl_full_flexion_rad.get(role, math.radians(150.0))
+            curls[role] = self._clamp_value(angle / full_flexion, 0.0, 1.0)
+
+        if not curls:
+            return None
+        if not self._finger_tracking_status_logged:
+            self._finger_tracking_status_logged = True
+            carb.log_info(f"HumanoidExample: finger teleoperation using hand-tracking joints {sorted(curls)}")
+        return curls
+
+    def _get_hand_joint_position(self, input_device, pose_name: str):
+        """Return one tracked hand-joint position, or None when it is unavailable."""
+        try:
+            return Gf.Vec3d(input_device.get_virtual_world_pose(pose_name).ExtractTranslation())
+        except Exception:
+            return None
+
+    def _angle_between(self, first: Gf.Vec3d, second: Gf.Vec3d) -> float | None:
+        """Return the unsigned angle in radians between two vectors, or None if degenerate."""
+        first_length = first.GetLength()
+        second_length = second.GetLength()
+        if first_length <= 1e-6 or second_length <= 1e-6:
+            return None
+        cosine = self._clamp_value(Gf.Dot(first, second) / (first_length * second_length), -1.0, 1.0)
+        return math.acos(cosine)
+
+    def _get_controller_finger_curls(self, input_device) -> dict[str, float] | None:
+        """Map a controller's trigger and grip onto per-finger curls.
+
+        Follows the convention every VR title uses, so the pose reads naturally: the
+        trigger is the index finger, the grip closes the remaining fingers and the thumb.
+        Pressing both therefore makes a fist, and the trigger alone points the index.
+        """
+        if input_device is None:
+            return None
+        trigger = max(
+            self._get_xr_gesture_value(input_device, "trigger", "value"),
+            self._get_xr_gesture_value(input_device, "trigger", "click"),
+        )
+        grip = max(
+            self._get_xr_gesture_value(input_device, "squeeze", "value"),
+            self._get_xr_gesture_value(input_device, "squeeze", "click"),
+            self._get_xr_gesture_value(input_device, "grip", "value"),
+        )
+        return {
+            "index": max(trigger, grip * 0.9),
+            "middle": max(grip, trigger * 0.5),
+            "ring": grip,
+            "little": grip,
+            "thumb": max(grip, trigger * 0.7),
+        }
+
+    def _get_hand_closure(self, side: str) -> float:
+        """Return how closed one hand is, as the mean curl across its fingers."""
+        curls = self._latest_finger_curls.get(side)
+        if not curls:
+            return 0.0
+        return sum(curls.values()) / len(curls)
+
+    def _is_hand_closed(self, side: str, input_device) -> bool:
+        """Return whether a hand is gripping hard enough to pick an object up.
+
+        With controllers this stays the squeeze that has always driven the grab. With
+        hand tracking there is no squeeze button, so closing the fingers is the grip.
+        """
+        if self._is_controller_arm_pose_enabled(input_device):
+            return True
+        if self._finger_curl_source.get(side) != "hand_tracking":
+            return False
+        return self._get_hand_closure(side) >= self._finger_grab_threshold
 
     def _read_xr_controller_axes(self) -> tuple[float, float]:
         """Return forward and yaw commands from XR controller buttons/sticks."""
@@ -2619,7 +2499,7 @@ class HumanoidExample(BaseSample):
         return forward, yaw
 
     def _update_controller_command(self, dt: float) -> None:
-        """Map VR/gamepad inputs to H1 policy command velocities.
+        """Map VR/gamepad inputs to G1 policy command velocities.
 
         Suggested VR/gamepad mapping:
             - Right trigger: walk forward
@@ -2693,7 +2573,7 @@ class HumanoidExample(BaseSample):
         if self._eye_gaze_tracker is not None:
             self._eye_gaze_tracker.cleanup()
             self._eye_gaze_tracker = None
-        self.h1 = None
+        self.g1 = None
         self._physics_ready = False
         self._head_camera_transform_op = None  # handles die with the stage; never reuse them
         self._xr_anchor_op = None

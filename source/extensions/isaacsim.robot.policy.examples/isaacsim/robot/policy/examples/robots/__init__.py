@@ -15,10 +15,11 @@
 
 # RL based robot template classes
 
-"""Provides example robot policies including terrain navigation and manipulation tasks for Anymal, Franka, H1, and Spot robots."""
+"""Provides example robots: policy-driven Anymal, Franka, Go2, H1 and Spot, plus the teleoperated G1."""
 
 from isaacsim.robot.policy.examples.robots.anymal import AnymalFlatTerrainPolicy
 from isaacsim.robot.policy.examples.robots.franka import FrankaOpenDrawerPolicy
+from isaacsim.robot.policy.examples.robots.g1 import G1TeleopRobot
 from isaacsim.robot.policy.examples.robots.go2 import Go2FlatTerrainPolicy
 from isaacsim.robot.policy.examples.robots.h1 import H1FlatTerrainPolicy
 from isaacsim.robot.policy.examples.robots.spot import SpotFlatTerrainPolicy

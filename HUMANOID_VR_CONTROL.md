@@ -1,27 +1,85 @@
-# Humanoid VR Control — H1 Robot with VR Gait, Quest Pro Eye Tracking & Behavioral Data Recording
+# Humanoid VR Control — Unitree G1 with Dexterous Hands, Quest Pro Eye Tracking & Behavioral Data Recording
 
 > **Fork of:** [NVIDIA IsaacSim](https://github.com/isaac-sim/IsaacSim) · Isaac Sim 6.0.0 GA  
-> **Files modified/added:** `source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py` · `eye_gaze_tracker.py` (same folder)  
+> **Files modified/added:** `.../interactive/humanoid/humanoid_example.py` · `eye_gaze_tracker.py` (same folder) · `.../robots/g1.py` (new)  
 > **Author:** [@soheilAppear](https://github.com/soheilAppear)
 
 ---
 
 ## What This Is
 
-This fork extends the stock Isaac Sim H1 humanoid interactive example with a full **VR-driven locomotion and data-collection pipeline**:
+This fork replaces the stock Isaac Sim H1 humanoid example with the **Unitree G1 fitted with
+Inspire five-finger hands** — the Unitree humanoid that [Isaac Teleop](https://github.com/NVIDIA/IsaacTeleop)
+drives for dexterous manipulation — and wraps it in a full **VR-driven teleoperation and
+data-collection pipeline**:
 
 | Feature | Description |
 |---------|-------------|
-| **Headset gait detection** *(disabled by default)* | Bob your head up/down in VR to make the robot walk — real-time peak/trough signal processing on the HMD height signal. Currently off while step detection is tuned; set `_headset_gait_enabled = True` to re-enable |
+| **Headset gait detection** *(disabled by default)* | Bob your head up/down in VR to move the robot forward — real-time peak/trough signal processing on the HMD height signal. Currently off while step detection is tuned; set `_headset_gait_enabled = True` to re-enable |
 | **Horizontal motion gate** | Prevents false walking from pure head nodding — gait is suppressed unless the headset also moves in the floor plane |
 | **Eye-level first-person camera** | Viewport/XR camera placed at robot eye height (not top of skull) |
-| **VR hand tracking → arm control** | OpenXR hand/controller poses drive H1 arm joints |
-| **Grab system** | Physical sample boxes in the scene can be grabbed with controllers |
+| **VR hand tracking → arm control** | OpenXR hand/controller poses drive the G1 arm joints |
+| **Finger teleoperation** | Real articulated fingers: per-finger curl measured from the OpenXR hand skeleton drives the G1's Inspire hand joints; with controllers the trigger curls the index and the grip closes the rest |
+| **Grab system** | Physical sample boxes can be grabbed by squeezing the controller grip — or, under hand tracking, simply by closing your fingers |
 | **Quest Pro eye tracking** | Real OpenXR eye gaze (the runtime's calibrated fusion of both eyes) drawn as a **red ray** from your eyes to the gazed collider (sample boxes, ground) with a **large blood-red marker sphere** at the collision point; the looked-at box is tinted yellow; every gaze-target change is printed live to the terminal as `[EyeGaze] looking at ...`; robot self-hits filtered out of the raycast (`eye_gaze_tracker.py`) |
 | **Behavioral session recorder** | Every run creates a session folder under `~/BehavioralCollection/raw_sessions/` with `metadata.json` + five time-aligned ~100 Hz CSVs (behavior, hand tracking, gaze, object states, frame timestamps), flushed to disk every ~10 s during play |
 | **Eye-camera frame capture** | First-person 256×256 PNG frames at ~10 Hz, timestamped for video–sensor sync |
 | **Gaze logging with fallback** | `gaze.csv` uses real eye tracking when available, else HMD-forward direction — tagged per row via `gaze_source` |
 | **Learning pipeline scaffold** | `learning/` folder for the V-JEPA world-model pipeline (data sync → baselines → multimodal predictor → planner) |
+
+### How the G1 walks — read this first
+
+Isaac Sim ships a trained flat-terrain locomotion policy for the H1, but **none for the
+G1** (`/Isaac/Samples/Policies/` contains `h1`, `go2`, `spot`, `anymal` and Franka only,
+in 4.5, 5.0 and 6.0 alike). Unitree, however, publishes one for their own robot, and this
+fork uses it: [`unitree_rl_gym`](https://github.com/unitreerobotics/unitree_rl_gym)'s
+`deploy/pre_train/g1/motion.pt` (BSD-3-Clause), vendored here as
+`robots/data/g1_unitree_motion.pt`.
+
+It is an **LSTM actor** — `LSTM(47 → 64)` into an `MLP(64 → 32 → 12)` — trained in Isaac
+Gym and running here at 50 Hz. Two properties make it a good fit:
+
+- **It drives the legs only.** The waist and both arms stay free for teleoperation,
+  instead of being owned by the balance controller the way the H1's whole-body policy
+  owned them. Your arms and fingers do not fight the gait.
+- **It transfers.** Measured in Isaac Sim on the 53-DOF G1 with Inspire hands: 2.69 m
+  travelled on a 0.5 m/s command over 5 s, pelvis height 0.75–0.78 m, tilt never above
+  8.5°, and left/right ankle correlation of **−0.62** — the feet genuinely alternate
+  rather than shuffle. It turns (+113° on a 0.6 rad/s command over 4 s) and stands still
+  without falling.
+
+Set the mode in `humanoid_example.py`:
+
+```python
+self._g1_locomotion = "policy"      # Unitree walking policy — real physics gait
+#                     "kinematic"   # no policy: posture held, base glides on command
+```
+
+`kinematic` is the fallback and is worth knowing about: the robot holds its standing
+posture, gravity is disabled on its links, and the base is integrated straight from the
+`(vx, vy, wz)` command. It cannot fall over, which makes it useful for recording clean
+manipulation sessions where a stumble would ruin the take.
+
+**Things that will bite you if you change this code:**
+
+- **The joint order is not the obvious one.** The policy expects the training URDF's
+  order (all of the left leg, then all of the right); PhysX reports DOFs by tree depth
+  (`left_hip_pitch, right_hip_pitch, waist_yaw, left_hip_roll, …`). The mapping comes out
+  as `[0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18]` — resolved by *name* in
+  `_configure_walk_policy`. Index it positionally and the robot falls instantly.
+- **The policy is stateful.** Its LSTM memory lives inside the scripted module, so the
+  same observation twice gives two different actions. It must be called exactly once per
+  50 Hz tick, in order, and its hidden and cell state zeroed on reset (`post_reset`).
+- **The gains are part of the policy.** It learned against Unitree's PD values
+  (hip 100/2, knee 150/4, ankle 40/2), so those are applied in policy mode rather than
+  the Isaac Lab ones used for the kinematic posture hold.
+- Commands are clamped to the range it was trained within — [0.8, 0.5, 1.57] in m/s, m/s
+  and rad/s. Asking for more is a reliable way to make it fall.
+
+If you would rather train your own — for rough terrain, or to include the arms — the task
+is `Isaac-Velocity-Flat-G1-v0` in Isaac Lab; budget roughly 150M steps (~1500 iterations
+× 4096 envs × 24), which is on the order of half an hour on an RTX 5090, plus however
+many runs of reward tuning it takes.
 
 ---
 
@@ -141,21 +199,49 @@ cd /path/to/isaac-sim-standalone-6.0.0-linux-x86_64
 
 ## Running
 
-### Without VR (keyboard only)
+Every command below is run from the Isaac Sim install directory:
+
 ```powershell
 cd "C:\path\to\isaac-sim-standalone-6.0.0-windows-x86_64"
-.\isaac-sim.bat
 ```
 
-### With VR headset
+### Option 1 — the full example, with UI (keyboard, VR, gaze, data recording)
+
 ```powershell
-.\isaac-sim.xr.vr.bat
+.\isaac-sim.bat            # desktop / keyboard
+.\isaac-sim.xr.vr.bat      # VR headset (start SteamVR first)
 ```
 
 Once Isaac Sim is open:
-1. Go to **Isaac Examples → Robot Policy → Humanoid**
-2. Click **Load**
-3. Click **Play**
+1. **Window -> Examples -> Robotics Examples**, then **Policy -> Humanoid: Unitree G1**
+2. Click **LOAD**, then **Play**
+
+This is the path that records behavioural sessions, draws the gaze ray, and runs the
+first-person camera. Everything else in this guide applies to it.
+
+### Option 2 — straight from the terminal, no clicking
+
+`g1_standalone.py` spawns the G1, walks it and cycles its hands, with no UI to navigate:
+
+```powershell
+# with a window; arrow keys / numpad walk, SPACE toggles the fists
+.\python.bat "C:\path\to\IsaacSim-HumanoidBehavior\source\standalone_examples\api\isaacsim.robot.policy.examples\g1_standalone.py"
+
+# no window at all - scripted walk + turn + fists; good for a quick check or over SSH
+.\python.bat "...\g1_standalone.py" --headless --seconds 20
+
+# the can't-fall glide mode instead of the walking policy
+.\python.bat "...\g1_standalone.py" --locomotion kinematic
+
+# the three-finger Dex3 hand instead of the Inspire five-finger
+.\python.bat "...\g1_standalone.py" --hand ThreeFinger
+```
+
+Flags: `--headless`, `--seconds N`, `--locomotion policy|kinematic`,
+`--hand Inspire|ThreeFinger|None`, `--device cuda|cpu`, `--test`.
+
+> Installed by junction (Option B above)? Both paths pick up your repo edits directly -
+> only an Isaac Sim restart is needed, never a reinstall.
 
 ---
 
@@ -204,7 +290,8 @@ Every load of the example creates a **session folder**:
 ~/BehavioralCollection/raw_sessions/session_YYYY-MM-DD_HH-MM-SS/
 ├── metadata.json           session config: physics/rendering dt, log rates, robot name…
 ├── behavior.csv            main ~100 Hz log (schema below)
-├── hand_tracking.csv       left/right hand or controller pose + grip/trigger/buttons (~100 Hz)
+├── hand_tracking.csv       left/right hand or controller pose + grip/trigger/buttons,
+│                           plus per-finger curl actually sent to the robot (~100 Hz)
 ├── gaze.csv                gaze ray + raycast hit point/object (~100 Hz); real Quest Pro
 │                           eye tracking when available, else HMD-forward (see gaze_source)
 ├── object_states.csv       sample-box poses, velocities, grab state (~100 Hz)
@@ -221,6 +308,19 @@ written at session start.
 > Each gaze row's `gaze_source` column says where it came from: `eye_tracker` (real
 > Quest Pro eye tracking, see below) or `hmd_forward` (HMD position + facing direction —
 > a weaker but still useful intent signal).
+
+### Finger columns in `hand_tracking.csv`
+
+| Column | Description |
+|---|---|
+| `<side>_finger_thumb/index/middle/ring/little` | Curl actually commanded to that finger, `0.0` = open, `1.0` = fully closed |
+| `<side>_hand_closure` | Mean curl across the five fingers — a single "how closed is this hand" scalar |
+| `<side>_finger_source` | `hand_tracking` (measured from the tracked hand skeleton), `controller` (trigger/grip), or `none` (that hand was not tracked this sample) |
+
+Curl under hand tracking is the angle between each finger's metacarpal bone and its
+distal phalanx, normalised by a full-flexion reference (150° for the fingers, 95° for
+the thumb). Measuring an *angle between bones* rather than a fingertip-to-palm distance
+makes the signal independent of hand size and of where your hand is in the room.
 
 ### Quest Pro Eye Tracking (optional)
 
@@ -290,9 +390,9 @@ self._eye_gaze_ray_visual_enabled = True  # red ray + hit marker in the scene
 | **HMD velocity** | `hmd_vel_x`, `hmd_vel_y`, `hmd_vel_z`, `hmd_horiz_speed` | Filtered velocity (m/s) and horizontal speed magnitude |
 | **Gait signal** | `gait_filtered_h`, `gait_vel_sign`, `gait_horiz_gate`, `gait_output`, `gait_pulse_rem` | Internal gait detector state |
 | **Step event** | `step_event` | `1` on the exact sample when a footfall is detected, `0` otherwise |
-| **Robot pose** | `robot_pos_x/y/z`, `robot_qw/qi/qj/qk`, `robot_yaw` | H1 base world pose |
-| **Commands** | `cmd_forward`, `cmd_lateral`, `cmd_yaw` | Locomotion commands sent to policy (m/s, rad/s) |
-| **Joint states** | `j_<joint_name>_pos`, `j_<joint_name>_vel` | Position (rad) and velocity (rad/s) for every H1 DOF |
+| **Robot pose** | `robot_pos_x/y/z`, `robot_qw/qi/qj/qk`, `robot_yaw` | G1 base world pose |
+| **Commands** | `cmd_forward`, `cmd_lateral`, `cmd_yaw` | Locomotion commands driving the base (m/s, rad/s) |
+| **Joint states** | `j_<joint_name>_pos`, `j_<joint_name>_vel` | Position (rad) and velocity (rad/s) for every one of the G1's 53 DOFs (29 body + 24 finger) |
 
 **Sample rate:** ~100 Hz (every 2 physics steps at 200 Hz physics)
 
@@ -346,14 +446,56 @@ self._headset_gait_max_extremum_gap   = 0.95    # max seconds between peak and n
 
 ### Camera
 ```python
-self._first_person_eye_height_above_base = 0.45  # eye height above the H1 pelvis/base link (m)
-self._first_person_head_forward_offset   = 0.14  # forward from the head, out of the skull mesh (m)
+self._first_person_eye_height_above_base = 0.58  # eye height above the G1 pelvis/base link (m)
+self._first_person_head_forward_offset   = 0.26  # forward from the head, out of the skull mesh (m)
 self._first_person_head_up_offset        = 0.0   # extra fine-tune on top of the eye height (m)
-self._head_camera_yaw_sign               = -1.0  # set 1.0 if the view turns opposite to the robot
+self._head_camera_yaw_sign               = 1.0   # set -1.0 if the view turns opposite to the robot
 ```
 The camera height is always `base_z + eye_height (+ up_offset)` — deterministic
 regardless of how the asset's head-link origin is placed. Adjust `eye_height` in
-±0.02 steps until the view matches the robot's eyes.
+±0.02 steps until the view matches the robot's eyes; `0.46` is strict eye level
+inside the G1's head, `0.58` clears the top of the skull.
+
+Note these numbers shrank when the robot changed: the G1 stands 1.32 m tall against
+the H1's 1.80 m, so every offset measured against the old skull had to come down.
+
+> **VR comfort note:** in `policy` locomotion the camera is derived from the pelvis pose,
+> which now genuinely bobs and tilts with each footfall. That is realistic embodiment, and
+> it is also the classic recipe for motion sickness in VR. If it bothers you, either
+> switch `_g1_locomotion` to `"kinematic"` (rock-steady base) or low-pass the camera
+> height in `_get_head_camera_pose`.
+The same applies to the VR rig anchor, which now sits *below* the floor:
+
+```python
+self._xr_anchor_height_offset = -0.30  # your real standing eye height adds on top
+```
+The G1's eyes are at ~1.25 m. If you stand 1.7 m tall, your eyes need the rig to
+drop ~0.3 m for them to land at the robot's. Raise towards 0 if you are shorter.
+
+### Robot and fingers
+```python
+self._g1_hand_variant     = "Inspire"   # "Inspire" (5 fingers) or "ThreeFinger" (Dex3)
+self._g1_spawn_position   = [0.0, 0.0, 0.80]   # pelvis height of the standing posture
+self._finger_control_enabled = True
+self._finger_smoothing       = 0.35     # low-pass on curl, per physics step
+self._finger_grab_threshold  = 0.55     # mean curl at which a nearby box is grabbed
+self._finger_curl_full_flexion_rad = {"thumb": 95°, others: 150°}  # bone angle = fully closed
+```
+
+The robot-side finger constants live in `robots/g1.py` (`G1TeleopRobot`):
+
+```python
+FINGER_STIFFNESS    = 20.0   # the hand asset's own ~0.05-0.19 stalls the fingers part-closed
+FINGER_DAMPING      = 0.6
+FINGER_MAX_EFFORT   = 10.0
+FINGER_MAX_VELOCITY = 8.0    # rad/s; the asset caps at 0.5 rad/s (the real hand's actuator
+                             # speed), which takes 3.2 s to close a fist. 8 rad/s takes ~0.2 s
+```
+
+Only six joints per hand are driven (four finger proximals + thumb pitch and yaw); the
+other six are PhysX **mimic** joints that follow their driver automatically. Never write
+positions to the mimic joints — snapping them against their coupling leaves the two hands
+resting in different poses and the fingers stalling short of the commanded pose.
 
 ### Data collection
 ```python
@@ -380,8 +522,9 @@ on_physics_step (200 Hz)
 │       ├── peak/trough detection
 │       └── pulse output × horiz_gate
 │
-├── h1.forward(dt, base_command)          ← H1FlatTerrainPolicy step
-├── _update_h1_arms_from_hand_tracking()  ← OpenXR hand → arm DOFs
+├── g1.forward(dt, base_command)          ← G1TeleopRobot: glide the base, hold the posture
+├── _update_g1_arms_from_hand_tracking()  ← OpenXR hand → arm DOFs
+├── _update_g1_fingers()                  ← hand skeleton / trigger+grip → finger DOFs
 ├── _update_head_camera_view()            ← move first-person camera
 └── _collect_all_behavioral_data()        ← behavior/hand/gaze/object rows (~100 Hz)
                                              + eye-camera PNG frame (~10 Hz)

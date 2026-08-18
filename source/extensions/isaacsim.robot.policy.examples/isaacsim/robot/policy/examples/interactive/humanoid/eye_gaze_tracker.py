@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Meta Quest Pro eye-gaze tracking for the H1 humanoid VR example.
+"""Meta Quest Pro eye-gaze tracking for the G1 humanoid VR example.
 
 Reads the runtime's combined ("unified") OpenXR eye-gaze pose through Kit's
 XRCore input-device API, raycasts it into the PhysX scene, and draws a thin
@@ -109,9 +109,9 @@ class EyeGazeTracker:
         self._ray_color = Gf.Vec3f(1.0, 0.05, 0.05)          # red
         self._hit_marker_color = Gf.Vec3f(0.45, 0.0, 0.02)   # blood red
         self._highlight_color = Gf.Vec3f(1.0, 0.85, 0.1)     # gazed sample-box tint
-        self._robot_root_path = "/World/H1"                  # own-body hits are re-cast past
-        self._sample_box_root_marker = "/H1_SampleBoxes/"    # only these prims get tinted
-        self._ray_root_path = "/World/H1_EyeGazeRay"
+        self._robot_root_path = "/World/G1"                  # own-body hits are re-cast past
+        self._sample_box_root_marker = "/G1_SampleBoxes/"    # only these prims get tinted
+        self._ray_root_path = "/World/G1_EyeGazeRay"
 
         # --- state ----------------------------------------------------------
         self.latest = GazeSample()
@@ -270,8 +270,8 @@ class EyeGazeTracker:
 
             hit_path = self._decode_hit_path(hit)
             hit_distance = float(getattr(hit, "distance", 0.0))
-            # Match the robot prim SUBTREE only ("/World/H1" or "/World/H1/...").
-            # A bare startswith("/World/H1") also matched "/World/H1_SampleBoxes/..."
+            # Match the robot prim SUBTREE only ("/World/G1" or "/World/G1/...").
+            # A bare startswith("/World/G1") also matched "/World/G1_SampleBoxes/..."
             # and silently discarded every box hit as a self-hit.
             if hit_path is not None and (
                 hit_path == self._robot_root_path or hit_path.startswith(self._robot_root_path + "/")
