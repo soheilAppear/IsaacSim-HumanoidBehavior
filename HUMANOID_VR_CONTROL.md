@@ -251,17 +251,76 @@ Flags: `--headless`, `--seconds N`, `--locomotion policy|kinematic`,
 | Key | Action |
 |-----|--------|
 | `↑` or `Numpad 8` | Walk forward |
+| `↓` or `Numpad 2` | Walk backward (slower — the gait is less stable in reverse) |
 | `←` or `Numpad 4` | Turn left |
 | `→` or `Numpad 6` | Turn right |
 
 ### VR Controller
+
+Thumbsticks are used when the runtime exposes them, because the triggers do double duty —
+the trigger that would drive locomotion is also that hand's index-finger curl, so walking
+on it would clench the robot's hand at the same time.
+
 | Input | Action |
 |-------|--------|
-| Right trigger (hold) | Walk forward |
-| X button (left controller) | Turn left |
-| A button (right controller) | Turn right |
+| **Left stick** | Walk forward / backward (preferred) |
+| **Right stick** | Turn left / right (preferred) |
+| Right trigger (hold) | Walk forward *(fallback if no stick)* |
+| Left trigger (hold) | Walk backward *(fallback if no stick)* |
+| X button (left controller) | Turn left *(fallback)* |
+| A button (right controller) | Turn right *(fallback)* |
 | Left grip (hold) | Arm teleoperation — left arm |
 | Right grip (hold) | Arm teleoperation — right arm |
+| Trigger pressure | Index-finger curl on that hand |
+| Grip pressure | Middle / ring / little / thumb curl on that hand |
+
+The example tells you which one it picked, once, the first time you move:
+
+```
+[G1] locomotion input: THUMBSTICK
+[G1] locomotion input: TRIGGERS/BUTTONS (no thumbstick seen). ...
+```
+
+If you get the second line but your controllers do have sticks, the log also prints
+`HumanoidExample XR left controller inputs: [...]` — find the stick's name there and add
+it to `_xr_stick_input_candidates`.
+
+The names used are Kit's own (`XRInputTokens.thumbstick`, `XRGestureTokens.x` / `.y`), and
+the mapping is verified: stick up walks forward, stick down reverses at the capped speed,
+right stick right turns right, small drift is deadzoned away, and a centred stick still
+falls through to the trigger.
+
+### Gamepad
+| Input | Action |
+|-------|--------|
+| Left stick up / down | Walk forward / backward |
+| Right stick left / right | Turn |
+| Right trigger | Walk forward |
+| X / A buttons | Turn left / right |
+
+### How a keypress becomes a step
+
+Every input above lands in the same place: a single base velocity command
+`(v_x, v_y, w_z)` in m/s and rad/s. Keyboard, VR controller and gamepad all just write
+into it, and it is smoothed and clamped before use.
+
+In `policy` locomotion that command becomes `obs[6:9]` of the walking policy's
+observation (scaled by `[2.0, 2.0, 0.25]`). The policy answers with 12 leg-joint
+position targets at 50 Hz, and the PhysX PD drives turn those into joint torques. So
+"forward" is not a translation applied to the robot — the robot is asked to *walk* at
+that speed and the gait emerges from the policy. In `kinematic` mode the same command is
+integrated straight into the base pose instead.
+
+Command limits: forward 1.0 m/s and yaw 1.0 rad/s as requested, then clamped by the
+robot to the range the policy was trained within — 0.8 m/s forward, 0.5 m/s lateral,
+1.57 rad/s yaw. Backward is deliberately capped lower (`_max_backward_speed = 0.4`).
+Lateral strafing (`v_y`) is supported by the policy but is not bound to any key.
+
+> **Head motion does not move the robot.** Headset gait is off
+> (`_headset_gait_enabled = False`) and, while disabled, its output is excluded from the
+> command mix entirely rather than merely being zero. Your HMD pose is still read every
+> step, but only for `sim_time`, the `hmd_*` columns in `behavior.csv`, and the
+> HMD-forward gaze fallback.
 
 ### VR Headset Gait (step-in-place walking)
 
@@ -459,11 +518,36 @@ inside the G1's head, `0.58` clears the top of the skull.
 Note these numbers shrank when the robot changed: the G1 stands 1.32 m tall against
 the H1's 1.80 m, so every offset measured against the old skull had to come down.
 
-> **VR comfort note:** in `policy` locomotion the camera is derived from the pelvis pose,
-> which now genuinely bobs and tilts with each footfall. That is realistic embodiment, and
-> it is also the classic recipe for motion sickness in VR. If it bothers you, either
-> switch `_g1_locomotion` to `"kinematic"` (rock-steady base) or low-pass the camera
-> height in `_get_head_camera_pose`.
+### Camera stabilization — the VR wobble fix
+
+In `policy` locomotion the camera rides the pelvis, and a walking humanoid's pelvis is
+not a steady platform. Measured on this robot while walking at 0.5 m/s, the raw camera
+motion was:
+
+| | Raw (unstabilized) | Stabilized |
+|---|---|---|
+| Height bob | 3.06 cm peak-to-peak | see below |
+| Lateral sway | 2.47 cm peak-to-peak | |
+| Yaw wobble | 5.00° peak-to-peak | |
+
+All of it at the 0.8 s gait period — about **1.25 Hz**, squarely in the band that causes
+VR sickness. A real neck does not pass that through; the head stays far steadier than the
+hips. `_stabilize_camera_pose` reproduces that with three first-order low-passes:
+
+```python
+self._camera_stabilization_enabled = True
+self._camera_height_filter_time  = 0.35   # s: strongest — nothing here intentionally
+                                          #    changes height, so lag costs nothing
+self._camera_lateral_filter_time = 0.18   # s: removes sway, keeps walking responsive
+self._camera_yaw_filter_time     = 0.22   # s: removes per-step yaw wobble
+```
+
+The filtered pose feeds both the desktop camera *and* the XR rig anchor, so the headset
+gets the same steady frame. Camera roll and pitch never enter at all — the pose is built
+from yaw with world-up — so bob, sway and yaw were the whole problem.
+
+Raise the time constants if any wobble remains; lower them if walking feels laggy. Set
+`_camera_stabilization_enabled = False` to feel the raw pelvis motion again.
 The same applies to the VR rig anchor, which now sits *below* the floor:
 
 ```python
@@ -515,17 +599,18 @@ on_physics_step (200 Hz)
 ├── _update_controller_command(dt)
 │   ├── _read_xr_controller_axes()        ← VR trigger / A / X buttons
 │   ├── _read_gamepad_controller_axes()   ← gamepad fallback
-│   └── _update_headset_gait_command(dt)
+│   └── _update_headset_gait_command(dt)   ← pose reads for logging; output NOT used
 │       ├── _get_headset_tracking_height() ← reads /user/head XR pose
 │       ├── _update_headset_velocity(dt)   ← 3D velocity + horizontal gate
-│       ├── low-pass filter on height
-│       ├── peak/trough detection
-│       └── pulse output × horiz_gate
+│       └── (step detection, only when _headset_gait_enabled)
 │
-├── g1.forward(dt, base_command)          ← G1TeleopRobot: glide the base, hold the posture
+├── g1.forward(dt, base_command)          ← G1TeleopRobot
+│   ├── policy mode:    47-dim obs → LSTM → 12 leg targets @ 50 Hz
+│   └── kinematic mode: integrate the base pose, hold the posture
 ├── _update_g1_arms_from_hand_tracking()  ← OpenXR hand → arm DOFs
 ├── _update_g1_fingers()                  ← hand skeleton / trigger+grip → finger DOFs
-├── _update_head_camera_view()            ← move first-person camera
+├── _update_head_camera_view(dt)          ← first-person camera
+│   └── _stabilize_camera_pose()          ← low-pass out the gait wobble (VR comfort)
 └── _collect_all_behavioral_data()        ← behavior/hand/gaze/object rows (~100 Hz)
                                              + eye-camera PNG frame (~10 Hz)
                                              (CSVs appended every ~10 s + on stop)

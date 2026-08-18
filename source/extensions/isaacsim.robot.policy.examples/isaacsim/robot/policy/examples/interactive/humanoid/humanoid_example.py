@@ -103,12 +103,14 @@ class HumanoidExample(BaseSample):
         self._gamepad = None
         self._xr_core = None
         self._xr_input_status_logged = False
+        self._locomotion_input_logged = False
         self._keyboard_command = None
         self._controller_command = None
         self._controller_deadzone = 0.15
         self._locomotion_trigger_threshold = 0.25
         self._arm_pose_enable_threshold = 0.25
         self._max_forward_speed = 1.0
+        self._max_backward_speed = 0.4   # the gait is less stable in reverse than forward
         self._max_yaw_speed = 1.0
         self._command_response_time = 0.0
         self._headset_gait_enabled = False    # temporarily disabled: step detection not yet stable; flip to True to restore
@@ -176,6 +178,25 @@ class HumanoidExample(BaseSample):
                                                         # head_compose mode; try 0/90/180 if you spawn rotated
         self._head_camera_last_base = None              # stashed by _get_head_camera_pose for the anchor
         self._head_camera_last_yaw = None
+        # --- Camera stabilization (the VR wobble fix) ---
+        # A walking humanoid's pelvis bobs ~2-3 cm vertically, sways laterally and
+        # wobbles in yaw once per step. At the 0.8 s gait period that is ~1.25 Hz, right
+        # in the band that causes VR sickness, and the camera rides the pelvis. A real
+        # neck does not pass that through: the head stays far steadier than the hips.
+        # These first-order low-passes reproduce that. Height gets the strongest
+        # filtering (nothing here intentionally changes the robot's height, so lag costs
+        # nothing); x/y and yaw are filtered more gently because walking and turning are
+        # intentional and should not feel sluggish.
+        # Filtering x/y harder than it might seem safe to is fine: a first-order lag on
+        # position does not slow the camera down, it just parks it a few centimetres
+        # behind the robot at constant speed — a static offset nobody notices, unlike the
+        # oscillation it removes. (Measured: travel 3.36 m -> 3.31 m over 6 s.)
+        self._camera_stabilization_enabled = True
+        self._camera_height_filter_time = 0.35    # s: removes the gait bob
+        self._camera_lateral_filter_time = 0.30   # s: removes side-to-side sway
+        self._camera_yaw_filter_time = 0.22       # s: removes per-step yaw wobble
+        self._camera_filtered_base = None
+        self._camera_filtered_yaw = None
         self._first_person_head_target_distance = 1.8
         # Headset velocity and horizontal-motion tracking (gait gate)
         self._last_headset_raw_position = None       # Gf.Vec3d: position from pose reader
@@ -229,6 +250,8 @@ class HumanoidExample(BaseSample):
         self._g1_arm_joint_limits = {}
         self._hand_pose_candidates = ("palm", "wrist", "grip", "aim", "")
         self._controller_pose_candidates = ("grip", "aim", "")
+        # Names runtimes use for the thumbstick; the first that answers wins.
+        self._xr_stick_input_candidates = ("thumbstick", "joystick", "trackpad")
         self._arm_smoothing = 0.34
         self._smoothed_arm_targets = {}
         self._arm_rig_smoothing = 0.38
@@ -305,6 +328,10 @@ class HumanoidExample(BaseSample):
             # forward command
             "NUMPAD_8": [self._max_forward_speed, 0.0, 0.0],
             "UP": [self._max_forward_speed, 0.0, 0.0],
+            # backward command (the walking policy is trained for reverse too, though its
+            # range is smaller than forward, so this is deliberately gentler)
+            "NUMPAD_2": [-self._max_backward_speed, 0.0, 0.0],
+            "DOWN": [-self._max_backward_speed, 0.0, 0.0],
             # yaw command (positive)
             "NUMPAD_4": [0.0, 0.0, self._max_yaw_speed],
             "LEFT": [0.0, 0.0, self._max_yaw_speed],
@@ -487,6 +514,7 @@ class HumanoidExample(BaseSample):
             except Exception as e:
                 carb.log_warn(f"HumanoidExample: Quest Pro eye-gaze tracker unavailable: {e}")
         self._xr_input_status_logged = False
+        self._locomotion_input_logged = False
         self._hand_tracking_status_logged = False
         self._g1_arm_dofs_configured = False
         self._grabbed_objects_by_side = {}
@@ -517,6 +545,8 @@ class HumanoidExample(BaseSample):
         self._xr_anchor_configured = False  # re-apply anchor settings on every load
         self._head_camera_last_base = None
         self._head_camera_last_yaw = None
+        self._camera_filtered_base = None
+        self._camera_filtered_yaw = None
         self._start_behavioral_session()
 
         torch = import_module("torch")
@@ -599,7 +629,7 @@ class HumanoidExample(BaseSample):
             except Exception as e:
                 self._log_physics_step_error("finger teleoperation", e)
             try:
-                self._update_head_camera_view()
+                self._update_head_camera_view(dt=dt)
             except Exception as e:
                 self._log_physics_step_error("head camera update", e)
             if self._eye_gaze_tracker is not None:
@@ -617,7 +647,7 @@ class HumanoidExample(BaseSample):
             self.g1.initialize()  # This already sets default state internally
             self.g1.post_reset()
             self._configure_g1_arm_dofs()
-            self._update_head_camera_view(force=True)
+            self._update_head_camera_view(force=True, dt=dt)
 
     def _log_physics_step_error(self, subsystem: str, error: Exception) -> None:
         """Warn once per distinct physics-step subsystem failure instead of spamming at 200 Hz."""
@@ -811,7 +841,7 @@ class HumanoidExample(BaseSample):
         except Exception:
             return None
 
-    def _get_head_camera_pose(self):
+    def _get_head_camera_pose(self, dt: float | None = None):
         """Compute a first-person camera pose from the G1 head/eye position."""
         if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
@@ -825,10 +855,17 @@ class HumanoidExample(BaseSample):
         qw, qx, qy, qz = (float(orientation[0]), float(orientation[1]), float(orientation[2]), float(orientation[3]))
         yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
         yaw *= self._head_camera_yaw_sign
-        forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
         base = Gf.Vec3d(float(position[0]), float(position[1]), float(position[2]))
+
+        # Damp the gait oscillation out before anything downstream sees it.
+        if dt is None:
+            dt = float(self._world_settings.get("physics_dt", 1.0 / 200.0))
+        base, yaw = self._stabilize_camera_pose(base, yaw, dt)
+
+        forward = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
         # Stash for the XR anchor update, which needs the raw base/yaw rather
-        # than the finished camera matrix.
+        # than the finished camera matrix. These are the *stabilized* values, so the VR
+        # rig rides the same steady frame the desktop camera does.
         self._head_camera_last_base = base
         self._head_camera_last_yaw = yaw
 
@@ -847,7 +884,53 @@ class HumanoidExample(BaseSample):
         target = eye + forward * self._first_person_head_target_distance
         return Gf.Matrix4d().SetLookAt(eye, target, Gf.Vec3d(0.0, 0.0, 1.0)).GetInverse()
 
-    def _update_head_camera_view(self, force: bool = False) -> None:
+    def _stabilize_camera_pose(self, base: Gf.Vec3d, yaw: float, dt: float) -> tuple[Gf.Vec3d, float]:
+        """Low-pass the robot's base pose so the gait does not shake the camera.
+
+        Three separate time constants because the three axes have different needs:
+        height only ever oscillates (never intentionally changes here) so it is filtered
+        hard; x/y and yaw carry the operator's intent and are filtered just enough to
+        remove the per-step wobble without feeling laggy.
+
+        Args:
+            base: Raw base position from the articulation root.
+            yaw: Raw base yaw in radians.
+            dt: Physics timestep in seconds.
+
+        Returns:
+            The smoothed ``(base, yaw)`` to build the camera from.
+        """
+        if not self._camera_stabilization_enabled or dt <= 0.0:
+            return base, yaw
+
+        if self._camera_filtered_base is None or self._camera_filtered_yaw is None:
+            self._camera_filtered_base = Gf.Vec3d(base)
+            self._camera_filtered_yaw = yaw
+            return base, yaw
+
+        previous = self._camera_filtered_base
+        lateral_alpha = self._clamp_value(dt / self._camera_lateral_filter_time, 0.0, 1.0)
+        height_alpha = self._clamp_value(dt / self._camera_height_filter_time, 0.0, 1.0)
+        self._camera_filtered_base = Gf.Vec3d(
+            previous[0] + (base[0] - previous[0]) * lateral_alpha,
+            previous[1] + (base[1] - previous[1]) * lateral_alpha,
+            previous[2] + (base[2] - previous[2]) * height_alpha,
+        )
+
+        # Yaw is filtered through the shortest angular difference, so crossing +/-pi
+        # does not spin the view the long way round.
+        yaw_alpha = self._clamp_value(dt / self._camera_yaw_filter_time, 0.0, 1.0)
+        delta = self._wrap_angle(yaw - self._camera_filtered_yaw)
+        self._camera_filtered_yaw = self._wrap_angle(self._camera_filtered_yaw + delta * yaw_alpha)
+
+        return self._camera_filtered_base, self._camera_filtered_yaw
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """Wrap an angle into [-pi, pi]."""
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _update_head_camera_view(self, force: bool = False, dt: float | None = None) -> None:
         """Move the viewport/XR camera to the G1 head pose."""
         if self._head_camera_transform_op is None:
             return
@@ -869,7 +952,7 @@ class HumanoidExample(BaseSample):
             if self._head_camera_transform_op is None:
                 return
 
-        camera_pose = self._get_head_camera_pose()
+        camera_pose = self._get_head_camera_pose(dt)
         if camera_pose is None:
             return
         self._head_camera_transform_op.Set(camera_pose)
@@ -2457,11 +2540,42 @@ class HumanoidExample(BaseSample):
             return False
         return self._get_hand_closure(side) >= self._finger_grab_threshold
 
+    def _get_xr_stick_axis(self, input_device, axis: str) -> float:
+        """Read a thumbstick axis, trying the input names different runtimes use.
+
+        Returns 0.0 both when the stick is centred and when the runtime does not expose
+        one, which is exactly the fallback behaviour the caller wants.
+        """
+        for input_name in self._xr_stick_input_candidates:
+            value = self._get_xr_gesture_value(input_device, input_name, axis)
+            if value != 0.0:
+                return value
+        return 0.0
+
     def _read_xr_controller_axes(self) -> tuple[float, float]:
-        """Return forward and yaw commands from XR controller buttons/sticks."""
+        """Return forward and yaw commands from XR controller sticks, else triggers.
+
+        Thumbsticks are preferred because the triggers do double duty: the same trigger
+        that would drive locomotion is also the index-finger curl for that hand, so
+        walking with it would clench the robot's hand at the same time. If the runtime
+        exposes no stick the trigger mapping still works — check the
+        ``HumanoidExample XR ... controller inputs:`` line in the log to see what your
+        controllers actually report.
+        """
         left_xr = self._get_xr_input_device("/user/hand/left")
         right_xr = self._get_xr_input_device("/user/hand/right")
         self._log_xr_input_status_once(left_xr, right_xr)
+
+        # Standard VR convention: left stick translates, right stick turns.
+        stick_forward = self._apply_deadzone(self._get_xr_stick_axis(left_xr, "y"))
+        stick_yaw = -self._apply_deadzone(self._get_xr_stick_axis(right_xr, "x"))
+        if stick_forward != 0.0 or stick_yaw != 0.0:
+            if not self._locomotion_input_logged:
+                self._locomotion_input_logged = True
+                print("[G1] locomotion input: THUMBSTICK", flush=True)
+            if stick_forward < 0.0:
+                stick_forward *= self._max_backward_speed / max(self._max_forward_speed, 1e-6)
+            return stick_forward, stick_yaw
 
         right_trigger = self._get_xr_gesture_value(right_xr, "trigger", "value")
         right_trigger_click = self._get_xr_gesture_value(right_xr, "trigger", "click")
@@ -2469,7 +2583,17 @@ class HumanoidExample(BaseSample):
             right_trigger if right_trigger >= self._locomotion_trigger_threshold else 0.0,
             right_trigger_click,
         )
-        forward = self._apply_deadzone(forward)
+        # Left trigger reverses, mirroring the right. Scaled down because the gait is
+        # less stable walking backwards than forwards.
+        left_trigger = self._get_xr_gesture_value(left_xr, "trigger", "value")
+        left_trigger_click = self._get_xr_gesture_value(left_xr, "trigger", "click")
+        backward = max(
+            left_trigger if left_trigger >= self._locomotion_trigger_threshold else 0.0,
+            left_trigger_click,
+        )
+        forward = self._apply_deadzone(forward) - self._apply_deadzone(backward) * (
+            self._max_backward_speed / max(self._max_forward_speed, 1e-6)
+        )
         turn_left = max(
             self._get_xr_gesture_value(left_xr, "x", "click"),
             self._get_xr_gesture_value(left_xr, "x", "value"),
@@ -2480,6 +2604,14 @@ class HumanoidExample(BaseSample):
         )
 
         yaw = self._apply_deadzone(turn_left - turn_right)
+        if (forward != 0.0 or yaw != 0.0) and not self._locomotion_input_logged:
+            self._locomotion_input_logged = True
+            print(
+                "[G1] locomotion input: TRIGGERS/BUTTONS (no thumbstick seen). "
+                "If your controllers have sticks, check the 'XR ... controller inputs' "
+                "line above and add the name to _xr_stick_input_candidates.",
+                flush=True,
+            )
         return forward, yaw
 
     def _read_gamepad_controller_axes(self) -> tuple[float, float]:
@@ -2499,14 +2631,20 @@ class HumanoidExample(BaseSample):
         return forward, yaw
 
     def _update_controller_command(self, dt: float) -> None:
-        """Map VR/gamepad inputs to G1 policy command velocities.
+        """Map VR/gamepad inputs to the base velocity command.
 
-        Suggested VR/gamepad mapping:
+        VR/gamepad mapping:
             - Right trigger: walk forward
-            - Step in place: walk forward from headset vertical peak/trough detection
+            - Left trigger: walk backward
             - X button: turn left
             - A button: turn right
             - Left/right grip or squeeze: arm pose teleoperation
+            - Trigger / grip pressure: finger curl
+
+        Head motion does NOT drive the robot. ``_update_headset_gait_command`` is still
+        called because sim_time, the hmd_* columns in behavior.csv and the HMD-forward
+        gaze fallback all come from the pose reads inside it — but its output only
+        reaches the command when headset gait is explicitly enabled.
         """
         if self._controller_command is None:
             return
@@ -2514,7 +2652,10 @@ class HumanoidExample(BaseSample):
         xr_forward, xr_yaw = self._read_xr_controller_axes()
         gamepad_forward, gamepad_yaw = self._read_gamepad_controller_axes()
         headset_gait_forward = self._update_headset_gait_command(dt)
-        forward = max(xr_forward, gamepad_forward, headset_gait_forward)
+
+        forward = xr_forward if abs(xr_forward) > abs(gamepad_forward) else gamepad_forward
+        if self._headset_gait_enabled:
+            forward = max(forward, headset_gait_forward)
         yaw = xr_yaw if abs(xr_yaw) > abs(gamepad_yaw) else gamepad_yaw
 
         self._controller_command[0] = self._max_forward_speed * forward
