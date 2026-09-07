@@ -13,7 +13,7 @@
 [![Quest Pro Eye Tracking](https://img.shields.io/badge/eye%20tracking-Quest%20Pro%20✔%20verified-red.svg)](HUMANOID_VR_CONTROL.md#quest-pro-eye-tracking-optional)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow.svg)](LICENSE)
 
-**[📄 Setup & Usage Guide](HUMANOID_VR_CONTROL.md)** · **[🧠 Learning Pipeline](learning/README.md)** · **[📊 Data Schema](HUMANOID_VR_CONTROL.md#behavioral-data-collection)**
+**[📄 Setup & Usage Guide](HUMANOID_VR_CONTROL.md)** · **[Control Architecture & Validation](docs/humanoid-control.md)** · **[🧠 Learning Pipeline](learning/README.md)** · **[📊 Data Schema](HUMANOID_VR_CONTROL.md#behavioral-data-collection)**
 
 <img src="docs/readme/vr_gaze_showcase.gif" alt="VR view: eye gaze selects a sample box (highlighted yellow), the red collision marker pins the exact gaze point, and the robot's hands reach for it" width="640">
 
@@ -21,16 +21,24 @@
 
 </div>
 
+**Default mode: stationary hand control.** The robot stands anchored at its spawn pose; walking and turning inputs are disabled. Use optical hand tracking, or hold controller grip to move the arm and pull trigger to pick up a nearby object. Gaze remains active. Save your stage and restart Isaac Sim, then LOAD the example to create the fixed-base scene.
+
+The [current developer guide](docs/humanoid-control.md) documents the repaired controls,
+assisted pickup, tests, and pending live validation. Performance measurements and captures
+on this page come from earlier sessions. Gaze rows distinguish real eye tracking from
+HMD-forward fallback; fixed-joint pickup is recorded as assistance.
+
 **The idea:** teleoperating a humanoid in VR produces exactly the data embodied-AI research is starving for — synchronized human *intent* (head motion, hand poses, eye gaze) paired with robot *behavior* (full joint states, base trajectory, commands) and *first-person video*. This fork turns the stock Isaac Sim humanoid example into that recording instrument — retargeted onto the **Unitree G1 with Inspire five-finger hands**, the Unitree humanoid [Isaac Teleop](https://github.com/NVIDIA/IsaacTeleop) drives for dexterous manipulation — and ships the scaffold of a V-JEPA-based world-model pipeline to consume it.
 
 | | Feature | What it does |
 |---|---------|--------------|
 | 👁️ | **Quest Pro eye tracking** — *verified end-to-end* | Real OpenXR eye gaze over SteamVR + Steam Link, drawn as a red ray with a blood-red marker at the gaze collision; gazed objects highlight yellow; live `[EyeGaze] looking at sample box Box_03 @ (5.2, -0.4, 0.3) m` terminal events |
-| 📼 | **Behavioral session recorder** | Every run auto-creates a session: 5 time-aligned ~100 Hz CSVs (HMD, hands, gaze + collisions, objects, all robot joints) + ~10 Hz first-person frames + metadata — **crash-safe**, flushed to disk every 10 s |
+| 📼 | **Behavioral session recorder** | Every run auto-creates a session: 5 time-aligned ~100 Hz CSVs (HMD, hands, gaze + collisions, objects, all robot joints) + ~10 Hz first-person frames + metadata — **crash-safe**, flushed to disk every 2.5 s |
 | 🤲 | **Hand tracking & arm teleop** | OpenXR hand/controller poses drive the G1 arms; grab system for physics objects |
-| ✋ | **Dexterous finger control** | The G1's real Inspire hand joints open and close from your own fingers: per-finger curl is measured from the OpenXR hand skeleton, or from trigger (index) and grip (the rest) on controllers |
+| ✋ | **Dexterous finger control** | The G1's real Inspire hand joints open and close from your own fingers: per-finger curl is measured from the OpenXR hand skeleton, or from trigger pressure on controllers; grip clutches the arm without closing the fingers |
 | 🎥 | **Eye-level first-person camera** | Viewport/XR camera rides at the robot's eye height — in VR you literally see through the robot's eyes |
 | 🚶 | **Real walking gait** | Unitree's own pretrained G1 policy (BSD-3-Clause) drives the legs at 50 Hz — measured 2.69 m in 5 s on a 0.5 m/s command with genuinely alternating feet. It controls *only* the legs, so your arms and fingers never fight the balance controller. A kinematic glide mode is available as a can't-fall fallback |
+| 🏭 | **Warehouse workcell** | The robot works inside NVIDIA's `full_warehouse` — racking, pallets, forklifts — with pickable crates and KLT bins scattered within a short walk, so sessions record real pick-and-carry behaviour instead of cubes on an empty plane |
 | 🧍 | **Headset gait walking** *(experimental, off by default)* | Step in place (head bob) to move the robot; peak/trough detection with a horizontal-motion gate against false triggers |
 | 🧠 | **Learning pipeline** ([`learning/`](learning/README.md)) | Phased plan: dataset sync → CSV baselines → frozen V-JEPA 2 embeddings → multimodal predictor → action-conditioned latent world model → MPC planner |
 
@@ -39,10 +47,26 @@
 The eye tracker is not just a visualization — it is a **gaze-driven object-selection and auto-annotation method**:
 
 1. **Embodied gaze ray** — the Quest Pro's calibrated binocular gaze (`XR_EXT_eye_gaze_interaction`) is read in the *robot's* world frame: the XR rig rides the robot, so your gaze ray physically originates at the robot's eyes.
-2. **Self-hit-filtered raycast** — the ray is cast into the PhysX scene with subtree-aware filtering: collisions with the robot's own body are re-cast past, so the selected object is always what you *meant* to look at, never the embodiment itself.
+2. **Self-hit-filtered raycast** — the ray is cast into the PhysX scene with subtree-aware filtering: all raycast hits on the robot's own subtree are excluded, so the nearest non-robot collider is selected.
 3. **Selection = annotation** — the first real collider along the ray (sample box, ground, …) becomes the selected object: tinted yellow in-scene, marked with a blood-red collision sphere, announced live on the terminal (`[EyeGaze] looking at sample box Box_03 @ (5.2, -0.4, 0.3) m, 3.8 m away`), and logged to `gaze.csv` at ~100 Hz with hit position, distance, and prim path.
 
 Because every gaze-selection event is time-aligned with hand poses, robot joint states, and first-person video, each session yields **ground-truth "what the human is attending to" labels for free** — visual-attention supervision for imitation learning and intent prediction, with zero manual annotation.
+
+### 🎮 VR controls at a glance
+
+| Input | Action |
+|---|---|
+| Left stick forward / back | Walk / **brake** |
+| Right stick left-right, or **X** (left) / **A** (right) | Turn — **on the spot**, no forward creep |
+| Grip (hold) | Move that arm |
+| **Trigger** | Grab the nearest package (assisted out to 0.55 m, green-tinted before you squeeze) |
+| **B** (right) | **Recenter** the VR view on the robot |
+| **Y** (left) | Drop everything held |
+
+The VR rig **measures itself from your headset** — your standing eye height and which way
+you are facing — so the view lands at the robot's eye level looking the way it walks,
+whatever your height and wherever you are standing in the room. Verified exact for body
+heights 1.15–1.85 m; press **B** any time to redo it.
 
 <sub>All of it lives in two files: [`humanoid_example.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py) + [`eye_gaze_tracker.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/eye_gaze_tracker.py) — drop them into a stock Isaac Sim 6.0 install ([3 install options](HUMANOID_VR_CONTROL.md#installation--how-to-apply)). Works desktop-only with keyboard too; VR and eye tracking are optional layers.</sub>
 

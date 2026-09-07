@@ -31,20 +31,15 @@ class HumanoidExampleExtension(omni.ext.IExt):
     multimodal behavioural data collection in Isaac Sim.
 
     The extension registers itself with the examples browser under the "Policy" category and provides
-    a user interface for interacting with the humanoid robot simulation. Users can control the robot
-    using keyboard inputs to move forward and rotate.
-
-    Keyboard controls:
-        - Up arrow / numpad 8: Move forward
-        - Left arrow / numpad 4: Spin counterclockwise
-        - Right arrow / numpad 6: Spin clockwise
+    a user interface for stationary manipulation. The base is anchored while hands
+    are controlled by optical hand tracking or by controller grip/trigger inputs.
     """
 
     def on_startup(self, ext_id: str):
         """Initializes the Humanoid example extension.
 
         Registers the Unitree G1 humanoid example with the examples browser and creates the UI template
-        with keyboard controls for forward movement and rotation.
+        with hand-tracking and controller pickup instructions.
 
         Args:
             ext_id: The extension identifier.
@@ -52,12 +47,14 @@ class HumanoidExampleExtension(omni.ext.IExt):
         self.example_name = "Humanoid"
         self.category = "Policy"
 
-        overview = "This Example shows a Unitree G1 with Inspire dexterous hands, teleoperated in VR. "
-        overview += "Head, hand and finger tracking drive the robot; the base glides on the keyboard or controller. "
-        overview += "\n\n\tKeyboard Input:"
-        overview += "\n\t\tup arrow / numpad 8: Move Forward"
-        overview += "\n\t\tleft arrow / numpad 4: Spin Counterclockwise"
-        overview += "\n\t\tright arrow / numpad 6: Spin Clockwise"
+        overview = "The G1 stands anchored in place. Walking and turning inputs are disabled. "
+        overview += "Arms, fingers, gaze, and recording remain active."
+        overview += "\n\nHand tracking: reach with an open hand, close your fingers around a nearby object to take it, "
+        overview += "then open your hand to release."
+        overview += "\n\nControllers: hold the side GRIP to move/rotate that arm; pull TRIGGER to close and pick up. "
+        overview += "Keep grip held while carrying; release trigger to drop."
+        overview += "\nY: drop both objects (release/open before grabbing again). B: recenter view."
+        overview += "\nStart with the tabletop objects directly in front-right of the robot."
         overview += "\n\nPress the 'Open in IDE' button to view the source code."
 
         ui_kwargs = {
