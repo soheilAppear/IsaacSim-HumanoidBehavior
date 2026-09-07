@@ -16,12 +16,72 @@ finger control passes replay tests, but the headset must supply valid skeletal l
 Use the [real-hand observer](#real-hand-observation) to distinguish missing input from a
 robot-control problem.
 
+[Screenshots and videos](#screenshots-and-videos) ·
 [Installation](#installation) · [Running](#running) · [Controls](#controls) ·
 [Validation](#validation) · [Recordings](#behavioral-data-collection) ·
 [Quest Pro gaze](#quest-pro-eye-tracking-optional) · [Troubleshooting](#troubleshooting)
 
 For implementation details, coordinate frames, lifecycle behavior, and test coverage, see
 [the developer guide](docs/humanoid-control.md).
+
+## Screenshots and videos
+
+![Both G1 Inspire hands with cyan and orange hand-target markers](docs/readme/g1-inspire-hands.png)
+
+Both Inspire hands in the recorded robot-camera view. The colored spheres are target
+markers; this still does not demonstrate independent finger motion.
+
+| Recorded action | Video | Preview |
+|---|---|---|
+| Bottle pickup, lift, hand transfer, and release | [Silent MP4, 4.1 s](docs/readme/g1-bottle-pickup.mp4?raw=true) | [Animated GIF](docs/readme/g1-bottle-preview.gif) |
+| Package pickup, lift, and release | [Silent MP4, 3.1 s](docs/readme/g1-package-pickup.mp4?raw=true) | [Animated GIF](docs/readme/g1-package-preview.gif) |
+
+The [README gallery](README.md#recorded-g1-demos) displays both animated previews and
+the bottle/package screenshots. All new media comes from local recording
+`session_2026-09-07_02-40-23`, captured on **7 September 2026**. Its metadata identifies
+Isaac Sim 6.0.0, G1, Inspire hands, stationary locomotion, a world-fixed base, and
+`distance_gated_fixed_joint` grasp assistance. Raw session data is not included here.
+
+| Published asset | Original `eye_camera` frames | Simulation time |
+|---|---|---|
+| `g1-bottle-pickup.mp4` / `g1-bottle-preview.gif` | 150–190 inclusive | 15.2–19.2 s |
+| `g1-package-pickup.mp4` / `g1-package-preview.gif` | 265–295 inclusive | 26.7–29.7 s |
+| `g1-bottle-lift.png` | 180 | 18.2 s |
+| `g1-package-lift.png` | 280 | 28.2 s |
+| `g1-inspire-hands.png` | 292 | 29.4 s |
+
+Screenshots are unmodified PNG frames. Videos preserve the native **256×256** frame
+size, use silent H.264 with browser-compatible pixel format, and play at **10 fps in
+simulation time**. The final frame is displayed for another 0.1 s, giving durations
+of 4.1 s and 3.1 s. The original first-to-last wall-clock spans were approximately
+17.46 s and 13.79 s; these clips are not real-time performance measurements.
+
+The session metadata does not distinguish operator input from injected replay input.
+These clips demonstrate visible manipulation, not verified Quest tracking accuracy,
+per-finger independence, or camera invariance. Refer to [Validation](#validation) for
+measured results and outstanding hardware checks. Existing gaze markers and highlights
+are preserved in the source images; exporting this media does not change gaze code or
+settings. The July H1 clip in the README remains labeled as historical footage.
+
+To export the same excerpts from a local copy of this recording, install FFmpeg and
+run from the repository root. Set `$sessionDir` to the folder containing `metadata.json`:
+
+```powershell
+$sessionDir = "C:/path/to/raw_sessions/session_2026-09-07_02-40-23"
+$frames = Join-Path $sessionDir "frames/eye_camera/frame_%06d.png"
+ffmpeg -y -framerate 10 -start_number 150 -i $frames -frames:v 41 -an -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -movflags +faststart docs/readme/g1-bottle-pickup.mp4
+ffmpeg -y -framerate 10 -start_number 265 -i $frames -frames:v 31 -an -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -movflags +faststart docs/readme/g1-package-pickup.mp4
+
+foreach ($clip in "bottle", "package") {
+    ffmpeg -y -i "docs/readme/g1-$clip-pickup.mp4" -filter_complex '[0:v]split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=sierra2_4a' -loop 0 "docs/readme/g1-$clip-preview.gif"
+}
+```
+
+For other sessions, check `frame_timestamps.csv` before choosing a playback rate;
+missing frames or changed recording settings can invalidate a fixed 10 fps export.
+PNGs and MP4s use this repository's Git LFS rules, so contributors need `git lfs pull`.
+The small GIF previews are stored directly in Git and linked to the MP4 files for
+GitHub readers.
 
 ## Installation
 

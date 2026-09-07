@@ -9,11 +9,17 @@ gaze, object states, and images for later analysis and learning experiments.
 [![License](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](LICENSE)
 
 [Setup and controls](HUMANOID_VR_CONTROL.md) ·
+[Recorded demos](#recorded-g1-demos) ·
 [Developer guide and validation](docs/humanoid-control.md) ·
 [Performance](docs/humanoid-control.md#performance-and-cpu-physics) ·
 [Learning pipeline](learning/README.md)
 
-![Warehouse scene](docs/readme/hero_shot_compressed.png)
+| G1 bottle lift | G1 package lift |
+|:---:|:---:|
+| ![White Inspire fingers lifting a yellow bottle](docs/readme/g1-bottle-lift.png) | ![Right Inspire hand lifting a highlighted package](docs/readme/g1-package-lift.png) |
+
+Robot-camera screenshots from the **7 September 2026** G1 recording, at their native
+256×256 resolution. Colored targets and gaze highlights are part of the recorded scene.
 
 ## Current behavior
 
@@ -34,6 +40,22 @@ locomotion, and step-in-place inputs cannot move the base in this mode.
 
 Inspire has six independent hand actuators. Distal knuckles are coupled, so it cannot
 reproduce every human knuckle angle or finger-splay movement separately.
+
+## Recorded G1 demos
+
+These excerpts show **assisted pickup, lifting, and release** in a recorded stationary
+G1 session. Click a preview to open its video file, or use the MP4 links below.
+
+| Bottle pickup and transfer | Package pickup and release |
+|:---:|:---:|
+| [![Animated bottle pickup preview](docs/readme/g1-bottle-preview.gif)](docs/readme/g1-bottle-pickup.mp4) | [![Animated package pickup preview](docs/readme/g1-package-preview.gif)](docs/readme/g1-package-pickup.mp4) |
+| [Open / download MP4 · 4.1 s](docs/readme/g1-bottle-pickup.mp4?raw=true) | [Open / download MP4 · 3.1 s](docs/readme/g1-package-pickup.mp4?raw=true) |
+
+Videos are silent H.264 at 256×256 and 10 frames per simulated second. Playback follows
+**simulation time**, not the slower wall-clock capture rate. These are visual examples;
+they do not establish real Quest finger-tracking quality or camera-lock validation.
+See [media provenance and export commands](HUMANOID_VR_CONTROL.md#screenshots-and-videos)
+and the [validation results](#validation-and-known-limitations) for those distinctions.
 
 ## Quick start
 
