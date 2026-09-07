@@ -1,41 +1,87 @@
 # Overview
 
-The isaacsim.robot.policy.examples extension provides interactive demonstrations of reinforcement learning policy deployment for robotic systems in Isaac Sim. This extension showcases trained policies running on different robot types including manipulator arms, humanoid robots, and quadruped robots, with real-time keyboard control interfaces and GPU-accelerated physics simulation.
+The isaacsim.robot.policy.examples extension provides interactive robot demonstrations
+and reusable policy controllers for Isaac Sim. This fork adds stationary Unitree G1
+VR teleoperation to the Humanoid example while retaining the Franka, quadruped, and
+standalone locomotion policy examples.
 
 ## Key Components
 
-### Interactive Robot Examples
+### Humanoid Teleoperation
 
-The extension provides three main robot demonstration categories through specialized example classes:
+**{class}`HumanoidExample <isaacsim.robot.policy.examples.interactive.humanoid.HumanoidExample>`
+provides stationary arm and hand teleoperation for a Unitree G1 with Inspire hands.**
+The pelvis is fixed to the world, and walking and turning inputs are suppressed.
+The current configuration uses CPU physics with a 100 Hz simulation step and a
+requested 90 Hz rendering cadence. These configured rates do not guarantee real-time
+performance; rendering, recording, and control work also consume frame time.
 
-**{class}`FrankaExample <isaacsim.robot.policy.examples.interactive.franka.FrankaExample>`** demonstrates a Franka Emika Panda robot performing an autonomous drawer opening task. The robot uses a learned policy to interact with a cabinet, attempting to open and hold a drawer in position. The simulation runs at 200 Hz physics with 60 Hz rendering and automatically resets every 10 seconds for continuous demonstration.
+The example supports Quest Pro controller poses and OpenXR optical hand landmarks.
+Controller grip acts as an arm clutch, and trigger controls finger closure and
+assisted pickup. Valid optical hand poses drive the arm without requiring a fist;
+individual finger curls and thumb opposition drive the six Inspire actuators per
+hand. Closing and opening the hand requests pickup and release. Pickup attaches a
+nearby object with a fixed joint rather than relying solely on finger contact.
 
-**{class}`HumanoidExample <isaacsim.robot.policy.examples.interactive.humanoid.HumanoidExample>`** showcases a Unitree H1 humanoid robot executing flat terrain locomotion policies. The simulation operates with GPU-accelerated physics at 200 Hz and 25 Hz rendering, providing keyboard controls for forward movement and rotational commands. Users can control the robot using arrow keys or numpad inputs for directional movement.
+The camera maintains a fixed transform relative to the robot body at head height,
+including while paused. Physical headset translation and rotation do not move the
+camera in stationary mode. Existing gaze tracking and its recording remain active.
+The session recorder writes robot, hand, gaze, object, and camera data for later
+analysis.
 
-**{class}`QuadrupedExample <isaacsim.robot.policy.examples.interactive.quadruped.QuadrupedExample>`** features a Boston Dynamics Spot robot running flat terrain locomotion policies trained in Isaac Lab. The example provides comprehensive keyboard control including forward/backward movement, lateral motion, and yaw rotation commands, running at 500 Hz physics with 50 Hz rendering for smooth real-time interaction.
+The OpenXR component setting
+`/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled` requests skeletal
+hand tracking when the XR instance starts. The headset and active runtime must also
+provide valid landmarks. A connected headset or controller poses alone do not prove
+that optical tracking is available. Real Quest landmark delivery remains an active
+validation issue; generated-input replay checks do not verify headset tracking quality.
 
-**{class}`Go2Example <isaacsim.robot.policy.examples.interactive.go2.Go2Example>`** demonstrates a Unitree Go2 quadruped robot executing flat terrain locomotion using a learned policy. The example provides keyboard-based velocity commands for controlling the robot's walking gait and direction.
+**{class}`G1TeleopRobot <isaacsim.robot.policy.examples.robots.G1TeleopRobot>`
+provides the robot articulation and joint-control interface used by the example.**
+It configures the standing posture, arm and hand drives, joint limits, and stationary
+base. The Humanoid example does not run a walking policy in its default mode.
 
-### Robot Policy Controllers
+### Other Interactive Examples
 
-In addition to the interactive examples, the extension provides standalone policy controller classes that can be used programmatically:
+**{class}`FrankaExample <isaacsim.robot.policy.examples.interactive.franka.FrankaExample>`
+demonstrates learned drawer opening with a Franka Emika Panda.**
+The example repeatedly executes and resets the manipulation task.
 
-- **`AnymalFlatTerrainPolicy`** — ANYmal quadruped locomotion using an LSTM-based SEA (Series Elastic Actuator) network for flat terrain walking
-- **`Go2FlatTerrainPolicy`** — Unitree Go2 quadruped locomotion policy for stable walking on flat terrain
-- **`SpotFlatTerrainPolicy`** — Boston Dynamics Spot locomotion policy
-- **`H1FlatTerrainPolicy`** — Unitree H1 humanoid locomotion policy
-- **`FrankaOpenDrawerPolicy`** — Franka Panda drawer opening manipulation policy
+**{class}`QuadrupedExample <isaacsim.robot.policy.examples.interactive.quadruped.QuadrupedExample>`
+demonstrates flat-terrain locomotion with Boston Dynamics Spot.**
+Keyboard input supplies forward, lateral, and yaw commands.
 
-### Policy Controller Framework
+**{class}`Go2Example <isaacsim.robot.policy.examples.interactive.go2.Go2Example>`
+demonstrates flat-terrain locomotion with a Unitree Go2.**
+Keyboard input controls the commanded velocity and direction. These examples retain
+their own physics and rendering configurations; the G1 CPU settings do not describe
+every example in this extension.
 
-The extension includes a comprehensive `PolicyController` base class that manages the lifecycle of policy-based robot control. This framework handles policy loading from files, robot initialization with configurable control modes (position, velocity, effort), and physics simulation integration. Each robot implementation extends this base controller with specific policy execution logic.
+### Policy Controllers and Configuration
 
-### Configuration System
+**{class}`PolicyController <isaacsim.robot.policy.examples.controllers.PolicyController>`
+provides the shared framework for loading and executing robot policies.**
+It manages robot initialization and policy-based joint control. Standalone controllers
+remain available for other tasks:
 
-A flexible configuration system processes environment parameters from YAML files, handling robot joint properties, physics settings, and simulation parameters. The system supports both scalar and per-joint property specifications with pattern matching for joint names, enabling easy customization of robot behaviors and simulation characteristics.
+- {class}`AnymalFlatTerrainPolicy <isaacsim.robot.policy.examples.robots.AnymalFlatTerrainPolicy>`
+- {class}`Go2FlatTerrainPolicy <isaacsim.robot.policy.examples.robots.Go2FlatTerrainPolicy>`
+- {class}`SpotFlatTerrainPolicy <isaacsim.robot.policy.examples.robots.SpotFlatTerrainPolicy>`
+- {class}`H1FlatTerrainPolicy <isaacsim.robot.policy.examples.robots.H1FlatTerrainPolicy>`
+- {class}`FrankaOpenDrawerPolicy <isaacsim.robot.policy.examples.robots.FrankaOpenDrawerPolicy>`
+
+**{func}`parse_env_config <isaacsim.robot.policy.examples.controllers.parse_env_config>`
+loads YAML environment configuration for policy deployment.**
+The associated configuration helpers interpret joint properties, articulation and
+physics settings, observations, and actions.
 
 ## Integration
 
-The extension integrates with the Isaac Sim examples browser system, registering each robot demonstration under the "Policy" category. Each example provides a complete UI interface with documentation links and keyboard control instructions, making the demonstrations accessible through the standard Isaac Sim interface.
+The extension registers interactive demonstrations in the Isaac Sim examples browser
+under **Policy**. Select **Humanoid**, load the scene, and start simulation for G1
+teleoperation. XR must be active for controller or optical hand input.
 
-The examples utilize GPU-accelerated physics simulation with PyTorch backend integration for high-performance policy inference, demonstrating the deployment of reinforcement learning policies trained in Isaac Lab within the Isaac Sim environment.
+The extension uses the Isaac Sim sample framework, experimental articulation APIs,
+asset storage, and the examples browser. VR operation additionally depends on the
+XR experience and a working OpenXR runtime. The repository README and humanoid guides
+provide installation, control, recording, troubleshooting, and validation instructions.

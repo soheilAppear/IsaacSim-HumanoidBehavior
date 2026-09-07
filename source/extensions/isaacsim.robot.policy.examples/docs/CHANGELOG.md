@@ -1,5 +1,39 @@
 # Changelog
 
+## HumanoidBehavior fork changes — 2026-09-07
+
+This section records changes in this repository fork. It does not introduce an
+upstream extension release or change the upstream package version below.
+
+### Added
+
+- Stationary Unitree G1 teleoperation with Inspire hands, a fixed pelvis, arm IK,
+  and controller grip/trigger controls for assisted object pickup.
+- Optical finger curl control and separate thumb opposition, including partial
+  tracking loss handling and controller fallback when skeletal joints are absent.
+- A robot-mounted head-height camera that follows the body in Play and Pause,
+  independent of physical headset movement in stationary mode.
+- Session recording and repeatable offline and live validation tools for humanoid
+  control, finger mapping, camera attachment, and tracking observations.
+
+### Fixed
+
+- Grip-related physics failures caused by structural material highlight updates.
+- Unstable arm commands through bounded targets and position-priority IK.
+- Pickup joint placement using live palm and object poses with coincident joint frames.
+- Misleading hand-source metadata suppressing valid controller input before actual
+  skeletal landmarks arrive.
+
+### Documentation
+
+- Updated setup, controls, recording, CPU physics, performance troubleshooting, and
+  validation guidance for the current stationary G1 configuration.
+- Distinguished implemented recording from the planned learning pipeline. No trained
+  world model or learned planner is supplied by `learning/`.
+- Recorded the remaining real Quest tracking limitation: valid optical landmark
+  delivery and the reported open-hand/fist behavior require further hardware validation.
+  Existing gaze behavior is preserved.
+
 ## [5.2.11] - 2026-05-28
 ### Fixed
 - Conditional use of asset until menagerie assets are tested with Isaac lab

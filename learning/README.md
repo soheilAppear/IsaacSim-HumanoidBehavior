@@ -1,56 +1,111 @@
-# Learning Pipeline — V-JEPA-Based World Model for H1 VR Control
+# Learning Pipeline — Humanoid Teleoperation Data
 
-This folder is a separate learning pipeline that consumes data recorded by the
-Isaac Sim H1 humanoid VR extension (see [`HUMANOID_VR_CONTROL.md`](../HUMANOID_VR_CONTROL.md))
-and turns it into training data for embodied world models.
+This directory reserves space for a learning pipeline built from the Unitree G1
+teleoperation recordings. The Isaac Sim extension already records sessions, but
+`learning/` currently contains directory placeholders and a dependency list only.
+There is no dataset converter, training entry point, trained world model, or live
+learned planner in this directory.
 
-It is independent of the Isaac Sim / Kit Python environment — install its
-dependencies (`requirements.txt`) into a normal Python virtual environment,
-not the Isaac Sim bundled interpreter.
+For running the robot and collecting data, use the
+[project README](../README.md), [VR guide](../HUMANOID_VR_CONTROL.md), and
+[control and recording reference](../docs/humanoid-control.md).
 
-## Goal
+## Available recording data
 
-Move from VR teleoperation of the H1 robot toward a learned world model:
+The recorder lives in
+[`humanoid_example.py`](../source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py).
+When recording is enabled, loading the example creates a session under
+`~/BehavioralCollection/raw_sessions/` (`~` is the user's home directory):
 
+```text
+session_YYYY-MM-DD_HH-MM-SS/
+├── metadata.json
+├── behavior.csv
+├── hand_tracking.csv
+├── gaze.csv
+├── object_states.csv
+├── frame_timestamps.csv
+└── frames/eye_camera/
+    └── *.png
 ```
-current observation + human intent signals + candidate robot action
+
+The CSV streams contain robot and HMD state, hand poses and finger commands, gaze,
+object state, and camera-frame timestamps. Sensor sampling is requested at 100 Hz
+of simulation time, camera capture at 10 Hz, and buffered CSV writes every
+2.5 seconds of simulation time. CSV buffers also flush when the session closes.
+These are requested sampling rates, not measured wall-clock throughput; a slow
+simulation records fewer simulated seconds per real second.
+
+`metadata.json` identifies the robot, hand variant, simulation timing, locomotion
+mode, finger actuator roles, and grasp mode. Use it with the timestamps and
+`step_index` fields to interpret a session. Camera frames and sensor rows have
+different sampling rates; a future converter must align them explicitly.
+
+## Limits of the current data
+
+- The default robot is the G1 with Inspire hands, fixed in place for arm and hand
+  teleoperation. Current default sessions do not demonstrate walking or balance.
+- Each hand exposes five finger curls and separate thumb opposition. Coupled
+  robot knuckles do not reproduce every human joint independently.
+- Valid optical landmarks drive open hands as well as closed hands. Real Quest
+  landmark delivery has been intermittent; controller-only input and missing
+  skeletons must not be labeled as valid optical finger demonstrations.
+- Pickup uses a distance-gated fixed joint. The recorded grasp is assisted and
+  does not establish that an unassisted physical grasp would hold the object.
+- The camera is rigidly mounted to the robot body at head height. The HMD reader
+  prefers physical-space poses but can fall back to virtual-world poses; the CSV
+  does not identify that choice per row. Check the session log before treating HMD
+  coordinates as physical motion or combining them with stage-space signals.
+- Gaze rows identify their source through `gaze_source`. Preserve this field when
+  distinguishing eye tracking from HMD-forward fallback.
+
+Inspect tracking availability, source labels, timestamps, and successful object
+movement before selecting sessions for a future training set. A live replay test
+with generated inputs validates the controller; it does not establish the quality
+of a real headset recording.
+
+## Planned pipeline
+
+The research direction is an action-conditioned world model, potentially using
+frozen V-JEPA video features:
+
+```text
+recorded observations + human intent + candidate robot actions
   → predicted future robot/world state
-  → choose the best action
-  → execute in Isaac Sim
+  → evaluate candidate actions
+  → execute a selected action in Isaac Sim
 ```
 
-## Phased plan
+Only the recording stage is implemented. The remaining stages below are planned:
 
-| Phase | Description |
-|---|---|
-| 0 | Repo scaffolding (this folder) — no data yet |
-| 1 | Extend the Isaac Sim logger: per-session folders with synchronized video, HMD, hand, gaze, and object-state logs |
-| 2 | Build a dataset converter that time-aligns video frames with sensor CSVs into windowed training samples |
-| 3 | Train a CSV-only baseline (Transformer/GRU) predicting future commands and base motion — prove the sensor data is useful before touching video |
-| 4 | Extract frozen pretrained V-JEPA 2 video embeddings per session clip |
-| 5 | Train a multimodal predictor (V-JEPA embedding + sensor sequence → future state) and compare against the Phase 3 baseline |
-| 6 | Train an action-conditioned latent world model: `z_t + action_sequence → z_t+H` |
-| 7 | Offline latent-space MPC planner over candidate action sequences |
-| 8 | Wire a trained policy/planner back into the live Isaac Sim callback, with safety fallbacks to manual VR control |
-| 9 | Evaluation: prediction error, ablations (HMD-only vs. +hands vs. +gaze vs. +video), planning success rate |
+| Stage | Status |
+| --- | --- |
+| Session recording: metadata, PNG frames, and sensor CSVs | Implemented in the Isaac Sim extension |
+| Timestamp alignment and windowed dataset conversion | Planned |
+| CSV-only prediction baseline | Planned |
+| Frozen video-embedding extraction | Planned |
+| Multimodal and action-conditioned prediction | Planned |
+| Offline planning and live learned control | Planned |
+| Prediction, ablation, and task-success evaluation | Planned |
 
-## Folder layout
+## Directory layout and environment
 
-```
+```text
 learning/
-├── configs/       # dataset.yaml, train_*.yaml
-├── data_tools/     # session -> synchronized, windowed dataset conversion
-├── models/         # model definitions (sensor encoder, transformer, V-JEPA wrapper, predictors)
-├── train/          # training entry points
-├── eval/           # evaluation / plotting scripts
-└── inference/      # live policy stub, MPC planner
+├── configs/       # Placeholder for dataset and training configuration
+├── data_tools/    # Placeholder for alignment and dataset conversion
+├── models/        # Placeholder for model definitions
+├── train/         # Placeholder for training entry points
+├── eval/          # Placeholder for evaluation tools
+├── inference/     # Placeholder for inference and planning
+└── requirements.txt
 ```
 
-Datasets, embeddings, checkpoints, and reports live outside the repo under
-`~/BehavioralCollection/` (`raw_sessions/`, `processed_sessions/`, `embeddings/`,
-`models/`, `reports/`) and are never committed — see the root `.gitignore`.
+The dependency list is a starting point for future development, not a tested
+training environment or a requirement for running teleoperation. Keep future
+learning dependencies in a separate Python virtual environment rather than
+installing them into the Isaac Sim bundled interpreter.
 
-## Status
-
-Phase 0 only: folder scaffolding. No session-folder logging, sync tooling, or
-models exist yet. `humanoid_example.py` is unmodified by this phase.
+Store datasets, embeddings, checkpoints, and reports outside the repository under
+`~/BehavioralCollection/`. The existing [`.gitignore`](../.gitignore) also excludes
+common generated media and model artifacts within `learning/`.

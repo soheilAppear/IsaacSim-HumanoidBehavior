@@ -10,13 +10,19 @@ The longer [setup guide](../HUMANOID_VR_CONTROL.md) contains installation instru
 and historical experiments. Its recorded performance numbers are not acceptance results
 for the current implementation.
 
+Optical control accepts a valid **open hand** immediately. Finger updates do not
+require a fist, a grip/pinch gesture, or an active arm target. Closing the hand is
+only needed to request pickup. The reported real-headset symptom of detection only
+while making a fist remains unresolved: recent hardware observations did not provide
+valid finger skeletons, so continuous open-hand tracking has not been verified there.
+
 ## Controls
 
 | Input | Result |
 |---|---|
 | Left/right XR stick axes; X/A buttons | No robot movement in the default stationary mode |
 | Grip held | Move/rotate that arm relative to its clutch calibration |
-| Trigger | Close all fingers; request nearby assisted pickup at 0.60, release at 0.35 |
+| Trigger | Close all fingers; request nearby assisted pickup at 0.60, release below 0.35 |
 | B | Restore the fixed robot-head view |
 | Y | Drop both objects; release/open before picking up again |
 | Left stick click | Keep the robot-head camera locked in stationary mode |
@@ -48,12 +54,14 @@ Stationary mode also prevents stick clicks from selecting a room-scale camera mo
    poses. Present an **open hand** in the tracking cameras' view.
    The launcher and extension enable Kit's OpenXR Hand Tracking component; restart
    an already-running XR session once after updating. Keep the existing OpenXR runtime.
+   No fist or pinch is needed to begin tracking. A valid wrist/palm drives the arm;
+   valid finger landmarks independently drive the fingers.
 2. Reach and rotate your hand to guide the corresponding robot palm toward an object
    on the near edge of the small front-right table. Optical tracking does not require
    a grip button or controller clutch.
 3. **Close your fingers into a fist** near the object to request pickup, then move your
    closed hand to lift. The average measured finger curl must reach 0.55 to engage.
-4. **Open your hand** to release; average curl at or below 0.35 releases the attachment.
+4. **Open your hand** to release; average curl below 0.35 releases the attachment.
    If tracking is lost, the object is released. Open the hand before closing again
    after a tracking-loss drop.
 
@@ -150,8 +158,9 @@ avoids a deep fist wrapping past 180 degrees and reopening the robot finger. Joi
 positions need the OpenXR position-valid flag; missing orientation is acceptable for
 this position-only calculation. Thumb opposition is measured in the hand's own palm
 plane and has a separate target and recorded `thumb_yaw` column.
-Missing finger roles relax
-open and remain in the whole-hand averaging denominator, so one tracked thumb cannot
+An open digit has zero curl and is still a valid measurement. Finger updates run
+independently of the arm's active target and the pickup closure threshold.
+Missing finger roles relax open and remain in the whole-hand averaging denominator, so one tracked thumb cannot
 look like a fully closed hand. Controller trigger pressure drives all roles. Only
 independent finger driver joints are commanded; mimic joints follow their coupling.
 Curls update before the arm/pickup decision in each physics tick. Kit can label a
@@ -285,6 +294,85 @@ records requested/resolved locomotion mode, grasp mode, and assistance settings.
 The session's simulation clock stays monotonic across world resets; gait and velocity
 filters clear so reset discontinuities do not become motion estimates.
 
+## Performance and CPU physics
+
+The defaults request **100 Hz CPU physics** and **90 Hz rendering**, using the Torch
+backend. These are configured simulation intervals, not a guarantee of 90 displayed
+frames per second or real-time simulation. During a previous live VR run, the
+simulation advanced about **0.3 simulated seconds per wall-clock second**. XR load
+varied between runs; that observation is not a benchmark for every scene or headset.
+When the simulation falls behind, robot movement and tests that wait for simulated
+time also take longer in the real world.
+
+CPU physics was chosen after an earlier scene comparison reported approximately
+6.8 ms per step on CPU versus 23–28 ms on CUDA. Those historical measurements are
+not a current benchmark of this stationary scene. Switching to GPU physics is not
+an established fix for the present slowdown.
+
+The code performs the following work while the example is loaded and playing.
+These are plausible contributors; their individual costs have **not been measured**
+in the current setup.
+
+| Work | Current behavior |
+|---|---|
+| Automatic recording | `_behavioral_data_enabled = True`; behavior, hand, gaze, and object rows are collected at about 100 Hz |
+| Recorded camera | An additional 256×256 camera render product and RGB annotator refresh at render cadence, even though PNGs are saved at about 10 Hz |
+| File writes | PNG encoding and saving happen synchronously inside the physics callback; buffered CSVs are also written there about every 2.5 seconds |
+| Camera attachment | The body pose is read and the mounted view scheduled every physics tick and every application frame, including while paused |
+| Arm and pickup poses | Palm/finger poses are read repeatedly for IK, candidate selection, and grasp distance; each active arm separately fetches the full articulation Jacobian and joint positions |
+
+Finger landmarks are cached within each hand's curl calculation. Joint command
+limits and smoothing also affect movement response, independently of frame rate;
+their current values and purpose are described under arm and finger retargeting.
+A paused, empty session is not executing this example's physics, IK, or recording
+callbacks. Check which application and scene are active before attributing a slowdown
+to those paths. Run only one Kit application during comparisons.
+
+### Compare recording on and off
+
+1. Use the same scene, headset connection, renderer settings, physics settings, and
+   repeatable hand movements for both runs. Leave gaze behavior and settings unchanged.
+   Wait for scene loading and shader compilation to settle before measuring.
+2. Start with the default `_behavioral_data_enabled = True` in
+   `HumanoidExample.__init__()`. Restart Isaac Sim, load the example, and press Play.
+3. Measure wall time and simulated progress with the read-only probe below. Repeat
+   it three times and retain the results rather than choosing only the fastest run.
+4. Set `_behavioral_data_enabled = False` **before restarting and loading the example**,
+   then repeat the same measurements. Disabling it only after the recording camera
+   has initialized does not establish that its render product was removed. The fresh
+   run is needed to compare against a scene where that product was never created.
+5. Compare simulated-seconds/wall-seconds and the viewport's measured frame rate.
+   Restore recording to `True` and reload when returning to data collection.
+
+Run this PowerShell probe from the repository root with the example playing and the
+Python server enabled:
+
+```powershell
+@'
+import asyncio
+import time
+import omni.timeline
+
+assert EX is not None and EX._physics_ready, "Load the Humanoid example and press Play"
+assert omni.timeline.get_timeline_interface().is_playing(), "Keep the timeline playing"
+wall_start = time.perf_counter()
+sim_start = EX._headset_gait_time
+await asyncio.sleep(20.0)
+wall_seconds = time.perf_counter() - wall_start
+sim_seconds = EX._headset_gait_time - sim_start
+print({"wall_seconds": wall_seconds, "sim_seconds": sim_seconds,
+       "real_time_factor": sim_seconds / wall_seconds})
+'@ | python tools/kit_exec.py --timeout 45 -
+```
+
+The simulation clock advances independently of recording, so the probe works in
+both runs. A real-time factor of 1.0 means one simulated second per wall-clock second;
+0.3 means roughly six simulated seconds during this 20-second observation. This
+comparison measures the combined recording cost, not separate PNG, CSV, rendering,
+or controller costs. Lowering `_behavioral_frame_log_every_n_steps` increases the PNG
+rate; raising it reduces saves but does not by itself reduce the render product's
+refresh rate. `_behavioral_data_log_every_n_steps` controls the sensor-row interval.
+
 ## Automated validation
 
 Run from the repository root with an Isaac Sim standalone Python wrapper:
@@ -313,6 +401,8 @@ changes, release, and reset must not resync any collision prim. A separate teard
 check covers an invalid stage wrapper after the application closes its stage. IK
 regressions also cover conflicting wrist/position requests, redundant-joint posture
 recovery without changing the hand task, and world-axis rotation from a nontrivial pose.
+Open-hand regressions verify acquisition without grip, pinch, or fist and independent
+finger updates without a closed hand or active arm target.
 
 These tests do not validate extension startup/import ordering, live XR bindings, rendered
 visuals, collision/contact dynamics, or balance. Run Kit integration checks separately
@@ -394,7 +484,8 @@ Run it separately from synthetic replays. Motion flags show real optical input a
 corresponding joint variation; they do not measure detailed tracking accuracy. No motion
 can mean absent/occluded tracking, a still hand, or too few physics updates.
 
-On 7 September 2026, all **80 offline regression tests** passed. The full live finger
+The current suite contains **82 offline regression tests**, including two open-hand
+acquisition and independent-finger regressions. On 7 September 2026, the full live finger
 replay passed **19.73 simulated seconds** with all ten fingers and both thumb-opposition
 joints reaching their independent 0.7 normalized targets. Partial/full tracking loss,
 normal controller input, and Touch input mislabeled as `hand` passed for both hands;
@@ -409,9 +500,13 @@ over a metre. Gaze still reported `eye_tracker` with zero failed updates.
 Actual skeletal poses were seen intermittently after enabling Kit's hand component,
 but subsequent 20- and 45-second real-input observations contained no valid finger landmarks.
 The synthetic replay therefore establishes retargeting and joint-drive behavior;
-complete real-headset finger movement remains an operator acceptance check. The
-observer above distinguishes this transport/visibility condition from a frozen
-simulation without altering gaze or the active OpenXR runtime.
+it does not establish continuous tracking from the Quest Pro's cameras. The reported
+fist-only detection symptom remains unresolved. There is no application requirement
+to make a fist before acquiring an optical hand, and an open finger's zero curl is
+valid. Without valid incoming skeleton data, the hardware behavior cannot be confirmed
+or described as fixed. Repeat the observer with open hands and individual finger
+movements to separate missing/occluded input from a frozen simulation, without
+altering gaze or the active OpenXR runtime.
 
 ## Live acceptance procedure
 
@@ -431,7 +526,8 @@ simulation without altering gaze or the active OpenXR runtime.
    does not snap to the wrist on attachment. Lift, release, and observe it fall. Press Y
    while trigger remains held; it must stay released until you open and close again.
    Keep grip held while carrying; verify releasing grip also drops the object.
-5. Bend each optical finger separately and move the thumb across the palm without
+5. Present open hands first, without making a fist or pinching, and verify tracking
+   starts. Bend each optical finger separately and move the thumb across the palm without
    curling its tip; verify independent robot-finger and thumb-opposition movement.
    Repeat pickup with optical hand tracking, partial occlusion, and device loss/reconnection.
    Verify objects release and stale hand targets are not used. Reset while holding an

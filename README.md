@@ -1,397 +1,206 @@
-![Isaac Sim](docs/readme/hero_shot_compressed.png)
+# VR Humanoid Behavior Lab
 
----
-
-<div align="center">
-
-# 🥽 VR Humanoid Behavior Lab
-
-### Become a Unitree G1 humanoid — move it, reach with your hands, grasp with your fingers, look with your eyes.<br>Every signal you produce becomes a time-aligned multimodal dataset for embodied AI.
+Control a **Unitree G1 with Inspire five-finger hands** in Isaac Sim 6.0 using Quest Pro
+controllers or optical hand tracking. The project records hand input, robot joints,
+gaze, object states, and images for later analysis and learning experiments.
 
 [![Isaac Sim 6.0](https://img.shields.io/badge/Isaac%20Sim-6.0.0-76b900.svg)](https://github.com/isaac-sim/IsaacSim)
-[![OpenXR](https://img.shields.io/badge/OpenXR-SteamVR%20%2B%20Steam%20Link-1793d1.svg)](HUMANOID_VR_CONTROL.md#quest-pro-eye-tracking-optional)
-[![Quest Pro Eye Tracking](https://img.shields.io/badge/eye%20tracking-Quest%20Pro%20✔%20verified-red.svg)](HUMANOID_VR_CONTROL.md#quest-pro-eye-tracking-optional)
-[![License](https://img.shields.io/badge/license-Apache--2.0-yellow.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](tools/run_humanoid_tests.py)
+[![License](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](LICENSE)
 
-**[📄 Setup & Usage Guide](HUMANOID_VR_CONTROL.md)** · **[Control Architecture & Validation](docs/humanoid-control.md)** · **[🧠 Learning Pipeline](learning/README.md)** · **[📊 Data Schema](HUMANOID_VR_CONTROL.md#behavioral-data-collection)**
+[Setup and controls](HUMANOID_VR_CONTROL.md) ·
+[Developer guide and validation](docs/humanoid-control.md) ·
+[Performance](docs/humanoid-control.md#performance-and-cpu-physics) ·
+[Learning pipeline](learning/README.md)
 
-<img src="docs/readme/vr_gaze_showcase.gif" alt="VR view: eye gaze selects a sample box (highlighted yellow), the red collision marker pins the exact gaze point, and the robot's hands reach for it" width="640">
+![Warehouse scene](docs/readme/hero_shot_compressed.png)
 
-*Live capture through the headset: eye gaze selects the box (yellow), the red marker pins the exact gaze-collision point, the robot's arms follow the user's hands — all while every signal streams into the dataset. (Recorded on the earlier H1 build; the robot is now the G1 with dexterous hands.)*
+## Current behavior
 
-</div>
+The default is **stationary manipulation**. A world constraint anchors the robot's
+pelvis while its arms and fingers remain controllable. Walking, turning, keyboard
+locomotion, and step-in-place inputs cannot move the base in this mode.
 
-**Default mode: stationary hand control.** The robot stands anchored at its spawn pose; walking and turning inputs are disabled. Optical tracking drives each finger and thumb opposition, or hold controller grip to move the arm and pull trigger to pick up a nearby object. The camera stays rigidly mounted to the robot head and ignores physical headset movement. Gaze remains active. Save your stage and restart Isaac Sim, then LOAD the example to create the fixed-base scene.
+| Capability | Current implementation |
+|---|---|
+| Arm control | Controller grip clutches that arm; a valid optical wrist/palm pose activates hand tracking without a grip button or fist |
+| Finger control | Five independent curl targets and separate thumb opposition from the optical skeleton; controller trigger closes the whole hand |
+| Pickup | Nearby objects attach through distance-gated fixed-joint assistance; opening the hand, releasing trigger/grip, or pressing Y drops the object |
+| Camera | Rigid mount on the robot's head/torso body; physical headset translation and rotation do not move the view, including during Pause |
+| Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
+| Physics | CPU, with a configured 100 Hz physics timestep; rendering requests 90 Hz |
+| Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
+| Walking and learned control | Optional walking modes and learning scaffolding remain available for experiments; they are outside the stationary-mode acceptance results |
 
-The [current developer guide](docs/humanoid-control.md) documents the repaired controls,
-assisted pickup, passed simulation replays, and remaining hardware checks. Performance measurements and captures
-on this page come from earlier sessions. Gaze rows distinguish real eye tracking from
-HMD-forward fallback; fixed-joint pickup is recorded as assistance.
+Inspire has six independent hand actuators. Distal knuckles are coupled, so it cannot
+reproduce every human knuckle angle or finger-splay movement separately.
 
-**The idea:** teleoperating a humanoid in VR produces exactly the data embodied-AI research is starving for — synchronized human *intent* (head motion, hand poses, eye gaze) paired with robot *behavior* (full joint states, base trajectory, commands) and *first-person video*. This fork turns the stock Isaac Sim humanoid example into that recording instrument — retargeted onto the **Unitree G1 with Inspire five-finger hands**, the Unitree humanoid [Isaac Teleop](https://github.com/NVIDIA/IsaacTeleop) drives for dexterous manipulation — and ships the scaffold of a V-JEPA-based world-model pipeline to consume it.
+## Quick start
 
-| | Feature | What it does |
-|---|---------|--------------|
-| 👁️ | **Quest Pro eye tracking** — *verified end-to-end* | Real OpenXR eye gaze over SteamVR + Steam Link, drawn as a red ray with a blood-red marker at the gaze collision; gazed objects highlight yellow; live `[EyeGaze] looking at sample box Box_03 @ (5.2, -0.4, 0.3) m` terminal events |
-| 📼 | **Behavioral session recorder** | Every run auto-creates a session: 5 time-aligned ~100 Hz CSVs (HMD, hands, gaze + collisions, objects, all robot joints) + ~10 Hz first-person frames + metadata — **crash-safe**, flushed to disk every 2.5 s |
-| 🤲 | **Hand tracking & arm teleop** | OpenXR hand/controller poses drive the G1 arms; grab system for physics objects |
-| ✋ | **Dexterous finger control** | The G1's real Inspire hand joints open and close from your own fingers: per-finger curl is measured from the OpenXR hand skeleton, or from trigger pressure on controllers; grip clutches the arm without closing the fingers |
-| 🎥 | **Eye-level first-person camera** | Viewport/XR camera rides at the robot's eye height — in VR you literally see through the robot's eyes |
-| 🚶 | **Real walking gait** | Unitree's own pretrained G1 policy (BSD-3-Clause) drives the legs at 50 Hz — measured 2.69 m in 5 s on a 0.5 m/s command with genuinely alternating feet. It controls *only* the legs, so your arms and fingers never fight the balance controller. A kinematic glide mode is available as a can't-fall fallback |
-| 🏭 | **Warehouse workcell** | The robot works inside NVIDIA's `full_warehouse` — racking, pallets, forklifts — with pickable crates and KLT bins scattered within a short walk, so sessions record real pick-and-carry behaviour instead of cubes on an empty plane |
-| 🧍 | **Headset gait walking** *(experimental, off by default)* | Step in place (head bob) to move the robot; peak/trough detection with a horizontal-motion gate against false triggers |
-| 🧠 | **Learning pipeline** ([`learning/`](learning/README.md)) | Phased plan: dataset sync → CSV baselines → frozen V-JEPA 2 embeddings → multimodal predictor → action-conditioned latent world model → MPC planner |
+The tested workflow uses a Windows Isaac Sim 6.0 standalone installation and the
+complete modified `isaacsim.robot.policy.examples` extension. A full Isaac Sim source
+build is optional. For Quest Pro, keep the working OpenXR runtime and gaze setup;
+the documented working connection uses SteamVR with Steam Link.
 
-### 🔬 The innovation: gaze-raycast object selection
+1. Clone this fork's teleoperation branch and fetch its Git LFS assets:
 
-The eye tracker is not just a visualization — it is a **gaze-driven object-selection and auto-annotation method**:
+   ```powershell
+   git clone --branch TeleopG1Sim https://github.com/soheilAppear/IsaacSim-HumanoidBehavior.git
+   cd IsaacSim-HumanoidBehavior
+   git lfs install
+   git lfs pull
+   ```
 
-1. **Embodied gaze ray** — the Quest Pro's calibrated binocular gaze (`XR_EXT_eye_gaze_interaction`) is read in the *robot's* world frame: the XR rig rides the robot, so your gaze ray physically originates at the robot's eyes.
-2. **Self-hit-filtered raycast** — the ray is cast into the PhysX scene with subtree-aware filtering: all raycast hits on the robot's own subtree are excluded, so the nearest non-robot collider is selected.
-3. **Selection = annotation** — the first real collider along the ray (sample box, ground, …) becomes the selected object: tinted yellow in-scene, marked with a blood-red collision sphere, announced live on the terminal (`[EyeGaze] looking at sample box Box_03 @ (5.2, -0.4, 0.3) m, 3.8 m away`), and logged to `gaze.csv` at ~100 Hz with hit position, distance, and prim path.
+2. Follow [Installation](HUMANOID_VR_CONTROL.md#installation) to copy or link the
+   **complete extension** into the standalone installation. It includes the robot
+   wrapper, helper modules, registration, and bundled assets.
+3. Check `ISAAC_DIR` inside [tools/launch_isaac_vr.bat](tools/launch_isaac_vr.bat).
+   Its current value points to the maintainer's Windows installation; edit it if your
+   installation is elsewhere. Save any stage changes and close the previous Isaac
+   session before launching:
 
-Because every gaze-selection event is time-aligned with hand poses, robot joint states, and first-person video, each session yields **ground-truth "what the human is attending to" labels for free** — visual-attention supervision for imitation learning and intent prediction, with zero manual annotation.
+   ```powershell
+   .\tools\launch_isaac_vr.bat
+   ```
 
-### 🎮 VR controls at a glance
+   The launcher enables the Python server and requests OpenXR skeletal hand tracking
+   before the XR session starts.
+4. Open **Window → Examples → Robotics Examples → Policy → Humanoid**
+   (panel title **Humanoid: Unitree G1**), click **LOAD**, then **Play**.
+5. Begin with the reachable packages on the near edge of the small front-right table.
+
+See [Running](HUMANOID_VR_CONTROL.md#running) for the detailed startup procedure.
+After changing Python source, restart Isaac Sim and reload the example so it uses
+the updated classes.
+
+## Controls
 
 | Input | Action |
 |---|---|
-| Left stick forward / back | Walk / **brake** |
-| Right stick left-right, or **X** (left) / **A** (right) | Turn — **on the spot**, no forward creep |
-| Grip (hold) | Move that arm |
-| **Trigger** | Grab the nearest package (assisted out to 0.55 m, green-tinted before you squeeze) |
-| **B** (right) | **Recenter** the VR view on the robot |
-| **Y** (left) | Drop everything held |
+| Hold left/right **grip** | Move and rotate that arm; grip alone leaves the fingers open |
+| **Trigger** | Close that hand; request nearby pickup at 60% travel and release below 35% |
+| Release **grip** | End that arm's tracking and release its held object |
+| **Y** | Drop both objects; release/open before the next grab |
+| **B** | Restore the fixed robot-head view |
+| Left stick click | Keep the camera locked in stationary mode |
+| Sticks, X/A, locomotion keys, head movement | No base movement in stationary mode |
+| Open optical hand | A valid wrist/palm pose activates the arm without a fist; fingers update independently from valid digit landmarks |
+| Bend an optical finger | Move the corresponding robot finger |
+| Close/open optical hand | Request nearby pickup/release using average finger curl |
 
-The VR rig **measures itself from your headset** — your standing eye height and which way
-you are facing — so the view lands at the robot's eye level looking the way it walks,
-whatever your height and wherever you are standing in the room. Verified exact for body
-heights 1.15–1.85 m; press **B** any time to redo it.
+For controller pickup, **hold grip**, reach with the trigger released, then pull the
+trigger when the actual robot fingers are close to the object. Keep grip and trigger
+held to carry; release the trigger to drop. A target marker or highlight alone does
+not establish pickup range. See the [full control guide](HUMANOID_VR_CONTROL.md#controls)
+for optical thresholds, tracking loss, and release behavior.
 
-<sub>All of it lives in two files: [`humanoid_example.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py) + [`eye_gaze_tracker.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/eye_gaze_tracker.py) — drop them into a stock Isaac Sim 6.0 install ([3 install options](HUMANOID_VR_CONTROL.md#installation--how-to-apply)). Works desktop-only with keyboard too; VR and eye tracking are optional layers.</sub>
+## Validation and known limitations
 
----
+Recorded checks on **7 September 2026**:
 
-# Isaac Sim
+| Check | Result and scope |
+|---|---|
+| Offline regressions | **82 passed**, including open-hand acquisition without buttons, independent fingers, grip/pickup, camera, lifecycle, and gaze regressions |
+| Live grip and pickup replay | Passed with real PhysX: attached, lifted, and released a package; stationary base unchanged |
+| Live finger replay | All ten fingers and both thumb-opposition joints moved independently; controller fallback and tracking-loss checks passed |
+| Live camera replay | Fixed camera-to-body mount held during Play and Pause; tested with the Quest session connected |
+| Real eye input | `eye_tracker` was observed with zero failed updates during the connected checks; gaze implementation/settings were preserved |
+| Real Quest finger input | Skeletons arrived intermittently. The reported fist-only detection symptom remains unresolved; full open-hand/finger hardware acceptance is pending |
 
-[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://docs.python.org/3/whatsnew/3.12.html)
-[![Linux platform](https://img.shields.io/badge/platform-linux--64-orange.svg)](https://releases.ubuntu.com/22.04/)
-[![Linux aarch64 platform](https://img.shields.io/badge/platform-linux--aarch64-orange.svg)](https://docs.nvidia.com/dgx/dgx-os-7-user-guide/introduction.html)
-[![Windows platform](https://img.shields.io/badge/platform-windows--64-orange.svg)](https://www.microsoft.com/en-us/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-yellow.svg)](LICENSE)
+The live replays inject input at the XR boundary and measure real simulation behavior.
+They establish control and physics behavior; they do not establish headset tracking
+quality. Generic grip/aim/pinch/poke interaction poses are insufficient for
+individual fingers. A detected controller model also does not establish that a real
+hand skeleton is reaching Isaac. See [Troubleshooting](HUMANOID_VR_CONTROL.md#troubleshooting).
 
-NVIDIA Isaac Sim™ is a simulation platform built on NVIDIA Omniverse, designed to develop, test, train, and deploy AI-powered robots in realistic virtual environments. It supports importing robotic systems from common formats such as URDF, MJCF, and CAD. The simulator leverages high-fidelity, GPU-accelerated physics engines to simulate accurate dynamics and support multi-sensor RTX rendering at scale. It comes equipped with end-to-end workflows including synthetic data generation, reinforcement learning, ROS integration, and digital twin simulation. Isaac Sim provides the infrastructure needed to support robotics development at any stage.
-
-## Key Features
-
-- [Asset Import & Export](https://docs.isaacsim.omniverse.nvidia.com/latest/importer_exporter/importers_exporters.html): Importing and exporting robots and environments from and to non-USD format.
-- [Robot Tuning](https://docs.isaacsim.omniverse.nvidia.com/latest/robot_setup/index.html): Optimize robot for physics accuracy, computation efficiency, or photorealism
-- [Robot Simulation](https://docs.isaacsim.omniverse.nvidia.com/latest/robot_simulation/index.html): Tools for moving robots, such as controllers, motion generation and kinematics solvers, and policy integration.
-- [Sensors](https://docs.isaacsim.omniverse.nvidia.com/latest/sensors/index.html): RTX and physics-based sensors
-
-## Key Applications
-
-- [Isaac Lab](https://docs.isaacsim.omniverse.nvidia.com/latest/isaac_lab_tutorials/index.html): GPU-accelerated framework built for reinforcement learning, imitation learning, and motion planning.
-- [ROS Bridge](https://docs.isaacsim.omniverse.nvidia.com/latest/ros2_tutorials/ros2_landing_page.html): Integration with Robot Operating System (ROS).
-- [Synthetic Data Generation](https://docs.isaacsim.omniverse.nvidia.com/latest/synthetic_data_generation/index.html): Collection of SDG tools
-
-## Documentation
-
-For the latest Isaac Sim documentation, see [Isaac Sim Documentation](https://docs.isaacsim.omniverse.nvidia.com/latest/index.html).
-Follow these links to get started:
-
-- [Tutorials](https://docs.isaacsim.omniverse.nvidia.com/latest/introduction/quickstart_index.html)
-- [Assets](https://docs.isaacsim.omniverse.nvidia.com/latest/assets/usd_assets_overview.html)
-
-
-## Prerequisites and Environment Setup
-
-Ensure your system is set up with the following before building Isaac Sim:
-
-- **Operating System**: Windows 11 or Linux (Ubuntu 22.04/24.04)
-
-  > **(Linux) Ubuntu 24.04**
-  > Building with Ubuntu 24.04 requires GCC/G++ 11 to be installed, GCC/G++ 12+ is not supported.
-
-- **GPU**: For additional information on GPU features and requirements, see [NVIDIA GPU Requirements](https://docs.omniverse.nvidia.com/dev-guide/latest/common/technical-requirements.html)
-
-  #### Local Workstation
-
-  | Min | Recommended | Best |
-  |-----|-------------|------|
-  | RTX 4080 | RTX 5080 | RTX PRO 6000 Blackwell Workstation |
-  |  | RTX 5880 Ada | RTX PRO 5000 Blackwell Workstation |
-
-  #### Datacenter
-
-  | Min | Recommended | Best |
-  |-----|-------------|------|
-  | A40 | L40S | RTX PRO 6000 Blackwell Server |
-  |  | L20 | |
-
-- **Driver**: See [NVIDIA Driver Requirements](https://docs.omniverse.nvidia.com/dev-guide/latest/common/technical-requirements.html)
-
-- **Internet Access**: Required for downloading the Omniverse Kit SDK, extensions, and tools.
-
-
-
-### Required Software Dependencies
-
-- [**Git**](https://git-scm.com/downloads): For version control and repository management
-
-- [**Git LFS**](https://git-lfs.com/): For managing large files within the repository
-
-- **(Windows - C++ Only) Microsoft Visual Studio 2022 or 2026**: 
-
-- Install Visual Studio 2026, Windows SDK, MSVC using Winget by running the following command in PowerShell:
-
-  ```powershell
-  winget install --id=Microsoft.VisualStudio.Community -e --override "--add Microsoft.VisualStudio.Workload.NativeDesktop --includeRecommended"
-  ```
-  
-  [Additional information on Windows development configuration](docs/readme/windows_developer_configuration.md)
-
-
-- **(Linux) build-essentials**: A package that includes `make` and other essential tools for building applications.  For Ubuntu, install with:
-
-  ```bash
-  sudo apt-get install build-essential
-  ```
-
-  > **(Linux) ⚠️**
-  > Please use GCC/G++ 11, higher versions are not supported yet. To install GCC/G++ 11, run the following commands:
-  > ```bash
-  > sudo apt-get install gcc-11 g++-11
-  > sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 200
-  > sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 200
-  > ```
-
-  > **(Linux aarch64) ⚠️**
-  > On aarch64 hosts (e.g. DGX Spark), X11 development headers are required to build Python packages that lack pre-built wheels:
-  > ```bash
-  > sudo apt-get install -y libx11-dev xorg-dev
-  > ```
-
-  > **Compiler Version Check ⚠️**
-  > We have added a version checker to our build process. If you do not have the default versions you are still able to execute a build, add  `--skip-compiler-version-check` to `build.[sh/bat]` when building.  Proceed at your own risk, unsupported build environments may encounter build and runtime issues.
-
-### Recommended Software
-
-- [**(Linux) Docker**](https://docs.docker.com/engine/install/ubuntu/): For containerized development and deployment. **Ensure non-root users have Docker permissions.**
-
-- [**(Linux) NVIDIA Container Toolkit**](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html): For GPU-accelerated containerized development and deployment. **Installation and Configuring Docker steps are required.**
-
-- [**VSCode**](https://code.visualstudio.com/download) (or your preferred IDE): For code editing and development
-
-## Quick Start
-
-This section guides you through building Isaac Sim from source code.
-
-### 1. Clone the Repository
-
-
-```bash
-git clone -b main https://github.com/isaac-sim/IsaacSim.git isaacsim
-cd isaacsim
-git lfs install
-git lfs pull
-```
-
-### 2. Build
-
-Run the following command to initiate the configuration wizard:
-
-**Linux:**
-
-Confirm that GCC/G++ 11 is being used before building using the following commands:
-
-```bash
-gcc --version
-g++ --version
-```
-
-```bash
-./build.sh
-```
-
-**Windows:**
-
-> **⚠️ Windows Path Length Limitation**
-> Windows has a path length limitation of 260 characters. If you encounter errors related missing files or other build errors, try moving the repository to a shorter path.
+Run offline tests with Isaac Sim's Python wrapper:
 
 ```powershell
-build.bat
+& "C:/path/to/isaac-sim-standalone-6.0.0-windows-x86_64/python.bat" tools/run_humanoid_tests.py
 ```
 
-### 3. Run
-
-> **⚠️ Startup Time**
-> The first time loading Isaac Sim may take up to several minutes as Extensions and Shader are loaded and cached. The subsequent startup time should be in the ranges of 10-30 seconds depending on hardware configuration.
-
-
-
-Navigate to the corresponding binary directory for your platform and run the executable.
-
-**Linux (x86_64):**
-```bash
-cd _build/linux-x86_64/release
-./isaac-sim.sh
-```
-
-**Linux (aarch64):**
-```bash
-cd _build/linux-aarch64/release
-./isaac-sim.sh
-```
-
-**Windows:**
-```powershell
-cd _build/windows-x86_64/release
-isaac-sim.bat
-```
-
-> NOTE: If this is your first time building Isaac Sim, you will be prompted to accept the Omniverse Licensing Terms.
-
-
-
-## Advanced Build Options
-
-
-Isaac Sim uses a custom build system with the following key options:
-
-
-### Core Build Options
-- `-c, --clean`: Clean the repository and exit
-- `-x, --rebuild`: Clean the repository before building (full rebuild)
-- `-h, --help`: Show all available build options
-
-
-### Configuration Options
-- `--config [debug|release]`: Specify build configuration (default: both)
-- `-d, --debug`: Build only debug configuration
-- `-r, --release`: Build only release configuration
-
-
-### Advanced Options
-- `-j NUM_CORES, --jobs NUM_CORES`: Limit the number of parallel compilation jobs
-- `-v, --verbose`: Enable verbose build output
-- `-q, --quiet`: Suppress build output
-
-
-### Build Steps Control
-- `--fetch-only`: Only fetch dependencies and stop
-- `-g, --generate`: Generate projects, stage files and stop
-- `-s, --stage`: Stage files, skip generation step
-- `-b, --build-only`: Only perform building step, skip others
-- `--post-build-only`: Only perform post-build step
-
-## Usage
-Congratulations on installing Isaac Sim! To get started with using Isaac Sim, follow these [Quick Tutorials](https://docs.isaacsim.omniverse.nvidia.com/latest/introduction/quickstart_index.html). For more information, visit our full [documentation](https://docs.isaacsim.omniverse.nvidia.com/latest/index.html).
-
-## Additional Build Tools
-
-Beyond building and running from source (see [Quick Start](#quick-start)), Isaac Sim can also be packaged as a standalone binary archive, built as Python wheels, or deployed as a Docker container.
-
-### Binary Package
-
-Build a standalone redistributable binary package from source. A successful [build](#quick-start) is required before packaging.
-
-**Linux:**
-
-```bash
-./repo.sh package --config release -m isaac-sim-standalone
-```
-
-> **Note:** The same command works on both x86_64 and aarch64 hosts. The build system detects the platform automatically.
-
-**Windows:**
+With the updated example loaded and the Python server enabled, run live checks
+**one at a time** using ordinary host Python:
 
 ```powershell
-.\repo.bat package --config release -m isaac-sim-standalone
+python tools/validate_camera_live.py
+python tools/validate_fingers_live.py --timeout 300
 ```
 
-The packaged archive is written to the `_build/packages/` directory.
-
-### PIP Packages
-
-Build Isaac Sim Python (PIP) wheels locally from a successful [build](#quick-start). Pre-built wheels for released versions are also available on [pypi.nvidia.com](https://pypi.nvidia.com); see [Install Isaac Sim using PIP](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_python.html#installation-using-pip) for the install-only path.
-
-A successful [build](#quick-start) is required before packaging.
-
-**Linux:**
-
-```bash
-./repo.sh python_package --create
-./repo.sh comment_archive_deps
-./repo.sh python_package --wheel
-```
-
-**Windows:**
+These replays restore live input and leave the timeline paused. To observe real
+hands, press Play, switch the headset to bare hands, and bend individual fingers:
 
 ```powershell
-.\repo.bat python_package --create
-.\repo.bat comment_archive_deps
-.\repo.bat python_package --wheel
+python tools/observe_hand_tracking_live.py --seconds 20
 ```
 
-The three steps, in order:
+The observer changes no input, timeline, or gaze settings. Commands for the separate
+pickup/highlight replay, which temporarily substitutes gaze input, and detailed
+results are in [Automated validation](docs/humanoid-control.md#automated-validation).
 
-1. `python_package --create` stages per-package source trees under `_build/packages/python/` from the wheel definitions in [python_packages.toml](python_packages.toml).
-2. `comment_archive_deps` comments out references to Kit pip-archive extensions (`omni.kit.pip_archive`, `omni.isaac.core_archive`, `omni.isaac.ml_archive`, `omni.pip.compute`, `omni.pip.cloud`, `isaacsim.pip.newton`) in the generated `extension.toml` and `*.kit` files so wheel metadata is self-contained.
-3. `python_package --wheel` builds the `.whl` files into `_build/packages/dist/`.
+## Performance
 
-Install locally-built wheels into a Python 3.12 virtual environment:
+**100 Hz physics and 90 Hz rendering are configured rates, not measured performance
+guarantees.** A recent loaded session advanced roughly 0.3 simulated seconds per wall
+second, which stretches control response to about three times normal duration.
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install _build/packages/dist/*.whl
-```
+The code performs synchronous PNG encoding and CSV writes inside physics callbacks,
+creates an additional recording-camera render product, and repeats some robot-pose
+and IK reads. These are candidates for measurement; their individual contribution
+has not yet been isolated. CPU physics was chosen using older scene measurements,
+which do not establish current performance.
 
-> **(Linux aarch64) ⚠️**
-> On aarch64 hosts, X11 development headers are required to build transitive Python dependencies that lack pre-built aarch64 wheels (same note as under [Prerequisites and Environment Setup](#prerequisites-and-environment-setup)):
-> ```bash
-> sudo apt-get install -y libx11-dev xorg-dev
-> ```
+The next useful comparison is the same scene with recording enabled and disabled
+**before loading**, with only one Isaac session open. The
+[performance guide](docs/humanoid-control.md#performance-and-cpu-physics) explains the
+settings, measurement procedure, and limitations. Gaze and camera behavior should be
+held constant during that comparison.
 
-### Container (Docker)
+## Data and learning
 
-For building a Docker image, running with Docker Compose, and web-based streaming, see [tools/docker/README.md](tools/docker/README.md).
+Sessions are written under `~/BehavioralCollection/raw_sessions/` with sensor CSVs,
+`metadata.json`, frame timestamps, and eye-camera PNGs. Rates are defined in simulation
+time; gaze queries run at 50 Hz and their latest result is reused by 100 Hz log rows.
+Periodic flushing limits buffered data, but an interrupted process can still lose
+unflushed rows.
 
+Gaze hits record the collider intersected by the supplied ray; they are observations
+of the gaze signal, not a guarantee of human intent. Fixed-joint pickup is identified
+as assisted grasping. See [Behavioral data collection](HUMANOID_VR_CONTROL.md#behavioral-data-collection)
+for files and columns.
 
-## Troubleshooting
+The [learning directory](learning/README.md) contains the planned dataset and
+world-model workflow. A trained planner is not integrated into the current robot
+controller.
 
-- Please see the [FAQ](https://docs.isaacsim.omniverse.nvidia.com/latest/overview/faq_index.html), [Troubleshooting](https://docs.isaacsim.omniverse.nvidia.com/latest/overview/troubleshooting.html), and [Known Issues](https://docs.isaacsim.omniverse.nvidia.com/latest/overview/known_issues.html) for common questions, fixes, and workarounds.
+## Project layout
 
-- On Linux, if you encounter network connectivity issues when building (such as corporate firewalls), run the following commands:
+| Path | Purpose |
+|---|---|
+| [interactive/humanoid/](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/) | Scene, input, IK, pickup, camera, gaze, and recording |
+| [robots/g1.py](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/robots/g1.py) | Stationary anchor, joint control, optional locomotion, and reset |
+| [tools/](tools/) | VR launcher, live Python helper, observers, and validation replays |
+| [tools/tests/](tools/tests/) | Offline control regression suite |
+| [HUMANOID_VR_CONTROL.md](HUMANOID_VR_CONTROL.md) | Installation, operation, recording, and troubleshooting |
+| [docs/humanoid-control.md](docs/humanoid-control.md) | Implementation details, performance, and validation evidence |
+| [learning/](learning/) | Learning workflow plan and directory scaffolding |
 
-  ```bash
-  export http_proxy="http://{Your IP address}:7890"
-  export https_proxy="http://{Your IP address}:7890"
-  ```
+## Earlier captures
 
-  - Note: The above command should be used only if you have enabled a proxy software or behind a corporate firewall. Port 7890 should be replaced with the proxy port set by the proxy software.
+![Earlier H1 gaze and hand-control capture](docs/readme/vr_gaze_showcase.gif)
 
+This clip was recorded with the earlier H1 robot. It illustrates gaze highlighting
+and recording; the current G1's stationary behavior and finger validation are
+described above.
 
-## Support
+## Isaac Sim source and licensing
 
-* Please use GitHub [Discussions](https://github.com/isaac-sim/IsaacSim/discussions) for discussing ideas, asking questions, and requests for new features.
-* Github [Issues](https://github.com/isaac-sim/IsaacSim/issues) should only be used to track executable pieces of work with a definite scope and a clear deliverable. These can be fixing bugs, documentation issues, new features, or general updates.
+This fork includes the Isaac Sim source tree. For full simulator development, see
+the [upstream Isaac Sim repository](https://github.com/isaac-sim/IsaacSim),
+[Windows developer setup](docs/readme/windows_developer_configuration.md), and
+[container build guide](tools/docker/README.md). `build.bat --help` or
+`./build.sh --help` lists this checkout's source-build options.
 
-## Connect with the NVIDIA Omniverse Community
-
-Have a project or resource you'd like to share more widely? We'd love to hear from you! Reach out to the
-NVIDIA Omniverse Community team at OmniverseCommunity@nvidia.com to discuss potential opportunities
-for broader dissemination of your work.
-
-## License
-
-Licensing terms can be found in the [License File](LICENSE).
-
-## Citation
-
-To cite Isaac Sim, click on "Cite this repository" in the right sidebar of the [Isaac Sim GitHub repository](https://github.com/isaac-sim/IsaacSim) landing page and select one of the listed citation entries.
-
-## Contributing
-
-We do not support direct community contributions at the moment.
+Repository licensing is described in [LICENSE](LICENSE). Bundled policies and assets
+retain their own notices; see the [setup guide's license references](HUMANOID_VR_CONTROL.md#license).
+Fork-specific issues belong in [this repository's issue tracker](https://github.com/soheilAppear/IsaacSim-HumanoidBehavior/issues).
