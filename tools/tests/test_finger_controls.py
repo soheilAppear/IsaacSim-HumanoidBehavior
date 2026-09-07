@@ -63,6 +63,39 @@ class TestFingerControls(unittest.TestCase):
     def setUp(self):
         self.example = HUMANOID.HumanoidExample()
 
+    def test_open_hand_is_acquired_without_grip_pinch_or_fist(self):
+        ex = self.example
+        device = SkeletonDevice(skeleton_positions(ex), flags=3)
+        ex._get_xr_gesture_value = Mock(return_value=0.0)
+        self.assertEqual(ex._get_hand_input_kind(device), "hand_tracking")
+        self.assertIsNotNone(ex._get_hand_tracking_pose(device))
+        curls = ex._get_hand_tracking_finger_curls(device)
+        self.assertEqual(set(curls), {*ex._finger_roles, "thumb_yaw"})
+        self.assertTrue(all(abs(value) < 1e-6 for value in curls.values()))
+        ex._latest_finger_curls["right"] = curls
+        ex._finger_curl_source["right"] = "hand_tracking"
+        self.assertFalse(ex._is_hand_closed("right", device))
+        ex._get_xr_gesture_value.assert_not_called()
+
+    def test_individual_finger_updates_without_a_closed_hand_or_active_arm(self):
+        ex = self.example
+        device = SkeletonDevice(skeleton_positions(ex), flags=2)
+        ex._xr_core = object()
+        ex._get_xr_input_device = lambda handle: device
+        ex._get_xr_gesture_value = Mock(return_value=0.0)
+        ex.g1 = types.SimpleNamespace(has_finger_control=lambda: True, set_finger_curls=Mock())
+        ex._update_g1_fingers()
+        device.positions = skeleton_positions(ex, {"index": 0.7})
+        for _ in range(15):
+            ex._update_g1_fingers()
+        for side in ("left", "right"):
+            self.assertEqual(ex._finger_curl_source[side], "hand_tracking")
+            self.assertGreater(ex._latest_finger_curls[side]["index"], 0.65)
+            self.assertLess(ex._get_hand_closure(side), ex._finger_grab_threshold)
+            self.assertNotIn(side, ex._arm_input_sources)
+        ex.g1.set_finger_curls.assert_called()
+        ex._get_xr_gesture_value.assert_not_called()
+
     def test_each_finger_moves_independently(self):
         ex = self.example
         for moving in ex._finger_roles:
