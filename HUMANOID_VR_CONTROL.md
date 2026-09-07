@@ -14,7 +14,13 @@ headset accuracy, dynamic balance, or contact-based grasp success.
 
 **Current default: stationary manipulation.** The robot's pelvis is fixed to the world
 at its spawn pose. It does not walk, turn, or respond to locomotion inputs, including
-headset gait. Arm/finger tracking, pickup, gaze, and camera controls remain active.
+headset gait. Arm/finger tracking, pickup, and gaze remain active. The camera is rigidly
+mounted to the robot's head: physical headset translation and rotation cannot move it.
+B restores that fixed view, and the left-stick click cannot unlock it in stationary mode.
+Optical tracking independently drives each digit's curl and thumb opposition; controllers
+retain grip for arm tracking and trigger for whole-hand closure. The launcher requests
+the native OpenXR hand-joint component without changing gaze settings. Restart an
+already-running XR session once after updating to activate it.
 Save your stage and restart/reload the example to replace an existing walking instance.
 The walking measurements and tuning sections below are retained as historical,
 non-default experiments; they do not describe the current stationary setup.
@@ -31,9 +37,9 @@ data-collection pipeline**:
 | **Stationary manipulation** *(default)* | A fixed world-to-pelvis joint supports the standing robot; all base movement commands are suppressed while arms, hands, and gaze remain active |
 | **Headset gait detection** *(optional moving modes only)* | Experimental peak/trough processing on HMD height; disabled by default and cannot move the robot in stationary mode |
 | **Horizontal motion gate** | Prevents false walking from pure head nodding — gait is suppressed unless the headset also moves in the floor plane |
-| **Eye-level first-person camera** | Viewport/XR camera placed at robot eye height (not top of skull) |
+| **Eye-level first-person camera** | Fixed to the live robot head/torso body; physical headset movement is ignored in stationary mode |
 | **VR hand tracking → arm control** | OpenXR hand/controller poses drive the G1 arm joints |
-| **Finger teleoperation** | Real articulated fingers: per-finger curl measured from the OpenXR hand skeleton drives the G1's Inspire hand joints; with controllers, grip clutches the arm and trigger curls all fingers |
+| **Finger teleoperation** | Independent per-finger bend and thumb opposition from the OpenXR skeleton drive the Inspire hand's six actuators; with controllers, grip clutches the arm and trigger curls all fingers |
 | **Grab system** | Nearby objects use distance-gated fixed-joint grasp assistance: hold grip and pull trigger, or close tracked fingers |
 | **Quest Pro eye tracking** | Real OpenXR eye gaze (the runtime's calibrated fusion of both eyes) drawn as a **red ray** from your eyes to the gazed collider (sample boxes, ground) with a **large blood-red marker sphere** at the collision point; the looked-at box is tinted yellow; every gaze-target change is printed live to the terminal as `[EyeGaze] looking at ...`; robot self-hits filtered out of the raycast (`eye_gaze_tracker.py`) |
 | **Behavioral session recorder** | Every run creates a session folder under `~/BehavioralCollection/raw_sessions/` with `metadata.json` + five time-aligned ~100 Hz CSVs (behavior, hand tracking, gaze, object states, frame timestamps), flushed to disk every ~2.5 s during play |
@@ -312,12 +318,12 @@ then pull it to close the fingers and request pickup. XR triggers are reserved f
 | Trigger pressure | Curl all fingers on that controller's hand |
 | Trigger at or above 0.60 | Request pickup if the active robot hand is close enough |
 | Trigger at or below 0.35 | Release pickup and rearm the next grab |
-| B | Recenter the VR view once per press |
+| B | Restore the fixed robot-head view |
 | Y | Drop both objects; open/release before grabbing again |
-| Left stick click | Cycle the XR camera mode |
+| Left stick click | Keep the camera locked to the robot head in stationary mode |
 
-**Controller pickup sequence:** press **B** while facing the robot's forward direction
-to recenter. With trigger released, **hold grip**, then move and rotate the controller
+**Controller pickup sequence:** press **B** to restore the robot-head view.
+With trigger released, **hold grip**, then move and rotate the controller
 to bring the actual robot palm/fingers close to an object on the near edge of the
 **small front-right table**. **Keep grip held and squeeze
 trigger** past 60% to close and request attachment. Move the controller while keeping
@@ -697,15 +703,30 @@ written at session start.
 | Column | Description |
 |---|---|
 | `<side>_finger_thumb/index/middle/ring/little` | Curl actually commanded to that finger, `0.0` = open, `1.0` = fully closed |
+| `<side>_finger_thumb_yaw` | Separate thumb-opposition target, `0.0` = open, `1.0` = opposed across the palm |
 | `<side>_hand_closure` | Mean curl across the five fingers — a single "how closed is this hand" scalar |
-| `<side>_finger_source` | `hand_tracking` (measured from the tracked hand skeleton), `controller` (trigger/grip), or `none` (that hand was not tracked this sample) |
+| `<side>_finger_source` | `hand_tracking` (measured from the tracked hand skeleton), `controller` (trigger), or `none` (that hand was not tracked this sample) |
 
-Curl under hand tracking is the angle between each finger's metacarpal bone and its
-distal phalanx, normalised by a full-flexion reference (150° for the fingers, 95° for
-the thumb). Measuring an *angle between bones* rather than a fingertip-to-palm distance
-makes the signal independent of hand size and of where your hand is in the room.
+Curl under hand tracking sums the bends between adjacent bones from metacarpal to
+tip, normalised by a full-flexion reference (150° for the fingers, 95° for the thumb).
+This keeps tightly folded fingers closed even past 180° of total bend. Thumb opposition
+uses the thumb metacarpal direction in the palm plane. Both measurements are independent
+of hand size, room position, and wrist rotation. Inspire's six actuators couple distal
+knuckles; they cannot reproduce every human knuckle or finger-splay movement separately.
 
 ### Seeing through the robot's head
+
+The current default is **`robot_head`**: a fixed camera-to-body mount follows the live
+torso/head transform. Physical headset translation and rotation do not move the view,
+including while paused. **B** restores this view, and left stick click cannot unlock it
+in stationary mode. Gaze code and settings are unchanged. See the
+[current camera implementation and validation](docs/humanoid-control.md#robot-mounted-camera).
+
+### Historical camera experiments for moving modes
+
+The following calibration and camera-mode experiments describe the retained optional
+moving-robot paths. Their headset composition and mode-switch instructions do not
+apply to the default stationary `robot_head` mode.
 
 The rig rides the robot **and** keeps live head tracking (`_xr_camera_mode =
 "head_compose"`). Two numbers decide whether that actually feels like being inside the
@@ -1051,12 +1072,13 @@ self._headset_gait_max_extremum_gap   = 0.95    # max seconds between peak and n
 self._first_person_eye_height_above_base = 0.58  # eye height above the G1 pelvis/base link (m)
 self._first_person_head_forward_offset   = 0.26  # forward from the head, out of the skull mesh (m)
 self._first_person_head_up_offset        = 0.0   # extra fine-tune on top of the eye height (m)
-self._head_camera_yaw_sign               = 1.0   # set -1.0 if the view turns opposite to the robot
+self._head_camera_yaw_sign               = 1.0   # legacy moving-camera modes only
 ```
-The camera height is always `base_z + eye_height (+ up_offset)` — deterministic
-regardless of how the asset's head-link origin is placed. Adjust `eye_height` in
-±0.02 steps until the view matches the robot's eyes; `0.46` is strict eye level
-inside the G1's head, `0.58` clears the top of the skull.
+These offsets establish the camera pose at scene creation. In `robot_head` mode that
+pose becomes a fixed local mount on the head's rigid ancestor (`torso_link` in the
+Inspire asset), then follows its full live position and rotation. Adjust the offsets
+and reload the example to change the mount. `0.58` places the view above the skull;
+the forward offset keeps the camera outside its mesh.
 
 Note these numbers shrank when the robot changed: the G1 stands 1.32 m tall against
 the H1's 1.80 m, so every offset measured against the old skull had to come down.

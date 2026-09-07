@@ -17,20 +17,19 @@ for the current implementation.
 | Left/right XR stick axes; X/A buttons | No robot movement in the default stationary mode |
 | Grip held | Move/rotate that arm relative to its clutch calibration |
 | Trigger | Close all fingers; request nearby assisted pickup at 0.60, release at 0.35 |
-| B | Recenter view |
+| B | Restore the fixed robot-head view |
 | Y | Drop both objects; release/open before picking up again |
-| Left stick click | Cycle camera mode |
-| Optical hand tracking | Wrist/palm target plus individual finger curls; no controller clutch |
+| Left stick click | Keep the robot-head camera locked in stationary mode |
+| Optical hand tracking | Wrist/palm target, five independent finger curls, and separate thumb opposition; no controller clutch |
 | Keyboard arrows/numpad movement keys; gamepad locomotion inputs | No robot movement in the default stationary mode |
-| Head motion/step-in-place | No robot movement; tracking remains available for view, gaze, and recording |
+| Head motion/step-in-place | No robot or camera movement; existing gaze and recording remain available |
 
 Triggers on XR controllers never command walking. Grip alone leaves fingers open.
-Stick clicks are distinct from stick axes: the left stick click still changes camera
-mode even though tilting either stick does not move the robot.
+Stationary mode also prevents stick clicks from selecting a room-scale camera mode.
 
 ### Pick up with VR controllers
 
-1. Recenter with **B** while facing the robot's forward direction. Keep the trigger
+1. Restore the robot-head view with **B**. Keep the trigger
    released, then **hold the grip** on the hand you want to move.
 2. Move that controller forward, upward, or sideways and rotate it to guide the robot
    palm and wrist. Start with the objects on the near edge of the **small front-right
@@ -47,6 +46,8 @@ mode even though tilting either stick does not move the robot.
 
 1. Use your runtime's hand-tracking mode so it supplies wrist/palm and finger skeleton
    poses. Present an **open hand** in the tracking cameras' view.
+   The launcher and extension enable Kit's OpenXR Hand Tracking component; restart
+   an already-running XR session once after updating. Keep the existing OpenXR runtime.
 2. Reach and rotate your hand to guide the corresponding robot palm toward an object
    on the near edge of the small front-right table. Optical tracking does not require
    a grip button or controller clutch.
@@ -58,6 +59,11 @@ mode even though tilting either stick does not move the robot.
 
 Each hand works independently. Pickup remains assisted by a fixed joint; neither a
 highlight nor a closed hand alone guarantees attachment when the object is out of reach.
+Move one finger at a time to control the corresponding robot finger; thumb opposition
+is independent of thumb flexion. Inspire has six actuators: each finger's distal joints
+are mechanically coupled, so individual human knuckles and finger splay cannot all be
+reproduced independently. Controllers retain whole-hand trigger closure; individual
+finger tracking requires the optical skeleton from the headset.
 The distant side benches and floor objects remain in the scene; the stationary robot
 cannot walk over to them or lower its base to reach the floor.
 
@@ -139,11 +145,41 @@ reacquisition starts from the measured joints. Filters account for `dt`.
 If the live Jacobian is unavailable, the existing measured four-joint local map remains
 a degraded position fallback; it cannot reproduce the full wrist-orientation solve.
 
-Optical finger curls come from available skeleton joints. Missing finger roles relax
+Optical finger curls sum adjacent bone bends along each complete digit chain. This
+avoids a deep fist wrapping past 180 degrees and reopening the robot finger. Joint
+positions need the OpenXR position-valid flag; missing orientation is acceptable for
+this position-only calculation. Thumb opposition is measured in the hand's own palm
+plane and has a separate target and recorded `thumb_yaw` column.
+Missing finger roles relax
 open and remain in the whole-hand averaging denominator, so one tracked thumb cannot
 look like a fully closed hand. Controller trigger pressure drives all roles. Only
 independent finger driver joints are commanded; mimic joints follow their coupling.
-Curls update before the arm/pickup decision in each physics tick.
+Curls update before the arm/pickup decision in each physics tick. Kit can label a
+Touch device `hand` before a skeleton arrives. The input classifier requires skeletal
+landmark names for optical control; a valid grip pose plus real trigger/thumbstick
+actions preserves controller control when only interaction poses exist. A partially
+present skeleton stays optical, so missing joints cannot activate stale trigger input.
+
+## Robot-mounted camera
+
+The default `robot_head` mode fixes the camera pose relative to the robot's head body.
+The Inspire asset's visual head is fixed under `torso_link`, so the mount follows that
+body's full live position and rotation. It uses physics tensors while running, including
+with Fabric enabled. The camera keeps its existing `/World/G1_HeadCamera` path and eye
+offset so the viewport and recorder share the same view.
+
+Physical headset translation and rotation do not enter the mounted camera transform.
+An application-frame subscription reasserts this view through XRCore during Play and
+Pause, in addition to the physics update. **B** restores this fixed view; the left stick
+click cannot unlock it in stationary mode. Older room-scale modes remain available
+only for explicitly configured moving-robot experiments. Cleanup releases the frame
+subscription, and reset discards stale body-pose handles. Gaze code and its settings
+are unchanged by these camera and finger additions.
+
+For Steam Link, enable hand tracking on the headset and switch from controllers to
+bare hands. Valve documents that Steam Link forwards the skeleton through
+`XR_EXT_hand_tracking`. Controller aim/grip poses alone are insufficient for per-finger
+control. [Valve's hand-tracking announcement](https://store.steampowered.com/news/posts/?appgroupname=SteamVR&appids=250820&enddate=1728412551&feed=steam_community_announcements)
 
 ## Pickup and tracking loss
 
@@ -322,6 +358,61 @@ command reduced angular error from 19.5 to 4.4 degrees with 0.008 m palm displac
 These are stationary simulation results; they do not establish walking balance or
 hardware tracking quality.
 
+### Camera and finger validation
+
+Run these checks sequentially against the already-loaded stationary example:
+
+```powershell
+python tools/validate_camera_live.py
+python tools/validate_fingers_live.py --timeout 300
+```
+
+The camera replay checks a constant camera-to-body mount during Play and Pause with
+six simulated physical-head poses, B, and left stick click. It forwards camera updates
+to the real XRCore and verifies that gaze's tracker instance is retained. World camera
+motion caused by actual torso deflection is allowed; movement relative to the torso
+is not. The finger replay drives each of ten fingers and both thumb-opposition joints,
+then checks partial loss, controller triggers, misleading source metadata, and complete
+loss against measured PhysX joints. These scripts restore input and leave the timeline
+paused. They do not validate the headset's cameras or finger transport. A low VR frame
+rate stretches wall time because the finger replay waits for simulated time.
+
+For a shorter controller-transition check, use
+`python tools/validate_fingers_live.py --controllers-only --timeout 120`; its report
+explicitly marks the optical checks as skipped.
+
+To observe actual hardware, press Play, put down the controllers, switch the headset
+to bare hands, and bend individual fingers while running:
+
+```powershell
+python tools/observe_hand_tracking_live.py --seconds 20
+```
+
+This observer supplies no input and changes no timeline, gaze, or tracking settings.
+It reports real skeletal landmarks, optical targets, and measured robot-joint ranges.
+Run it separately from synthetic replays. Motion flags show real optical input and
+corresponding joint variation; they do not measure detailed tracking accuracy. No motion
+can mean absent/occluded tracking, a still hand, or too few physics updates.
+
+On 7 September 2026, all **80 offline regression tests** passed. The full live finger
+replay passed **19.73 simulated seconds** with all ten fingers and both thumb-opposition
+joints reaching their independent 0.7 normalized targets. Partial/full tracking loss,
+normal controller input, and Touch input mislabeled as `hand` passed for both hands;
+root translation was zero and no callback errors occurred.
+
+The live camera replay passed both Play and Pause with the Quest session connected.
+Maximum camera-to-body matrix change was `3.33e-16`; the authored camera matched the
+computed mount exactly. A separate read of the real headset's virtual eye position
+matched the mounted camera within `4.25e-8 m` after the physical headset had moved
+over a metre. Gaze still reported `eye_tracker` with zero failed updates.
+
+Actual skeletal poses were seen intermittently after enabling Kit's hand component,
+but subsequent 20- and 45-second real-input observations contained no valid finger landmarks.
+The synthetic replay therefore establishes retargeting and joint-drive behavior;
+complete real-headset finger movement remains an operator acceptance check. The
+observer above distinguishes this transport/visibility condition from a frozen
+simulation without altering gaze or the active OpenXR runtime.
+
 ## Live acceptance procedure
 
 1. Save your current stage and reload the changed extension/application. Open
@@ -330,14 +421,19 @@ hardware tracking quality.
 2. Confirm the resolved locomotion mode is `stationary`. Tilt both sticks, press X/A,
    try keyboard movement keys and gamepad inputs, and move your head. The robot's base
    position and orientation must stay fixed. Repeat while reaching with both arms.
-3. Hold grip with trigger released: the hand should stay open. Reach forward/up/out,
+3. Move your physical head sideways, vertically, and rotate it. The camera must retain
+   its fixed transform relative to the robot head. Repeat while paused and press B or
+   the left stick: neither should enable room-scale camera movement.
+   Hold grip with trigger released: the hand should stay open. Reach forward/up/out,
    rotate the wrist, then release/reengage grip. Verify the actual palm follows smoothly,
    does not jump when reacquired, and does not move or tip the robot's base.
 4. Reach the actual palm/fingers close to an object, pull trigger, and verify the object
    does not snap to the wrist on attachment. Lift, release, and observe it fall. Press Y
    while trigger remains held; it must stay released until you open and close again.
    Keep grip held while carrying; verify releasing grip also drops the object.
-5. Repeat with optical hand tracking, partial occlusion, and device loss/reconnection.
+5. Bend each optical finger separately and move the thumb across the palm without
+   curling its tip; verify independent robot-finger and thumb-opposition movement.
+   Repeat pickup with optical hand tracking, partial occlusion, and device loss/reconnection.
    Verify objects release and stale hand targets are not used. Reset while holding an
    object; verify no joint remains and the robot returns to its spawn pose.
 6. Hold the head still and move only the eyes. Confirm the runtime reports real

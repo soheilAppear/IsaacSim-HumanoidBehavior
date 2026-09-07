@@ -19,6 +19,11 @@ writeTarget.kit = true
 "isaacsim.examples.browser" = {}
 "isaacsim.storage.native" = {}
 
+[settings]
+# Request skeletal hand joints as well as controller input. The native OpenXR
+# component checks this before instance creation; restart XR if already active.
+xr.openxr.components."omni.kit.xr.openxr.ext.hand_tracking".enabled = true
+
 [[python.module]]
 name = "isaacsim.robot.policy.examples"
 

@@ -12,6 +12,8 @@ REM
 REM Pass --xr-verbose as the first argument to also turn on the OpenXR runtime diagnostics
 REM (which extensions the runtime advertised, which interaction profiles bound). Any other
 REM arguments are forwarded to Isaac Sim unchanged.
+REM Skeletal hand tracking must be requested before the OpenXR instance is created.
+REM If enabling it in an already-running app, restart the XR session to apply it.
 
 setlocal
 
@@ -29,6 +31,6 @@ if /i "%~1"=="--xr-verbose" (
 )
 
 echo Starting Isaac Sim XR VR with the Python server on 127.0.0.1:8226 ...
-call "%ISAAC_DIR%\isaac-sim.xr.vr.bat" --enable isaacsim.code_editor.python_server %XR_FLAGS% %*
+call "%ISAAC_DIR%\isaac-sim.xr.vr.bat" --enable isaacsim.code_editor.python_server --/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled=true %XR_FLAGS% %*
 
 endlocal

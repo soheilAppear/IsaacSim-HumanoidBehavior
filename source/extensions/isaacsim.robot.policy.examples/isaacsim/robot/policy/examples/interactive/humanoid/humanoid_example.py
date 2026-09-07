@@ -214,6 +214,10 @@ class HumanoidExample(BaseSample):
         self._headset_gait_output = 0.0
         self._head_camera_path = "/World/G1_HeadCamera"
         self._head_camera_transform_op = None
+        self._head_camera_mount_body_path = None
+        self._head_camera_mount_local = None
+        self._head_camera_mount_prim = None
+        self._head_camera_update_sub = None
         self._physics_step_error_logged = set()  # (subsystem, error) pairs already warned about
         # Camera geometry, re-tuned for the G1: it stands 1.32 m tall against the H1's
         # 1.80 m, so every offset that was measured against the H1 skull had to shrink.
@@ -226,7 +230,9 @@ class HumanoidExample(BaseSample):
         self._head_camera_yaw_sign = 1.0  # flip to -1.0 only if the DESKTOP view turns opposite
         # to the robot; the in-VR reversal was caused by
         # per-step camera forcing, fixed by the XR anchor below
-        # XR camera modes (the reversal/frozen-camera saga, in order of discovery):
+        # The stationary manipulation view is a rigid robot-mounted camera. The
+        # remaining modes are retained for later experiments with a moving robot.
+        #   "robot_head"    - fixed camera-to-head mount; ignores physical HMD motion.
         #   "camera_lock"   - schedule_set_camera(robot head pose) every step. Follows
         #                     the robot but cancels the user's own head rotation.
         #   "custom_anchor" - XR custom-anchor prim. Natural head tracking, but this
@@ -242,7 +248,7 @@ class HumanoidExample(BaseSample):
         #                     nothing fights its reprojection. Smoothest when the build
         #                     re-reads a moving anchor prim; try it if head_compose
         #                     still feels detached.
-        self._xr_camera_mode = "head_compose"
+        self._xr_camera_mode = "robot_head"
         self._xr_anchor_path = "/World/G1_XRAnchor"
         self._xr_anchor_op = None
         self._xr_anchor_configured = False
@@ -291,7 +297,7 @@ class HumanoidExample(BaseSample):
         #: lands the view on the robot depends on how this runtime interprets
         #: schedule_set_camera, which cannot be established from outside a live headset
         #: -- so it is switchable from inside one rather than guessed at.
-        self._xr_camera_mode_cycle = ("head_compose", "stage_anchor", "camera_lock")
+        self._xr_camera_mode_cycle = ("robot_head", "head_compose", "stage_anchor", "camera_lock")
         # --- automatic convention detection ---
         # schedule_set_camera(M) either makes the rendered VIEW equal M (the runtime
         # subtracting the live head pose internally) or sets the RIG ORIGIN to M and
@@ -591,18 +597,19 @@ class HumanoidExample(BaseSample):
         # Deliberately high: a light touch curls the
         # index finger without grabbing anything.
         self._finger_roles = ("thumb", "index", "middle", "ring", "little")
-        # Hand-tracking joint triplets used to measure each finger's flexion angle. Bones
-        # are compared rather than distances so the metric is independent of hand size.
+        # Sum adjacent bone bends, including the knuckle, instead of comparing only
+        # the first and last bone. A tightly folded finger can turn past 180 degrees;
+        # the endpoint angle would decrease again and incorrectly reopen the robot.
         self._finger_curl_joint_chains = {
             "thumb": ("thumb_metacarpal", "thumb_proximal", "thumb_distal", "thumb_tip"),
-            "index": ("index_metacarpal", "index_proximal", "index_distal", "index_tip"),
-            "middle": ("middle_metacarpal", "middle_proximal", "middle_distal", "middle_tip"),
-            "ring": ("ring_metacarpal", "ring_proximal", "ring_distal", "ring_tip"),
-            "little": ("little_metacarpal", "little_proximal", "little_distal", "little_tip"),
+            "index": ("index_metacarpal", "index_proximal", "index_intermediate", "index_distal", "index_tip"),
+            "middle": ("middle_metacarpal", "middle_proximal", "middle_intermediate", "middle_distal", "middle_tip"),
+            "ring": ("ring_metacarpal", "ring_proximal", "ring_intermediate", "ring_distal", "ring_tip"),
+            "little": ("little_metacarpal", "little_proximal", "little_intermediate", "little_distal", "little_tip"),
         }
         # Bone angle counted as a fully closed finger. The thumb only folds about halfway
         # as far as the fingers do, so sharing one threshold would leave it half open in
-        # a fist. Measured metacarpal-bone to distal-phalanx, matching the chains above.
+        # a fist. Each value is the sum of bends from the metacarpal to the fingertip.
         self._finger_curl_full_flexion_rad = {
             "thumb": math.radians(95.0),
             "index": math.radians(150.0),
@@ -610,6 +617,10 @@ class HumanoidExample(BaseSample):
             "ring": math.radians(150.0),
             "little": math.radians(150.0),
         }
+        #: Thumb metacarpal angle in the palm plane, from the thumb-side direction.
+        #: Opposing the thumb across the palm is separate from bending its two joints.
+        self._thumb_opposition_open_angle = math.radians(45.0)
+        self._thumb_opposition_closed_angle = math.radians(135.0)
         self._finger_tracking_status_logged = False
         self._prev_physics_sim_device: str | None = None
         self._prev_fabric_enabled: bool | None = None
@@ -1154,6 +1165,13 @@ class HumanoidExample(BaseSample):
         self._controller_command = torch.zeros(3, device=device)
         self._physics_ready = False
         self._set_active_head_camera()
+        # Keep the XR view attached between physics steps and while paused. The
+        # camera callback does not read or modify eye-gaze devices or their settings.
+        self._head_camera_update_sub = (
+            omni.kit.app.get_app()
+            .get_update_event_stream()
+            .create_subscription_to_pop(self._on_robot_camera_update, name="G1 robot-mounted camera")
+        )
 
         # Register physics callback using SimulationManager
         if self._physics_callback_id is None:
@@ -1176,6 +1194,7 @@ class HumanoidExample(BaseSample):
 
     async def setup_post_clear(self):
         """Called after clearing the scene."""
+        self._head_camera_update_sub = None
         self._reset_teleoperation_state()
         # Deregister physics callback
         if self._physics_callback_id is not None:
@@ -1194,6 +1213,8 @@ class HumanoidExample(BaseSample):
         self.g1 = None
         self._physics_ready = False
         self._head_camera_transform_op = None  # handles die with the stage; never reuse them
+        self._head_camera_mount_body_path = None
+        self._head_camera_mount_local = None
         self._xr_anchor_op = None
         self._restore_physics_simulation_state()
 
@@ -1308,6 +1329,7 @@ class HumanoidExample(BaseSample):
         self._object_state_prev_positions.clear()
         self._camera_filtered_base = None
         self._camera_filtered_yaw = None
+        self._head_camera_mount_prim = None
         self._xr_recenter_button_down = False
         self._xr_mode_button_down = False
         self._drop_button_down = False
@@ -1338,7 +1360,109 @@ class HumanoidExample(BaseSample):
         xformable = UsdGeom.Xformable(camera.GetPrim())
         xformable.ClearXformOpOrder()
         self._head_camera_transform_op = xformable.AddTransformOp()
+        self._prepare_robot_head_camera_mount(stage)
         carb.log_info(f"HumanoidExample: created G1 head camera at {self._head_camera_path}")
+
+    def _prepare_robot_head_camera_mount(self, stage: Usd.Stage) -> None:
+        """Record a fixed camera-to-body transform before the physics scene starts.
+
+        G1's visual head is a fixed child of the torso, not a separate articulation
+        link in the Inspire asset. Find its rigid ancestor and follow that body's
+        live physics pose. The existing camera path stays stable for recording.
+        """
+        self._head_camera_mount_prim = None
+        self._head_camera_mount_local = None
+        self._head_camera_mount_body_path = None
+        for path in (
+            f"{self._g1_prim_path}/torso_link/head_link",
+            f"{self._g1_prim_path}/head_link",
+            f"{self._g1_prim_path}/torso_link",
+        ):
+            body = stage.GetPrimAtPath(path)
+            while body.IsValid() and str(body.GetPath()).startswith(self._g1_prim_path + "/"):
+                if body.HasAPI(UsdPhysics.RigidBodyAPI):
+                    break
+                body = body.GetParent()
+            if body.IsValid() and body.HasAPI(UsdPhysics.RigidBodyAPI):
+                self._head_camera_mount_body_path = str(body.GetPath())
+                break
+        if self._head_camera_mount_body_path is None:
+            carb.log_warn("HumanoidExample: no rigid head/torso body for the robot camera")
+            return
+        cache = UsdGeom.XformCache()
+        root_world = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(self._g1_prim_path))
+        # Preserve the established eye position and viewing direction at spawn, then
+        # keep this mount rigid through all six axes of the robot body's motion.
+        eye = root_world.Transform(
+            Gf.Vec3d(
+                self._first_person_head_forward_offset,
+                0.0,
+                self._first_person_eye_height_above_base + self._first_person_head_up_offset,
+            )
+        )
+        direction = root_world.TransformDir(
+            Gf.Vec3d(self._first_person_head_target_distance, 0.0, -self._first_person_head_target_drop)
+        )
+        up = root_world.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
+        camera_world = Gf.Matrix4d().SetLookAt(eye, eye + direction, up).GetInverse()
+        body_world = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(self._head_camera_mount_body_path))
+        self._head_camera_mount_local = camera_world * body_world.GetInverse()
+
+    def _read_camera_mount_body_pose(self) -> Gf.Matrix4d | None:
+        """Read the real head/torso body, including when Fabric leaves USD stale."""
+        if self._head_camera_mount_body_path is None:
+            return None
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return None
+        body = stage.GetPrimAtPath(self._head_camera_mount_body_path)
+        if not body.IsValid():
+            return None
+        if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
+            # Before Play/after Stop there is no live tensor pose; use the authored
+            # mount. Never substitute authored transforms for a running rigid body.
+            return UsdGeom.XformCache().GetLocalToWorldTransform(body)
+        try:
+            if self._head_camera_mount_prim is None:
+                from isaacsim.core.experimental.prims import RigidPrim
+
+                self._head_camera_mount_prim = RigidPrim(paths=self._head_camera_mount_body_path)
+            positions, orientations = self._head_camera_mount_prim.get_world_poses()
+            position = self._first_pose_value(positions)
+            quaternion = self._first_pose_value(orientations)
+            if position is None or quaternion is None:
+                return None
+            values = [float(v) for v in position[:3]] + [float(v) for v in quaternion[:4]]
+            if len(values) != 7 or not all(math.isfinite(v) for v in values):
+                return None
+            rotation = Gf.Quatd(values[3], Gf.Vec3d(*values[4:]))
+            if rotation.GetLength() < 1e-8:
+                return None
+            matrix = Gf.Matrix4d().SetRotate(rotation.GetNormalized())
+            matrix.SetTranslateOnly(Gf.Vec3d(*values[:3]))
+            return matrix
+        except Exception as error:
+            self._head_camera_mount_prim = None
+            self._log_physics_step_error("robot camera mount", error)
+            return None
+
+    def _get_robot_head_camera_pose(self) -> Gf.Matrix4d | None:
+        """Return the rigid robot-mounted view without consuming a headset pose."""
+        if self._head_camera_mount_local is None:
+            return None
+        body_world = self._read_camera_mount_body_pose()
+        return self._head_camera_mount_local * body_world if body_world is not None else None
+
+    def _on_robot_camera_update(self, event: object) -> None:
+        """Reassert the mounted XR view every application frame, including Pause."""
+        if self._g1_locomotion != "stationary" and self._xr_camera_mode != "robot_head":
+            return
+        if omni.usd.get_context().get_stage() is None:
+            return  # A stage close can precede the example's cleanup callback.
+        try:
+            self._update_head_camera_view(force=True, dt=0.0)
+        except Exception as error:
+            self._log_physics_step_error("robot camera frame update", error)
 
     def _create_xr_anchor(self) -> None:
         """Create the Xform prim the VR rig anchors to (XR custom-anchor mode).
@@ -1836,7 +1960,11 @@ class HumanoidExample(BaseSample):
             print("[G1] Face the way you want to walk and press B to redo this.", flush=True)
 
     def _request_xr_recenter(self) -> None:
-        """Re-run the rig calibration from the current head pose (B on the right hand)."""
+        """Restore the fixed view, or recalibrate a legacy moving mode, on B."""
+        if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
+            self._update_head_camera_view(force=True, dt=0.0)
+            self._log_xr_camera_state("view restored to the fixed robot head mount")
+            return
         self._xr_calibrated = False
         self._xr_calibration_samples = []
         print("[G1] recentering the VR view on your current head pose and facing...", flush=True)
@@ -1946,6 +2074,8 @@ class HumanoidExample(BaseSample):
 
     def _get_head_camera_pose(self, dt: float | None = None):
         """Compute a first-person camera pose from the G1 head/eye position."""
+        if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
+            return self._get_robot_head_camera_pose()
         if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
 
@@ -2062,7 +2192,12 @@ class HumanoidExample(BaseSample):
             return
         self._head_camera_transform_op.Set(camera_pose)
         if self._xr_core is not None:
-            if self._xr_camera_mode == "head_compose":
+            if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
+                try:
+                    self._xr_core.schedule_set_camera(camera_pose)
+                except Exception as error:
+                    self._log_physics_step_error("robot-mounted XR camera", error)
+            elif self._xr_camera_mode == "head_compose":
                 self._schedule_composed_xr_camera()
             elif self._xr_camera_mode == "stage_anchor":
                 self._schedule_stage_anchor_xr_camera()
@@ -2354,6 +2489,7 @@ class HumanoidExample(BaseSample):
             "arm_orientation_tracking": self._arm_track_orientation,
             "finger_control_enabled": self._finger_control_enabled,
             "finger_roles": list(self._finger_roles),
+            "finger_actuator_roles": [*self._finger_roles, "thumb_yaw"],
             "headset_gait_enabled": self._headset_gait_enabled,
             "eye_gaze_enabled": self._eye_gaze_enabled,
             "behavioral_data_log_rate_hz": (1.0 / physics_dt) / self._behavioral_data_log_every_n_steps,
@@ -2772,7 +2908,7 @@ class HumanoidExample(BaseSample):
         for side in ("left", "right"):
             curls = self._latest_finger_curls.get(side, {})
             record[f"{side}_finger_source"] = self._finger_curl_source.get(side, "none")
-            for role in self._finger_roles:
+            for role in (*self._finger_roles, "thumb_yaw"):
                 value = curls.get(role)
                 record[f"{side}_finger_{role}"] = round(float(value), 6) if value is not None else None
             record[f"{side}_hand_closure"] = round(self._get_hand_closure(side), 6)
@@ -3129,14 +3265,50 @@ class HumanoidExample(BaseSample):
         carb.log_info(f"HumanoidExample G1 DOFs: {dof_names}")
         carb.log_info(f"HumanoidExample G1 hand-tracked arm DOFs: {self._g1_arm_joint_names_by_side}")
 
+    def _get_hand_input_kind(self, input_device) -> str:
+        """Distinguish optical landmarks from a live controller despite source metadata.
+
+        Kit can report `hand` immediately after its hand component starts, while the
+        device still contains only the six Touch interaction poses. Generic `palm`,
+        `pinch`, and `poke` poses are not a skeleton. Keep partially present skeletons
+        optical, so an occlusion cannot turn stale buttons into a controller grab.
+        """
+        if input_device is None:
+            return "none"
+        try:
+            source = str(input_device.get_hand_tracking_data_source())
+        except (AttributeError, RuntimeError):
+            source = ""
+        try:
+            pose_names = {str(name) for name in input_device.get_pose_names()}
+        except (AttributeError, RuntimeError):
+            pose_names = set()
+        if source == "hand":
+            skeletal_names = {"wrist"}
+            skeletal_names.update(name for chain in self._finger_curl_joint_chains.values() for name in chain)
+            if pose_names.intersection(skeletal_names):
+                return "hand_tracking"
+            # Accept mislabeled Touch input only with its real grip pose and action
+            # components. Hand-interaction pinch/poke poses alone cannot enable this.
+            if "grip" not in pose_names or read_world_pose(input_device, "grip") is None:
+                return "none"
+            try:
+                inputs = {str(name) for name in input_device.get_input_names()}
+            except (AttributeError, RuntimeError):
+                return "none"
+            return "controller" if {"trigger", "thumbstick"}.issubset(inputs) else "none"
+        # A disconnected controller may keep stale analog values. It cannot keep
+        # the fingers closed without any valid controller pose in this frame.
+        for name in self._controller_pose_candidates:
+            if name and pose_names and name not in pose_names:
+                continue
+            if read_world_pose(input_device, name) is not None:
+                return "controller"
+        return "none"
+
     def _get_hand_tracking_pose(self, input_device):
         """Return a tracked hand pose matrix from the best available hand pose name."""
-        if input_device is None:
-            return None
-        try:
-            if str(input_device.get_hand_tracking_data_source()) != "hand":
-                return None
-        except Exception:
+        if self._get_hand_input_kind(input_device) != "hand_tracking":
             return None
 
         try:
@@ -3159,13 +3331,8 @@ class HumanoidExample(BaseSample):
         `_compute_arm_target_body_position`, so moving or turning the robot cannot
         masquerade as operator hand motion.
         """
-        if input_device is None:
+        if self._get_hand_input_kind(input_device) != "controller":
             return None
-        try:
-            if str(input_device.get_hand_tracking_data_source()) == "hand":
-                return None
-        except (AttributeError, RuntimeError):
-            pass
         if not self._is_controller_arm_pose_enabled(input_device):
             self._controller_arm_neutral_positions.pop(side, None)
             self._controller_arm_neutral_targets.pop(side, None)
@@ -4159,8 +4326,8 @@ class HumanoidExample(BaseSample):
 
         Runs every physics step, before arm/grasp decisions. Each hand independently
         prefers OpenXR hand tracking (per-finger flexion measured from the tracked hand
-        skeleton) and falls back to the controller's trigger and grip. The resulting
-        curls are smoothed, sent to the robot, and kept for hand_tracking.csv.
+        skeleton) and falls back to the controller's trigger. Thumb opposition has
+        its own target. Curls are smoothed, sent to the robot, and recorded.
         """
         if not self._finger_control_enabled or not self.g1 or not self.g1.has_finger_control():
             return
@@ -4196,8 +4363,11 @@ class HumanoidExample(BaseSample):
         previous = self._smoothed_finger_curls.get(side, {})
         alpha = smoothing_alpha(self._finger_smoothing, self._last_physics_dt)
         smoothed = {}
-        for role in self._finger_roles:
-            target = curls.get(role, 0.0)
+        for role in (*self._finger_roles, "thumb_yaw"):
+            # Controllers close the whole hand, including opposition. Optical input
+            # supplies opposition explicitly, so flexing the thumb does not rotate it.
+            fallback = curls.get("thumb", 0.0) if role == "thumb_yaw" else 0.0
+            target = curls.get(role, fallback)
             if not math.isfinite(float(target)):
                 target = 0.0
             target = self._clamp_value(float(target), 0.0, 1.0)
@@ -4211,12 +4381,11 @@ class HumanoidExample(BaseSample):
     def _get_hand_tracking_finger_curls(self, input_device) -> dict[str, float] | None:
         """Measure each finger's curl from the OpenXR tracked hand skeleton.
 
-        Returns None unless the device is actually delivering hand tracking (rather than
-        a controller), so the caller can fall back to the trigger/grip mapping.
-
-        Curl is the angle between the finger's proximal bone and its distal bone, which
-        is independent of hand size and of where the hand is in the room — unlike a
-        fingertip-to-palm distance, which changes with both.
+        Read each digit independently; a missing joint relaxes only that digit.
+        Summing adjacent bone bends is independent of hand size, room position, and
+        wrist orientation, and remains closed when a fist folds beyond 180 degrees.
+        The six-actuator Inspire hand couples each finger's distal joints mechanically;
+        retarget its total bend, with a separate palm-plane thumb opposition target.
         """
         if input_device is None:
             return None
@@ -4230,32 +4399,94 @@ class HumanoidExample(BaseSample):
         except Exception:
             return None
 
+        positions_by_name = {}
+
+        def position(name):
+            if name not in positions_by_name:
+                positions_by_name[name] = (
+                    self._get_hand_joint_position(input_device, name) if name in pose_names else None
+                )
+            return positions_by_name[name]
+
         curls = {}
         for role, chain in self._finger_curl_joint_chains.items():
-            if not all(name in pose_names for name in chain):
-                continue
-            positions = [self._get_hand_joint_position(input_device, name) for name in chain]
+            positions = [position(name) for name in chain]
             if any(position is None for position in positions):
                 continue
-            proximal_bone = positions[1] - positions[0]
-            distal_bone = positions[3] - positions[2]
-            angle = self._angle_between(proximal_bone, distal_bone)
-            if angle is None:
+            bones = [second - first for first, second in zip(positions, positions[1:])]
+            angles = [self._angle_between(first, second) for first, second in zip(bones, bones[1:])]
+            if any(angle is None for angle in angles):
                 continue
             full_flexion = self._finger_curl_full_flexion_rad.get(role, math.radians(150.0))
-            curls[role] = self._clamp_value(angle / full_flexion, 0.0, 1.0)
+            curls[role] = self._clamp_value(sum(angles) / full_flexion, 0.0, 1.0)
 
         if not curls:
             return None
+        # Missing opposition landmarks must not substitute thumb curl: that would
+        # rotate the thumb merely because its tip flexed during an occlusion.
+        curls["thumb_yaw"] = self._get_hand_tracking_thumb_opposition(position)
         if not self._finger_tracking_status_logged:
             self._finger_tracking_status_logged = True
             carb.log_info(f"HumanoidExample: finger teleoperation using hand-tracking joints {sorted(curls)}")
         return curls
 
     def _get_hand_joint_position(self, input_device, pose_name: str):
-        """Return one tracked hand-joint position, or None when it is unavailable."""
-        pose = read_world_pose(input_device, pose_name)
-        return Gf.Vec3d(pose.ExtractTranslation()) if pose is not None else None
+        """Read a finite world joint position without requiring tracked orientation.
+
+        Finger bend uses translation only. OpenXR may mark a joint's position valid
+        while its orientation is unavailable; keep that usable skeletal landmark.
+        Invalid descriptors never fall back to a stale matrix or physical-room pose.
+        """
+        try:
+            reader = getattr(input_device, "get_virtual_world_pose_desc", None)
+            if not callable(reader):
+                pose = read_world_pose(input_device, pose_name)
+                return Gf.Vec3d(pose.ExtractTranslation()) if pose is not None else None
+            descriptor = reader(pose_name)
+            if int(descriptor.validity_flags) & 0x2 == 0:
+                return None
+            matrix = descriptor.pose_matrix
+            if matrix is None or len(matrix) != 4 or any(len(row) != 4 for row in matrix):
+                return None
+            coordinates = tuple(float(matrix[3][axis]) for axis in range(3))
+            if not all(math.isfinite(value) for value in coordinates):
+                return None
+            return Gf.Vec3d(*coordinates)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+
+    def _get_hand_tracking_thumb_opposition(self, position) -> float:
+        """Measure thumb opposition in the palm plane, independently of tip flexion."""
+        landmarks = [
+            position(name)
+            for name in (
+                "wrist",
+                "middle_proximal",
+                "index_proximal",
+                "little_proximal",
+                "thumb_metacarpal",
+                "thumb_proximal",
+            )
+        ]
+        if any(landmark is None for landmark in landmarks):
+            return 0.0
+        wrist, middle, index, little, thumb_base, thumb_knuckle = landmarks
+        forward = middle - wrist
+        outward = index - little
+        if forward.GetLength() <= 1e-6:
+            return 0.0
+        forward.Normalize()
+        outward -= forward * Gf.Dot(outward, forward)
+        if outward.GetLength() <= 1e-6:
+            return 0.0
+        outward.Normalize()
+        thumb = thumb_knuckle - thumb_base
+        thumb_in_plane = forward * Gf.Dot(thumb, forward) + outward * Gf.Dot(thumb, outward)
+        angle = self._angle_between(outward, thumb_in_plane)
+        if angle is None:
+            return 0.0
+        travel = self._thumb_opposition_closed_angle - self._thumb_opposition_open_angle
+        return self._clamp_value((angle - self._thumb_opposition_open_angle) / travel, 0.0, 1.0)
 
     def _angle_between(self, first: Gf.Vec3d, second: Gf.Vec3d) -> float | None:
         """Return the unsigned angle in radians between two vectors, or None if degenerate."""
@@ -4272,13 +4503,8 @@ class HumanoidExample(BaseSample):
         Keeping the clutch separate lets the operator reach with an open hand, then
         curl around the target without changing the arm's calibration.
         """
-        if input_device is None:
+        if self._get_hand_input_kind(input_device) != "controller":
             return None
-        try:
-            if str(input_device.get_hand_tracking_data_source()) == "hand":
-                return None  # incomplete hand tracking is not controller data
-        except (AttributeError, RuntimeError):
-            pass
         trigger = max(
             self._get_xr_gesture_value(input_device, "trigger", "value"),
             self._get_xr_gesture_value(input_device, "trigger", "click"),
@@ -4428,6 +4654,10 @@ class HumanoidExample(BaseSample):
         guess, the operator cycles the modes while wearing the headset and keeps the one
         that puts them in the robot.
         """
+        if self._g1_locomotion == "stationary":
+            self._xr_camera_mode = "robot_head"
+            self._log_xr_camera_state("stationary mode keeps the camera fixed to the robot head")
+            return
         cycle = self._xr_camera_mode_cycle
         try:
             index = cycle.index(self._xr_camera_mode)
@@ -4562,6 +4792,7 @@ class HumanoidExample(BaseSample):
 
     def physics_cleanup(self):
         """Clean up physics resources."""
+        self._head_camera_update_sub = None
         self._reset_teleoperation_state()
         # Deregister physics callback
         if self._physics_callback_id is not None:
@@ -4582,6 +4813,8 @@ class HumanoidExample(BaseSample):
         self.g1 = None
         self._physics_ready = False
         self._head_camera_transform_op = None  # handles die with the stage; never reuse them
+        self._head_camera_mount_body_path = None
+        self._head_camera_mount_local = None
         self._xr_anchor_op = None
         self._restore_physics_simulation_state()
 

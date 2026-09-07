@@ -21,10 +21,10 @@
 
 </div>
 
-**Default mode: stationary hand control.** The robot stands anchored at its spawn pose; walking and turning inputs are disabled. Use optical hand tracking, or hold controller grip to move the arm and pull trigger to pick up a nearby object. Gaze remains active. Save your stage and restart Isaac Sim, then LOAD the example to create the fixed-base scene.
+**Default mode: stationary hand control.** The robot stands anchored at its spawn pose; walking and turning inputs are disabled. Optical tracking drives each finger and thumb opposition, or hold controller grip to move the arm and pull trigger to pick up a nearby object. The camera stays rigidly mounted to the robot head and ignores physical headset movement. Gaze remains active. Save your stage and restart Isaac Sim, then LOAD the example to create the fixed-base scene.
 
 The [current developer guide](docs/humanoid-control.md) documents the repaired controls,
-assisted pickup, tests, and pending live validation. Performance measurements and captures
+assisted pickup, passed simulation replays, and remaining hardware checks. Performance measurements and captures
 on this page come from earlier sessions. Gaze rows distinguish real eye tracking from
 HMD-forward fallback; fixed-joint pickup is recorded as assistance.
 
@@ -395,4 +395,3 @@ To cite Isaac Sim, click on "Cite this repository" in the right sidebar of the [
 ## Contributing
 
 We do not support direct community contributions at the moment.
-

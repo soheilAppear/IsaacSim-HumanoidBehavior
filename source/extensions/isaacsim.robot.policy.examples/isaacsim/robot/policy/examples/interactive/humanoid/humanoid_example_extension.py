@@ -49,11 +49,13 @@ class HumanoidExampleExtension(omni.ext.IExt):
 
         overview = "The G1 stands anchored in place. Walking and turning inputs are disabled. "
         overview += "Arms, fingers, gaze, and recording remain active."
-        overview += "\n\nHand tracking: reach with an open hand, close your fingers around a nearby object to take it, "
+        overview += " The camera stays fixed to the robot head when you move your real head."
+        overview += "\n\nHand tracking: move individual fingers and thumb opposition. Reach with an open hand, "
+        overview += "close your fingers around a nearby object to take it, "
         overview += "then open your hand to release."
         overview += "\n\nControllers: hold the side GRIP to move/rotate that arm; pull TRIGGER to close and pick up. "
         overview += "Keep grip held while carrying; release trigger to drop."
-        overview += "\nY: drop both objects (release/open before grabbing again). B: recenter view."
+        overview += "\nY: drop both objects (release/open before grabbing again). B: restore the fixed robot-head view."
         overview += "\nStart with the tabletop objects directly in front-right of the robot."
         overview += "\n\nPress the 'Open in IDE' button to view the source code."
 
