@@ -29,10 +29,10 @@ locomotion, and step-in-place inputs cannot move the base in this mode.
 
 | Capability | Current implementation |
 |---|---|
-| Arm control | Controller grip clutches that arm; a valid optical wrist/palm pose activates hand tracking without a grip button or fist |
+| Arm control | Controller grip clutches that arm; valid optical wrist/middle-knuckle positions drive an anatomical palm target without a grip button or fist; measured scenery contacts limit inward arm motion |
 | Finger control | Five independent curl targets and separate thumb opposition from the optical skeleton; controller trigger closes the whole hand |
-| Pickup | Nearby objects attach through distance-gated fixed-joint assistance; opening the hand, releasing trigger/grip, or pressing Y drops the object |
-| Camera | Rigid mount on the robot's head/torso body; physical headset translation and rotation do not move the view, including during Pause |
+| Pickup | Experimental physical contact grasping with bounded finger targets; objects must be held by fingers and friction, with no hand-to-object fixed joint |
+| Camera | Head turns rotate the view left/right, up/down, and in roll; its position stays mounted to the robot head/torso, including during Pause |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
 | Physics | CPU, with a configured 100 Hz physics timestep; rendering requests 90 Hz |
 | Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
@@ -40,6 +40,62 @@ locomotion, and step-in-place inputs cannot move the base in this mode.
 
 Inspire has six independent hand actuators. Distal knuckles are coupled, so it cannot
 reproduce every human knuckle angle or finger-splay movement separately.
+
+The first valid headset orientation sets forward; **B** resets it. Walking, leaning,
+or crouching in the room does not translate the camera. This turns the view only:
+the G1's visible head remains fixed to its torso, with no actuated neck joint.
+Eye-gaze tracking is unchanged.
+
+The front-right table now offers **six lightweight physical objects**, with varied
+shapes, heights, and thicknesses:
+
+| Color | Object | Dimensions | Mass |
+|---|---|---|---:|
+| Blue | Cube | 6 × 6 × 6 cm | 60 g |
+| Orange | Cylinder | 6 cm diameter × 10 cm high | 80 g |
+| Green | Sphere | 7 cm diameter | 50 g |
+| Purple | Tall thin cylinder | 4 cm diameter × 14 cm high | 60 g |
+| Yellow | Flat block | 9 × 6 × 3 cm | 70 g |
+| Red | Cone | 7 cm diameter × 10 cm high | 50 g |
+
+All use gravity and real collisions. The original cube and cylinder retain their
+sizes and masses; earlier historical pickup results used smaller 4 cm objects.
+Grasping the four new shapes has not been validated.
+The sphere, cube, and orange cylinder now sit nearer the robot, with the other
+three shapes staggered behind them. An open-hand replay confirmed that both arms
+can nearly straighten fully and retract without a fault. Reach still follows the
+G1's actual geometry and joint limits; this layout change adds no arm length or
+grasp guarantee. See [arm reach](HUMANOID_VR_CONTROL.md#palm-angle-arm-bending-and-latency).
+Physical mode holds the arm pose on tracking loss or grip release.
+
+**The reproduced sudden-stop case now passes.** Closing and opening the fingers
+against the table previously caused unstable joint speeds and an automatic pause.
+Adding a small joint-inertia floor to the hands passed all 20 close/open cycles,
+with no fault or base movement and a clean withdrawal. A second test reconstructed
+from recorded robot motion also passed. The guard remains enabled.
+
+The enlarged cylinder passed a physical lift, hold, and release trial. **Cube pickup
+remains unresolved:** both tested approaches failed to establish an opposing pinch,
+although the robot remained stable. Earlier smaller-cube successes were also inconsistent.
+Real headset handling remains unverified for this fix. See the
+[validation record](docs/validation/isaac-sim-6.1.md).
+The earlier fixed-joint assisted mode remains selectable for comparison; the recorded
+demos below show that older assisted mode.
+Each actuator retains its first-contact closing cap, with a **0.18 rad** lead,
+preventing further closure from following a finger as it rolls over the contacted
+body. A contact-report gap of up to **40 ms of simulation time** retains the command
+cap only; support evidence clears immediately. Opening always wins; fully opening
+the hand, input loss, and reset clear the retained caps.
+Physical mode prepares finite, critically damped finger couplings before Play,
+replacing the rigid settings that could destabilize the articulation at the table.
+After arm smoothing, measured scenery-contact normals restrict motion into the
+surface, including motion caused by wrist rotation. Withdrawal and sliding along
+the surface remain available. Graspable props are excluded from this arm limit.
+Loaded predictive contacts also limit arm motion before visible surface intersection.
+The six actuators still drive the hand; passive knuckles receive no extra drives.
+An invalid joint state pauses the simulation and requires **Reset or a scene reload**;
+pressing Play alone cannot clear the fault. Gaze and hidden hand target spheres
+are unchanged; head-view rotation is described above.
 
 ## Recorded G1 demos
 
@@ -91,7 +147,7 @@ the documented working connection uses SteamVR with Steam Link.
    No copying into the standalone installation is needed.
 4. Open **Window → Examples → Robotics Examples → Policy → Humanoid**
    (panel title **Humanoid: Unitree G1**), click **LOAD**, then **Play**.
-5. Begin with the reachable packages on the near edge of the small front-right table.
+5. Begin with the small cube and cylinder on the near edge of the front-right table.
 
 See [Running](HUMANOID_VR_CONTROL.md#running) for the detailed startup procedure.
 After changing Python source, restart Isaac Sim and reload the example so it uses
@@ -102,25 +158,35 @@ the updated classes.
 | Input | Action |
 |---|---|
 | Hold left/right **grip** | Move and rotate that arm; grip alone leaves the fingers open |
-| **Trigger** | Close that hand; request nearby pickup at 60% travel and release below 35% |
-| Release **grip** | End that arm's tracking and release its held object |
-| **Y** | Drop both objects; release/open before the next grab |
-| **B** | Restore the fixed robot-head view |
-| Left stick click | Keep the camera locked in stationary mode |
+| **Trigger** | Close that hand around the object; physical pickup depends on contact and friction |
+| Release **grip** | Hold that arm's pose in physical mode; valid trigger input still controls the fingers |
+| Controller **Y** | Force both hands open; release the trigger or open your tracked fingers to rearm |
+| **B** | Make the current headset orientation the forward view |
+| Turn / tilt the headset | Rotate the view while its position stays mounted to the robot |
+| Left stick click | Retain the mounted camera mode |
 | Sticks, X/A, locomotion keys, head movement | No base movement in stationary mode |
-| Open optical hand | A valid wrist/palm pose activates the arm without a fist; fingers update independently from valid digit landmarks |
+| Open optical hand | Valid wrist/middle-knuckle positions activate the arm without a fist; fingers update independently from valid digit landmarks |
 | Bend an optical finger | Move the corresponding robot finger |
-| Close/open optical hand | Request nearby pickup/release using average finger curl |
+| Close/open optical hand | Pinch or wrap around the object with thumb opposition; open to release |
+
+Y is ignored while using bare-hand tracking. If switching from a controller after
+a drop, open all four tracked fingers once; the thumb can remain naturally relaxed.
 
 For controller pickup, **hold grip**, reach with the trigger released, then pull the
 trigger when the actual robot fingers are close to the object. Keep grip and trigger
-held to carry; release the trigger to drop. A target marker or highlight alone does
-not establish pickup range. See the [full control guide](HUMANOID_VR_CONTROL.md#controls)
-for optical thresholds, tracking loss, and release behavior.
+held to carry; release the trigger to open. A highlight does not attach an object.
+Use optical thumb opposition and a pinch or wrap that actually encloses the object;
+for the cube, bring the thumb pad across to face the index pad on opposite sides.
+Making a fist nearby is insufficient. See the [full control guide](HUMANOID_VR_CONTROL.md#controls)
+for input mapping, tracking loss, and release behavior.
+
+If optical arm tracking disappears, physical mode holds the measured arm pose until
+tracking returns. Missing finger input still opens the fingers. This prevents an
+automatic return to rest from dragging a hand through the table.
 
 ## Validation and known limitations
 
-Recorded checks on **7 September 2026**, using Isaac Sim **6.0.0**:
+Historical checks on **7 September 2026**, using Isaac Sim **6.0.0**:
 
 | Check | Result and scope |
 |---|---|
@@ -130,6 +196,9 @@ Recorded checks on **7 September 2026**, using Isaac Sim **6.0.0**:
 | Live camera replay | Fixed camera-to-body mount held during Play and Pause; tested with the Quest session connected |
 | Real eye input | `eye_tracker` was observed with zero failed updates during the connected checks; gaze implementation/settings were preserved |
 | Real Quest finger input | Skeletons arrived intermittently in this historical check; see the 12 September recovery below |
+
+These camera results concern the former fully fixed view. The current rotation-only
+view has separate checks; they do not retroactively validate its headset behavior.
 
 The live replays inject input at the XR boundary and measure real simulation behavior.
 They establish control and physics behavior; they do not establish headset tracking
@@ -153,10 +222,31 @@ measured-eye samples during its last uninterrupted minute.
 See the [6.1 validation record](docs/validation/isaac-sim-6.1.md) for measurements,
 the corrected package colliders, and exact reproduction steps.
 
-The next arm-control update adds anatomical palm alignment, stable palm-centre
-targets, bounded IK task priorities, and wall-time input filtering. Offline checks
-pass, but these changes still require a fresh live pose/latency/pickup run. See
+The current update includes anatomical palm alignment, stable palm-centre targets,
+bounded IK task priorities, wall-time input filtering, and an experimental physical
+grasp mode. The user accepted the arm changes. The table-contact repair combines
+finite compliant finger couplings, limits on inward arm commands, and a joint-health
+guard. Three consecutive fixed-pose table-contact replays passed, but the later
+dynamic close/open stress test exposed a further fault. The selected hand-joint
+inertia floor passed that same 20-cycle test. Larger objects and motion derived from
+the recorded failure were checked separately: the derived path and larger-cylinder
+pickup passed; both larger-cube grasp trials failed without destabilizing the robot. See
 [palm angle, arm bending, and latency](HUMANOID_VR_CONTROL.md#palm-angle-arm-bending-and-latency).
+
+The current suite passed **242 offline tests**, including head-turn direction, release-latch recovery, retained contact caps,
+arm-contact limits, articulation health, and hand-joint stabilization. See the
+[validation record](docs/validation/isaac-sim-6.1.md) for configurations and results.
+Historical starter-object passes apply only to their recorded settings; no replay
+establishes arbitrary-object pickup or headset tracking accuracy.
+The earlier fresh-scene combined pickup replay failed because the smaller cube
+slipped with the exploratory grasp profile; it does not validate the enlarged objects.
+
+At the stop-fix handoff, a fresh production scene was paused with live input restored,
+hidden hand markers, and no physics fault or callback error. Isaac reported no XR
+devices, so these checks do not establish real Quest handling. The ready-state record
+is `_compat61/stop-fix-ready-state.json`; see the
+[validation record](docs/validation/isaac-sim-6.1.md) for its timestamp and configuration.
+That snapshot predates the four additional practice shapes.
 
 Run offline tests with Isaac Sim's Python wrapper:
 
@@ -170,6 +260,34 @@ With the updated example loaded and the Python server enabled, run live checks
 ```powershell
 python tools/validate_camera_live.py
 ```
+
+For a fresh, initialized physical-mode scene, check light contact with the table:
+
+```powershell
+python tools/validate_table_contact_live.py --timeout 240
+```
+
+This synthetic right-hand replay approaches an empty table area, commands a small
+downward motion, holds, then withdraws. It records contacts, joint state, and root
+stability in `_compat61/table-contact-live.json` and leaves live input restored with
+the timeline paused. Its report determines whether that run passed.
+
+In a fresh physical-mode scene with the original cube and cylinder on the front table, recheck
+the synthetic palm-down grasps after changes to hand physics. The replay selects
+an object-specific thumb pose and approach:
+
+```powershell
+python tools/validate_contact_grasp_live.py --object both --timeout 300
+```
+
+It records contact/lift/hold/release results in `_compat61/contact-grasp-live.json`,
+restores input, and leaves the scene paused. Open your input before resuming after
+its forced-drop cleanup. This trial uses real PhysX with synthetic optical landmarks;
+its report states whether that run passed. It does not validate headset tracking.
+`--object both` exercises the original cube and cylinder only; it does not test the
+sphere, tall cylinder, flat block, or cone.
+When a recording session exists, `validation_<run_id>.json` marks this synthetic
+interval by time and physics step; other samples in the session may be real user input.
 
 Before a full finger replay, restart Isaac Sim, LOAD a fresh example, press Play,
 and wait for initialized finger joints. Then run:
@@ -186,7 +304,7 @@ python tools/observe_hand_tracking_live.py --seconds 20
 ```
 
 The observer changes no input, timeline, or gaze settings. Commands for the separate
-pickup/highlight replay, which temporarily substitutes gaze input, and detailed
+legacy assisted pickup/highlight replay, which temporarily substitutes gaze input, and detailed
 results are in [Automated validation](docs/humanoid-control.md#automated-validation).
 
 ## Performance
@@ -217,15 +335,18 @@ Periodic flushing limits buffered data, but an interrupted process can still los
 unflushed rows.
 
 Gaze hits record the collider intersected by the supplied ray; they are observations
-of the gaze signal, not a guarantee of human intent. Fixed-joint pickup is identified
-as assisted grasping. See [Behavioral data collection](HUMANOID_VR_CONTROL.md#behavioral-data-collection)
+of the gaze signal, not a guarantee of human intent. Grasp mode must accompany each
+recording; old fixed-joint demonstrations are assisted grasping, not physical contact
+successes. See [Behavioral data collection](HUMANOID_VR_CONTROL.md#behavioral-data-collection)
 for files and columns.
 
 The [learning directory](learning/README.md) contains the planned dataset and
 world-model workflow. A trained planner is not integrated into the current robot
-controller. The [next research phase](HUMANOID_VR_CONTROL.md#next-research-phase)
-combines gaze-based object intent, hand/finger speed cues, and simulated grip feedback
-after the current alignment and latency checks pass.
+controller. After contact grasping passes live checks, the
+[next research phase](HUMANOID_VR_CONTROL.md#next-research-phase) can add a webcam's
+shoulder/elbow posture alongside Quest hands and eyes, then investigate gaze and
+hand/finger velocity as intent cues. Velocity is not measured finger pressure.
+Neither webcam fusion nor a new intent-training pipeline is implemented yet.
 
 ## Project layout
 

@@ -146,6 +146,10 @@ async def _validate_humanoid_live(ex, reload_example):
     try:
         timeline.pause()
         assert ex is not None, "Open the Humanoid example in the examples browser first"
+        assert ex._grasp_mode == "assisted", (
+            "This legacy replay requires assisted mode selected before LOAD. "
+            "Use tools/validate_contact_grasp_live.py for default physical grasping."
+        )
         if reload_example:
             await ex.clear_async()
             await ex.load_world_async()

@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
-from humanoid_test_support import CARB, G1, HUMANOID, USD
+from humanoid_test_support import CARB, G1, HUMANOID, USD, Array
 from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics
 
 
@@ -107,6 +107,10 @@ class TestStationaryInputs(unittest.TestCase):
         example._physics_ready = True
         example.g1 = types.SimpleNamespace(robot=Mock(), forward=Mock())
         example.g1.robot.is_physics_tensor_entity_valid.return_value = True
+        example.g1.robot.dof_names = ["waist_yaw_joint"]
+        example.g1.robot.get_dof_limits.return_value = (Array([[-1.0]]), Array([[1.0]]))
+        example.g1.robot.get_dof_positions.return_value = Array([[0.0]])
+        example.g1.robot.get_dof_velocities.return_value = Array([[0.0]])
         example._base_command = torch.ones(3)
         example._keyboard_command = torch.ones(3)
         example._controller_command = torch.ones(3)
@@ -132,6 +136,7 @@ class TestStationaryInputs(unittest.TestCase):
     def test_stationary_xr_still_handles_drop_recenter_and_camera_once_per_press(self):
         example = HUMANOID.HumanoidExample()
         example._get_xr_input_device = lambda handle: handle
+        example._get_hand_input_kind = Mock(return_value="controller")
         example._log_xr_input_status_once = Mock()
         example._get_xr_stick_axis = lambda device, axis: 1.0
         example._get_xr_gesture_value = lambda device, name, gesture: 1.0
@@ -145,6 +150,42 @@ class TestStationaryInputs(unittest.TestCase):
         example._request_xr_recenter.assert_called_once()
         example._drop_everything.assert_called_once()
         example._cycle_xr_camera_mode.assert_called_once()
+
+    def test_optical_y_action_cannot_drop_but_controller_y_still_uses_press_edges(self):
+        example = HUMANOID.HumanoidExample()
+        self.assertEqual(example._grasp_mode, "physical")
+        example._get_xr_input_device = lambda handle: handle
+        example._get_hand_input_kind = Mock(return_value="hand_tracking")
+        example._log_xr_input_status_once = Mock()
+        example._get_xr_stick_axis = lambda device, axis: 0.0
+        example._get_xr_gesture_value = Mock(side_effect=lambda device, name, gesture: float(name == "y"))
+        example._get_xr_stick_click = lambda device: 0.0
+        example._request_xr_recenter = Mock()
+        example._drop_everything = Mock()
+        example._cycle_xr_camera_mode = Mock()
+
+        # A runtime may expose the old controller Y action on an optical hand.
+        # Neither that value nor an absent device may lock the fingers open.
+        for kind in ("hand_tracking", "none"):
+            example._get_hand_input_kind.return_value = kind
+            for _ in range(3):
+                self.assertEqual(example._read_xr_controller_axes(), (0.0, 0.0))
+            example._drop_everything.assert_not_called()
+            self.assertFalse(example._drop_button_down)
+
+        example._get_hand_input_kind.return_value = "controller"
+        for _ in range(3):
+            example._read_xr_controller_axes()
+        example._drop_everything.assert_called_once()
+        self.assertTrue(example._drop_button_down)
+        example._get_xr_gesture_value.side_effect = lambda device, name, gesture: 0.0
+        example._read_xr_controller_axes()
+        self.assertFalse(example._drop_button_down)
+        example._get_xr_gesture_value.side_effect = lambda device, name, gesture: float(name == "y")
+        example._read_xr_controller_axes()
+        self.assertEqual(example._drop_everything.call_count, 2)
+        example._request_xr_recenter.assert_not_called()
+        example._cycle_xr_camera_mode.assert_not_called()
 
     def test_keyboard_cannot_leave_motion_latched_in_stationary_mode(self):
         example = HUMANOID.HumanoidExample()

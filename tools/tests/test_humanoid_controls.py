@@ -163,6 +163,7 @@ class TestHumanoidControls(unittest.TestCase):
 
     def test_drop_cannot_regrab_while_trigger_is_still_held(self):
         ex = self.example
+        ex._grasp_mode = "assisted"  # Legacy fixed-joint option, explicitly enabled.
         ex._grabbed_objects_by_side["right"] = "/World/Box"
         ex._get_active_hand_world_position = Mock(return_value=Gf.Vec3d(0, 0, 1))
         ex._find_nearest_grabbable_object = Mock(return_value=(None, None))
@@ -177,6 +178,7 @@ class TestHumanoidControls(unittest.TestCase):
 
     def test_grasp_joint_preserves_world_attachment_frames(self):
         ex = self.example
+        ex._grasp_mode = "assisted"  # Physical mode must never create this joint.
         hand_matrix = pose((1, 2, 3), yaw=75)
         object_matrix = pose((1.05, 2.1, 3.02), yaw=-25)
         for path in ("/World/Hand", "/World/Box"):

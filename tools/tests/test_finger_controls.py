@@ -83,7 +83,13 @@ class TestFingerControls(unittest.TestCase):
         ex._xr_core = object()
         ex._get_xr_input_device = lambda handle: device
         ex._get_xr_gesture_value = Mock(return_value=0.0)
-        ex.g1 = types.SimpleNamespace(has_finger_control=lambda: True, set_finger_curls=Mock())
+        ex.g1 = types.SimpleNamespace(
+            has_finger_control=lambda: True,
+            set_finger_curls=Mock(),
+            get_finger_curls=lambda side: {role: 0.0 for role in (*ex._finger_roles, "thumb_yaw")},
+            get_finger_joint_range=lambda side, role: (0.0, 1.0),
+        )
+        ex._contact_reader = types.SimpleNamespace(read=lambda dt: ({"left": [], "right": []}, "ok"))
         ex._update_g1_fingers()
         device.positions = skeleton_positions(ex, {"index": 0.7})
         for _ in range(15):

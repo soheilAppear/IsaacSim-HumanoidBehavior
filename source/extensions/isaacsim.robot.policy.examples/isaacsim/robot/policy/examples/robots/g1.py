@@ -103,8 +103,9 @@ class G1TeleopRobot:
     #: around 0.05-0.19 stiffness with a 1 N·m effort cap, which models the real hand's
     #: weak actuators: commanded to close, the fingers stall around a fifth of their
     #: travel while the mimic couplings resist. Teleoperation needs the pose the operator
-    #: asked for, so the drives are stiffened here. Mimic joints are left untouched —
-    #: their motion comes from the coupling, and driving them fights it.
+    #: asked for, so the drives are stiffened here. This drive setup leaves passive
+    #: mimic joints undriven. The physical-grasp scene separately tunes their existing
+    #: compliant coupling before Play; adding drives would fight that coupling.
     FINGER_STIFFNESS = 20.0
     FINGER_DAMPING = 0.6
     FINGER_MAX_EFFORT = 10.0
@@ -1166,6 +1167,59 @@ class G1TeleopRobot:
         """Return whether any finger DOF was resolved on the articulation."""
         return any(self._finger_dof_indices.values())
 
+    def get_finger_joint_range(self, side: str, role: str) -> tuple[float, float] | None:
+        """Return the configured open/closed actuator angles in radians.
+
+        These are the same endpoints used by :meth:`set_finger_curls`, including
+        its margin before the hard stop. The closed angle can be lower than the
+        open angle for a Dex3 finger; callers must preserve that direction.
+        """
+        if role not in self._finger_dof_indices.get(side, {}):
+            return None
+        try:
+            open_angle, closed_angle = self._finger_open_closed.get(side, {})[role]
+            open_angle, closed_angle = float(open_angle), float(closed_angle)
+            if not all(math.isfinite(value) for value in (open_angle, closed_angle)):
+                return None
+            if abs(closed_angle - open_angle) <= 1e-8:
+                return None
+            return open_angle, closed_angle
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def get_finger_curls(self, side: str) -> dict[str, float]:
+        """Measure normalized finger actuator positions from one live joint read.
+
+        Values use the command ranges and are clamped to ``[0, 1]`` if contact
+        pushes a joint outside that range. Missing/invalid measurements are omitted;
+        unavailable physics returns an empty dictionary. Commanded targets are never
+        substituted for actual motion or inferred for mimic joints.
+        """
+        roles = self._finger_dof_indices.get(side, {})
+        ranges = {role: value for role in roles if (value := self.get_finger_joint_range(side, role)) is not None}
+        if not ranges:
+            return {}
+        try:
+            if not self.robot.is_physics_tensor_entity_valid():
+                return {}
+            # Experimental Articulation returns a Warp array. Its numpy() method
+            # copies a GPU observation to the host, as used by initialization above.
+            positions = np.asarray(self.robot.get_dof_positions().numpy(), dtype=float)
+            if positions.ndim != 2 or positions.shape[0] != 1:
+                return {}
+            positions = positions[0]
+        except Exception:
+            return {}
+        measured = {}
+        for role, (open_angle, closed_angle) in ranges.items():
+            index = roles[role]
+            if not isinstance(index, (int, np.integer)) or index < 0 or index >= len(positions):
+                continue
+            angle = float(positions[index])
+            if math.isfinite(angle):
+                measured[role] = min(1.0, max(0.0, (angle - open_angle) / (closed_angle - open_angle)))
+        return measured
+
     def set_finger_curls(self, side: str, curls: dict[str, float]) -> None:
         """Drive one hand's fingers from normalized curl values.
 
@@ -1254,7 +1308,7 @@ class G1TeleopRobot:
                 carb.log_warn(f"G1TeleopRobot: could not set walking gains for {indices}: {e}")
 
     def _apply_articulation_properties(self) -> None:
-        """Apply solver settings suited to a 200 Hz teleoperation session."""
+        """Apply the robot's solver and collision settings without changing the timestep."""
         try:
             self.robot.set_solver_iteration_counts(position_counts=[16], velocity_counts=[1])
             self.robot.set_enabled_self_collisions([False])

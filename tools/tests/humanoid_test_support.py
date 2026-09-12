@@ -103,6 +103,9 @@ def load_source(relative_path, **extra):
 
 POSE = load_source("interactive/humanoid/xr_pose.py")
 HIGHLIGHTS = load_source("interactive/humanoid/material_highlights.py")
+GRASP = load_source("interactive/humanoid/grasp_controller.py")
+HEALTH = load_source("interactive/humanoid/articulation_health.py")
+ARM_CONTACT = load_source("interactive/humanoid/arm_contact.py")
 GAZE = load_source(
     "interactive/humanoid/eye_gaze_tracker.py",
     read_world_pose=POSE.read_world_pose,
@@ -113,6 +116,9 @@ HUMANOID = load_source(
     read_world_pose=POSE.read_world_pose,
     smoothing_alpha=POSE.smoothing_alpha,
     MaterialHighlights=HIGHLIGHTS.MaterialHighlights,
+    ContactGraspController=GRASP.ContactGraspController,
+    find_articulation_fault=HEALTH.find_articulation_fault,
+    project_contact_step=ARM_CONTACT.project_contact_step,
 )
 G1 = load_source("robots/g1.py", get_physics_simulation_interface=Mock())
 

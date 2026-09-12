@@ -32,6 +32,9 @@ from isaacsim.core.deprecation_manager import import_module
 from isaacsim.core.simulation_manager import SimulationManager
 from isaacsim.core.simulation_manager.impl.isaac_events import IsaacEvents
 from isaacsim.examples.base.base_sample_experimental import BaseSample
+from isaacsim.robot.policy.examples.interactive.humanoid.arm_contact import project_contact_step
+from isaacsim.robot.policy.examples.interactive.humanoid.articulation_health import find_articulation_fault
+from isaacsim.robot.policy.examples.interactive.humanoid.grasp_controller import ContactGraspController
 from isaacsim.robot.policy.examples.interactive.humanoid.material_highlights import MaterialHighlights
 from isaacsim.robot.policy.examples.interactive.humanoid.xr_pose import read_world_pose, smoothing_alpha
 from isaacsim.robot.policy.examples.interactive.utils import (
@@ -148,6 +151,9 @@ class HumanoidExample(BaseSample):
 
         self._base_command = None
         self._physics_ready = False
+        self._articulation_health_fault = None
+        self._articulation_health_limits = None
+        self._articulation_health_names = None
         self.g1 = None
         self._physics_callback_id = None
         self._event_timer_callback = None
@@ -218,6 +224,9 @@ class HumanoidExample(BaseSample):
         self._head_camera_mount_local = None
         self._head_camera_mount_prim = None
         self._head_camera_update_sub = None
+        self._head_camera_operator_rotation_enabled = True
+        self._head_camera_operator_neutral_rotation = None
+        self._head_camera_operator_delta_rotation = None
         self._physics_step_error_logged = set()  # (subsystem, error) pairs already warned about
         # Camera geometry, re-tuned for the G1: it stands 1.32 m tall against the H1's
         # 1.80 m, so every offset that was measured against the H1 skull had to shrink.
@@ -230,9 +239,9 @@ class HumanoidExample(BaseSample):
         self._head_camera_yaw_sign = 1.0  # flip to -1.0 only if the DESKTOP view turns opposite
         # to the robot; the in-VR reversal was caused by
         # per-step camera forcing, fixed by the XR anchor below
-        # The stationary manipulation view is a rigid robot-mounted camera. The
+        # The stationary view turns with the HMD at a robot-mounted eye position. The
         # remaining modes are retained for later experiments with a moving robot.
-        #   "robot_head"    - fixed camera-to-head mount; ignores physical HMD motion.
+        #   "robot_head"    - robot-mounted position; relative HMD rotation only.
         #   "camera_lock"   - schedule_set_camera(robot head pose) every step. Follows
         #                     the robot but cancels the user's own head rotation.
         #   "custom_anchor" - XR custom-anchor prim. Natural head tracking, but this
@@ -436,6 +445,7 @@ class HumanoidExample(BaseSample):
         self._robot_palm_local_frames = {}
         self._robot_palm_local_centers = {}
         self._arm_input_sources = {}
+        self._inactive_arm_hold_targets = {}
         self._arm_ik_link_index = {}  # side -> articulation link index of the hand
         self._arm_ik_logged = False
         self._arm_smoothing = 0.34
@@ -448,6 +458,26 @@ class HumanoidExample(BaseSample):
         self._grab_radius = 0.18  # m: object-centre search around the measured palm/fingers
         # This centre-distance gate is assistance, not a collision/contact test.
         self._grasp_contact_distance = 0.09  # m: nearest palm/finger link centre to object centre
+        # Physical mode never attaches an object. Select assisted explicitly before
+        # loading to reproduce the previous distance-gated fixed-joint experiment.
+        self._grasp_mode = "physical"
+        self._contact_reader = None
+        self._contact_health = "not_prepared"
+        self._physical_grasp_controllers = {side: ContactGraspController() for side in ("left", "right")}
+        self._physical_grasp_results = {}
+        self._latest_hand_contacts = {"left": [], "right": []}
+        self._arm_contact_limited = {}
+        self._physical_hand_mimic_joint_paths = []
+        self._physical_hand_armature_joint_values = {}
+        self._applied_finger_curls = {}
+        self._finger_contact_lead_rad = 0.18  # bounded preload for compliant fingers; not operator pressure
+        # Finite, critically damped coupling yields to hard table contact. Rigid
+        # mimics passed simple pickups but caused whole-articulation divergence.
+        self._finger_mimic_natural_frequency = 500.0  # rad/s; simulation tuning, not measured motor data
+        self._finger_mimic_damping_ratio = 1.0
+        # Artificial joint-space inertia stabilizes driven and passive knuckles.
+        # This is numerical stabilization, not a calibrated motor/rotor inertia.
+        self._finger_joint_armature = 1e-4  # kg m^2 minimum, applied before Play
         self._grasp_link_prims = {}  # side -> [RigidPrim] palm and finger links
         self._grasp_joint_root = "/World/G1_GraspJoints"
         self._grasp_joints_by_side = {}  # side -> fixed joint holding an object
@@ -466,13 +496,17 @@ class HumanoidExample(BaseSample):
         self._grab_requires_release = {}  # inhibit re-grasp after drop or tracking loss
         self._hand_closed_by_side = {}
         self._arm_rig_root_path = "/World/G1_ArmControlRig"
+        # Debug targets can obscure the fingers during pickup. Keep tracking the
+        # target transforms, but render their spheres only when explicitly enabled.
+        self._arm_rig_markers_enabled = False
         self._arm_rig_target_paths = {
             "left": f"{self._arm_rig_root_path}/LeftHandTarget",
             "right": f"{self._arm_rig_root_path}/RightHandTarget",
         }
         self._arm_rig_target_ops = {}
         self._sample_box_root_path = "/World/G1_SampleBoxes"
-        self._sample_box_count = 10
+        self._sample_box_count = 10  # configured historical assisted-scene count
+        self._spawned_sample_box_paths = []  # actual roots in the current fixture
         self._sample_box_seed = 12
         self._sample_box_density = 5.0
         self._sample_box_min_mass = 0.45
@@ -716,6 +750,10 @@ class HumanoidExample(BaseSample):
         their geometry, because three other systems key off them: the grab search, the
         ``object_states.csv`` logger, and the eye tracker's highlight filter.
         """
+        self._spawned_sample_box_paths = []
+        if self._grasp_mode == "physical":
+            self._create_contact_grasp_objects()
+            return
         stage = omni.usd.get_context().get_stage()
         UsdGeom.Xform.Define(stage, self._sample_box_root_path)
         rng = random.Random(self._sample_box_seed)
@@ -747,6 +785,7 @@ class HumanoidExample(BaseSample):
             # Logged so the dataset distinguishes a package the robot could actually
             # reach from one deliberately left out of reach on the floor.
             prim.CreateAttribute("g1:packageOnSurface", Sdf.ValueTypeNames.Bool).Set(bool(on_surface))
+            self._spawned_sample_box_paths.append(box_path)
 
         on_surface_count = sum(1 for slot in slots if slot[3])
         carb.log_info(
@@ -755,6 +794,161 @@ class HumanoidExample(BaseSample):
             f"{on_surface_count} within reach on work surfaces, "
             f"{self._sample_box_count - on_surface_count} on the floor (unreachable by design)"
         )
+
+    def _create_contact_grasp_objects(self) -> None:
+        """Place six light practice shapes on the nearest work surface.
+
+        Keep the existing object roots so gaze selection and recordings see the
+        same object namespace. Two staggered rows offer round, tapered, tall, and
+        flat objects within the stationary robot's measured forward reach.
+        Low masses let the operator practice without a stronger grip drive.
+        Dimensions and masses are not calibrated models of real grip capacity.
+        """
+        from pxr import PhysxSchema
+
+        stage = omni.usd.get_context().get_stage()
+        surfaces = self._get_work_surface_tops()
+        if not surfaces:
+            raise RuntimeError("Physical grasp objects require the front work table")
+        center_x, center_y, _, top_z, _, _ = surfaces[0]
+        UsdGeom.Xform.Define(stage, self._sample_box_root_path)
+        # Shape, XYZ dimensions (m), mass (kg), color, and XY offset from the
+        # table center. The old back row at X=0.54 exceeded the measured ~0.49 m
+        # forward palm reach. Keep centers at X=0.345..0.465, staggered laterally
+        # for finger clearance, rather than forcing joints or stretching the asset.
+        objects = (
+            ("cube", (0.06, 0.06, 0.06), 0.06, (0.15, 0.55, 0.9), (-0.155, 0.14)),
+            ("cylinder", (0.06, 0.06, 0.10), 0.08, (0.95, 0.55, 0.1), (-0.155, -0.08)),
+            ("sphere", (0.07, 0.07, 0.07), 0.05, (0.2, 0.75, 0.35), (-0.155, 0.38)),
+            ("cylinder", (0.04, 0.04, 0.14), 0.06, (0.65, 0.3, 0.85), (-0.035, 0.38)),
+            ("cube", (0.09, 0.06, 0.03), 0.07, (0.95, 0.8, 0.15), (-0.035, 0.215)),
+            ("cone", (0.07, 0.07, 0.10), 0.05, (0.9, 0.25, 0.2), (-0.045, 0.035)),
+        )
+        for index, (kind, dimensions, mass, color, offset) in enumerate(objects):
+            width, depth, height = dimensions
+            path = f"{self._sample_box_root_path}/Box_{index:02d}"
+            if kind == "cube":
+                shape = UsdGeom.Cube.Define(stage, path)
+                shape.CreateSizeAttr(width)
+                # Cube extents stay in local coordinates; a nonuniform scale
+                # gives the flat block matching visual and collision dimensions.
+                half_extent = Gf.Vec3f(width / 2)
+            elif kind == "sphere":
+                shape = UsdGeom.Sphere.Define(stage, path)
+                shape.CreateRadiusAttr(width / 2)
+                half_extent = Gf.Vec3f(width / 2)
+            else:
+                schema = UsdGeom.Cone if kind == "cone" else UsdGeom.Cylinder
+                shape = schema.Define(stage, path)
+                shape.CreateRadiusAttr(width / 2)
+                shape.CreateHeightAttr(height)
+                shape.CreateAxisAttr("Z")
+                half_extent = Gf.Vec3f(width / 2, depth / 2, height / 2)
+            # Author matching bounds for USD consumers that use the extent
+            # attribute directly instead of recomputing it from analytic size.
+            shape.CreateExtentAttr([-half_extent, half_extent])
+            shape.AddTranslateOp().Set(Gf.Vec3d(center_x + offset[0], center_y + offset[1], top_z + height / 2 + 0.003))
+            if kind == "cube" and (depth != width or height != width):
+                shape.AddScaleOp().Set(Gf.Vec3f(1.0, depth / width, height / width))
+            shape.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+            prim = shape.GetPrim()
+            UsdPhysics.CollisionAPI.Apply(prim)
+            UsdPhysics.RigidBodyAPI.Apply(prim)
+            UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(mass)
+            collision = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+            collision.CreateContactOffsetAttr(0.002)
+            collision.CreateRestOffsetAttr(0.0)
+            body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+            body.CreateSolverPositionIterationCountAttr(16)
+            body.CreateSolverVelocityIterationCountAttr(4)
+            # Sleeping bodies stop reporting forces even when supported. Keep
+            # these instrumented props awake so static holds remain observable.
+            body.CreateSleepThresholdAttr(0.0)
+            prim.CreateAttribute("g1:packageSize", Sdf.ValueTypeNames.Float).Set(max(dimensions))
+            prim.CreateAttribute("g1:packageDimensions", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(*dimensions))
+            prim.CreateAttribute("g1:packageMass", Sdf.ValueTypeNames.Float).Set(mass)
+            prim.CreateAttribute("g1:packageOnSurface", Sdf.ValueTypeNames.Bool).Set(True)
+            self._spawned_sample_box_paths.append(path)
+
+    def _prepare_physical_grasping(self) -> None:
+        """Author hand contact reports and physics materials before Play."""
+        if self._grasp_mode != "physical":
+            return
+        if self._g1_hand_variant.lower() != "inspire":
+            raise ValueError("Physical grasping currently requires Inspire hands; use assisted mode for ThreeFinger")
+        from isaacsim.robot.policy.examples.interactive.humanoid.grasp_contacts import ContactReader
+
+        stage = omni.usd.get_context().get_stage()
+        roots = self._spawned_sample_box_paths
+        self._contact_reader = ContactReader()
+        self._contact_reader.prepare(stage, self._g1_prim_path, roots)
+        self._prepare_physical_hand_couplings(stage)
+        material = UsdShade.Material.Define(stage, "/World/G1_ContactMaterial")
+        physics_material = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+        physics_material.CreateStaticFrictionAttr(0.8)
+        physics_material.CreateDynamicFrictionAttr(0.6)
+        physics_material.CreateRestitutionAttr(0.0)
+        # Bind only the physics purpose. The eye tracker's visual bindings retain
+        # their own material and precedence.
+        for path in (*self._contact_reader.sensor_paths, *roots):
+            prim = stage.GetPrimAtPath(path)
+            UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                material, bindingStrength=UsdShade.Tokens.strongerThanDescendants, materialPurpose="physics"
+            )
+        self._contact_health = "physics_not_ready"
+
+    def _prepare_physical_hand_couplings(self, stage) -> None:
+        """Keep Inspire's passive knuckles coupled under load, before Play.
+
+        The asset's compliant mimic springs can bend backward while the driven
+        proximal joint closes, losing the grasp despite a valid motor target.
+        Finite, critically damped coupling retains the existing relationship while
+        allowing yield against a hard collider. Zero-frequency rigid coupling
+        caused runaway finger velocities on table contact. No drive is added to
+        a passive joint and no object is attached. Gearing, reference joints,
+        limits, and existing drives stay authored. An artificial armature floor
+        also reduces abrupt acceleration of very light driven and passive finger links;
+        it is numerical stabilization, not a calibrated motor inertia. Existing
+        larger armatures are preserved and passive joints receive no velocity cap.
+        """
+        self._physical_hand_mimic_joint_paths = []
+        self._physical_hand_armature_joint_values = {}
+        if self._grasp_mode != "physical" or self._g1_hand_variant.lower() != "inspire":
+            return
+        from pxr import PhysxSchema
+
+        armature_floor = float(self._finger_joint_armature)
+        if not math.isfinite(armature_floor) or armature_floor < 0.0:
+            raise ValueError("Finger joint armature must be a finite, nonnegative inertia in kg m^2")
+        for side in ("left", "right"):
+            hand = stage.GetPrimAtPath(f"{self._g1_prim_path}/{side}_hand")
+            if not hand.IsValid():
+                raise ValueError(f"Missing {side} Inspire hand for physical mimic preparation")
+            for prim in Usd.PrimRange(hand):
+                if not prim.IsA(UsdPhysics.Joint):
+                    continue
+                couplings = PhysxSchema.PhysxMimicJointAPI.GetAll(prim)
+                for coupling in couplings:
+                    coupling.CreateNaturalFrequencyAttr(self._finger_mimic_natural_frequency)
+                    coupling.CreateDampingRatioAttr(self._finger_mimic_damping_ratio)
+                if couplings:
+                    self._physical_hand_mimic_joint_paths.append(str(prim.GetPath()))
+                if not prim.IsA(UsdPhysics.RevoluteJoint):
+                    continue
+                joint_api = PhysxSchema.PhysxJointAPI.Apply(prim)
+                armature = max(armature_floor, float(joint_api.GetArmatureAttr().Get()))
+                joint_api.CreateArmatureAttr(armature)
+                armature = float(joint_api.GetArmatureAttr().Get())
+                # Isaac 6.1's codeless per-axis schema takes precedence over the
+                # legacy joint schema. Honor it when present, without adding an
+                # axis API whose other defaults could alter authored velocity caps.
+                axis = "rot" + str(UsdPhysics.RevoluteJoint(prim).GetAxisAttr().Get())
+                if f"PhysxJointAxisAPI:{axis}" in prim.GetAppliedSchemas():
+                    axis_armature = prim.GetAttribute(f"physxJointAxis:{axis}:armature")
+                    armature = max(armature_floor, float(axis_armature.Get()))
+                    axis_armature.Set(armature)
+                    armature = float(axis_armature.Get())
+                self._physical_hand_armature_joint_values[str(prim.GetPath())] = armature
 
     def _build_package_slots(self, rng: random.Random) -> list[tuple[float, float, float, bool]]:
         """Decide where every package spawns: ``(x, y, z, on_surface)`` per package.
@@ -989,7 +1183,7 @@ class HumanoidExample(BaseSample):
             return 0.4
 
     def _create_arm_control_rig(self) -> None:
-        """Create visible controller target markers and hand meshes used as the G1 arm-control rig."""
+        """Create arm target transforms with optional, hidden-by-default debug spheres."""
         stage = omni.usd.get_context().get_stage()
         UsdGeom.Xform.Define(stage, self._arm_rig_root_path)
         colors = {"left": Gf.Vec3f(0.1, 0.55, 1.0), "right": Gf.Vec3f(1.0, 0.25, 0.15)}
@@ -1013,7 +1207,7 @@ class HumanoidExample(BaseSample):
             self._arm_rig_target_ops[side] = target.AddTransformOp()
 
             marker = UsdGeom.Sphere.Define(stage, f"{path}/TargetMarker")
-            marker.CreateRadiusAttr(0.08)
+            marker.CreateRadiusAttr(0.01)  # 1 cm radius when debug markers are enabled
             marker.CreateDisplayColorAttr().Set([colors[side]])
             UsdGeom.Imageable(marker.GetPrim()).MakeInvisible()
 
@@ -1045,12 +1239,33 @@ class HumanoidExample(BaseSample):
             distant_xform.ClearXformOpOrder()
             distant_xform.AddRotateXYZOp().Set(Gf.Vec3f(-45.0, 0.0, 35.0))
 
+    async def load_world_async(self) -> None:
+        """Release camera stage handles before the base class replaces the stage."""
+        # BaseSample creates the new stage before invoking scene cleanup. Detach
+        # first so application frames during that await cannot use the old stage.
+        self._head_camera_update_sub = None
+        self._head_camera_transform_op = None
+        self._head_camera_mount_prim = None
+        self._reset_operator_head_rotation()
+        await super().load_world_async()
+
+    async def clear_async(self) -> None:
+        """Detach the frame callback before asynchronous stage destruction starts."""
+        self._head_camera_update_sub = None
+        # Also make an already queued frame callback return before using USD or
+        # physics handles. Normal loading recreates these before subscribing again.
+        self._head_camera_transform_op = None
+        self._head_camera_mount_prim = None
+        self._reset_operator_head_rotation()
+        await super().clear_async()
+
     def setup_scene(self):
         """Set up the scene with robot and environment."""
         # Snapshot prior physics device/fabric state so cleanup can restore it.
         self._prev_physics_sim_device, self._prev_fabric_enabled = snapshot_physics_simulation_state()
 
-        # Set device and backend BEFORE creating robot so it uses GPU
+        # Select the configured backend/device before creating robot tensor views.
+        # The stationary VR configuration currently uses CPU physics.
         SimulationManager.set_backend(self._world_settings["backend"])
         SimulationManager.set_physics_sim_device(self._world_settings["device"])
         SimulationManager.get_available_physics_engines(verbose=True)
@@ -1066,7 +1281,7 @@ class HumanoidExample(BaseSample):
         # builds tensor views. Runtime highlighting changes only relationships.
         self._material_highlights.prepare(
             omni.usd.get_context().get_stage(),
-            [f"{self._sample_box_root_path}/Box_{index:02d}" for index in range(self._sample_box_count)],
+            self._spawned_sample_box_paths,
         )
 
         # Create the Unitree G1 with dexterous hands. Isaac Sim ships no G1 locomotion
@@ -1079,6 +1294,7 @@ class HumanoidExample(BaseSample):
             hand_variant=self._g1_hand_variant,
             locomotion=self._g1_locomotion,
         )
+        self._prepare_physical_grasping()
         self._create_arm_control_rig()
         self._create_head_camera()
         self._create_xr_anchor()
@@ -1121,6 +1337,7 @@ class HumanoidExample(BaseSample):
         self._xr_head_device_handle = None
         self._xr_last_head_pose = None
         self._xr_head_pose_age = 0
+        self._reset_operator_head_rotation()
         self._xr_convention = None
         self._xr_convention_index = 0
         self._xr_convention_errors = {}
@@ -1237,12 +1454,19 @@ class HumanoidExample(BaseSample):
             return
         if not math.isfinite(dt) or dt <= 0.0:
             return
+        if self._articulation_health_fault is not None:
+            self._pause_faulted_articulation()
+            return
 
         # Check if physics tensors are valid, if not, reinitialize
         if not self.g1.robot.is_physics_tensor_entity_valid():
             self._physics_ready = False
 
         if self._physics_ready:
+            # A finite but exploded articulation can otherwise keep producing IK,
+            # camera, and recording updates without throwing a Python exception.
+            if not self._check_articulation_health():
+                return
             # Robot is initialized: advance the base and hold the posture, then let the
             # teleoperation layer below override the arm and finger DOFs it owns.
             self._last_physics_dt = float(dt)
@@ -1300,8 +1524,58 @@ class HumanoidExample(BaseSample):
             self._update_head_camera_view(force=True, dt=dt)
             self._physics_ready = True
 
+    def _pause_faulted_articulation(self) -> None:
+        """Pause invalid physics; pressing Play alone must not bypass the latch."""
+        try:
+            timeline = import_module("omni.timeline").get_timeline_interface()
+            if timeline.is_playing():
+                timeline.pause()
+        except Exception as error:
+            self._log_physics_step_error("articulation fault pause", error)
+
+    def _check_articulation_health(self) -> bool:
+        """Latch a solver-state failure before using the completed physics step."""
+        try:
+            if self._articulation_health_limits is None:
+                lower, upper = self.g1.robot.get_dof_limits()
+                lower = self._first_pose_value(lower)
+                upper = self._first_pose_value(upper)
+                self._articulation_health_limits = list(zip(lower, upper))
+                self._articulation_health_names = [str(name) for name in self.g1.robot.dof_names]
+            reason = find_articulation_fault(
+                self._articulation_health_names,
+                self._first_pose_value(self.g1.robot.get_dof_positions()),
+                self._first_pose_value(self.g1.robot.get_dof_velocities()),
+                self._articulation_health_limits,
+            )
+        except Exception as error:
+            reason = f"could not read articulation state: {type(error).__name__}: {error}"
+        if reason is None:
+            return True
+        self._articulation_health_fault = reason
+        self._log_physics_step_error(
+            "articulation state",
+            RuntimeError(
+                f"{reason}. Simulation paused. Use this example's Reset or Load to rebuild the scene before continuing. "
+                "Timeline Stop/Play does not clear this fault."
+            ),
+        )
+        self._pause_faulted_articulation()
+        return False
+
     def _reset_teleoperation_state(self) -> None:
         """Release constraints and discard input, calibration, and cached physics handles."""
+        self._articulation_health_fault = None
+        self._articulation_health_limits = None
+        self._articulation_health_names = None
+        if self._contact_reader is not None:
+            self._contact_reader.invalidate()
+        self._physical_grasp_results.clear()
+        self._latest_hand_contacts = {"left": [], "right": []}
+        self._arm_contact_limited.clear()
+        self._applied_finger_curls.clear()
+        for controller in self._physical_grasp_controllers.values():
+            controller.reset()
         for side in ("left", "right"):
             self._release_grabbed_object(side)
             self._set_grab_candidate(side, None)
@@ -1323,6 +1597,7 @@ class HumanoidExample(BaseSample):
             self._robot_palm_local_frames,
             self._robot_palm_local_centers,
             self._arm_input_sources,
+            self._inactive_arm_hold_targets,
             self._smoothed_arm_targets,
             self._smoothed_arm_rig_targets,
             self._active_g1_hand_target_matrices,
@@ -1343,6 +1618,7 @@ class HumanoidExample(BaseSample):
         self._camera_filtered_base = None
         self._camera_filtered_yaw = None
         self._head_camera_mount_prim = None
+        self._reset_operator_head_rotation()
         self._xr_recenter_button_down = False
         self._xr_mode_button_down = False
         self._drop_button_down = False
@@ -1465,6 +1741,47 @@ class HumanoidExample(BaseSample):
             return None
         body_world = self._read_camera_mount_body_pose()
         return self._head_camera_mount_local * body_world if body_world is not None else None
+
+    def _reset_operator_head_rotation(self) -> None:
+        """Use the next valid headset orientation as forward without changing gaze calibration."""
+        self._head_camera_operator_neutral_rotation = None
+        self._head_camera_operator_delta_rotation = None
+
+    def _apply_operator_head_rotation(self, mounted_pose: Gf.Matrix4d) -> Gf.Matrix4d:
+        """Turn the view with the headset while retaining the exact mounted eye position.
+
+        OpenXR and USD cameras both look down local -Z with local +Y up. In Gf's
+        row-vector convention, ``head * neutral^-1`` is the rotation relative to
+        the operator's initial view, expressed in camera coordinates. Applying
+        it before the mount already converts those axes into the robot frame;
+        an additional Y-up/Z-up conversion would turn the view around wrong axes.
+
+        Only orientation is read: physical translation never moves the camera.
+        Losing tracking retains the last relative orientation while the mounted
+        position and body orientation continue following the simulated robot.
+        This camera motion does not add or actuate a neck joint in the G1 asset.
+        """
+        if not self._head_camera_operator_rotation_enabled:
+            return mounted_pose
+        head_pose = self._read_physical_head_pose()
+        if head_pose is not None:
+            rotation = head_pose.ExtractRotationMatrix()
+            if (
+                all(math.isfinite(rotation[row][column]) for row in range(3) for column in range(3))
+                and rotation.GetDeterminant() > 1e-6
+            ):
+                head_rotation = Gf.Matrix4d().SetRotate(head_pose.ExtractRotationQuat().GetNormalized())
+                if self._head_camera_operator_neutral_rotation is None:
+                    self._head_camera_operator_neutral_rotation = head_rotation
+                self._head_camera_operator_delta_rotation = (
+                    head_rotation * self._head_camera_operator_neutral_rotation.GetInverse()
+                )
+        if self._head_camera_operator_delta_rotation is None:
+            return mounted_pose
+        camera_pose = self._head_camera_operator_delta_rotation * mounted_pose
+        # Keep this invariant explicit even if the rotation representation changes.
+        camera_pose.SetTranslateOnly(mounted_pose.ExtractTranslation())
+        return camera_pose
 
     def _on_robot_camera_update(self, event: object) -> None:
         """Reassert the mounted XR view every application frame, including Pause."""
@@ -1973,10 +2290,11 @@ class HumanoidExample(BaseSample):
             print("[G1] Face the way you want to walk and press B to redo this.", flush=True)
 
     def _request_xr_recenter(self) -> None:
-        """Restore the fixed view, or recalibrate a legacy moving mode, on B."""
+        """Reset the operator's forward view, or recalibrate a legacy moving mode, on B."""
         if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
+            self._reset_operator_head_rotation()
             self._update_head_camera_view(force=True, dt=0.0)
-            self._log_xr_camera_state("view restored to the fixed robot head mount")
+            self._log_xr_camera_state("head view recentered; eye position remains on the robot head mount")
             return
         self._xr_calibrated = False
         self._xr_calibration_samples = []
@@ -2088,7 +2406,8 @@ class HumanoidExample(BaseSample):
     def _get_head_camera_pose(self, dt: float | None = None):
         """Compute a first-person camera pose from the G1 head/eye position."""
         if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
-            return self._get_robot_head_camera_pose()
+            mounted_pose = self._get_robot_head_camera_pose()
+            return self._apply_operator_head_rotation(mounted_pose) if mounted_pose is not None else None
         if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
 
@@ -2495,7 +2814,32 @@ class HumanoidExample(BaseSample):
             "robot_hand_variant": self._g1_hand_variant,
             "robot_locomotion_requested": self._g1_locomotion,
             "robot_locomotion": getattr(self.g1, "_locomotion", self._g1_locomotion),
-            "grasp_mode": "distance_gated_fixed_joint",
+            "grasp_mode": self._grasp_mode,
+            "grasp_contact_lead_rad": self._finger_contact_lead_rad,
+            "hand_mimic_coupling": "compliant" if self._grasp_mode == "physical" else "asset_authored",
+            "hand_mimic_natural_frequency_rad_s": (
+                self._finger_mimic_natural_frequency if self._grasp_mode == "physical" else None
+            ),
+            "hand_mimic_damping_ratio": self._finger_mimic_damping_ratio if self._grasp_mode == "physical" else None,
+            "hand_mimic_joint_paths": (
+                list(self._physical_hand_mimic_joint_paths) if self._grasp_mode == "physical" else []
+            ),
+            "hand_joint_armature_floor_kg_m2": (
+                self._finger_joint_armature if self._grasp_mode == "physical" else None
+            ),
+            "hand_joint_armature_kg_m2_by_path": (
+                dict(self._physical_hand_armature_joint_values) if self._grasp_mode == "physical" else {}
+            ),
+            "hand_joint_armature_meaning": (
+                "Artificial joint-space inertia for numerical stabilization; not calibrated motor/rotor inertia"
+                if self._grasp_mode == "physical"
+                else "asset_authored"
+            ),
+            "grasp_status_meaning": (
+                "contact_supported means sustained opposing contacts, not guaranteed hold; is_grabbed is false"
+                if self._grasp_mode == "physical"
+                else "is_grabbed means distance-gated fixed-joint attachment"
+            ),
             "base_fixed_to_world": self._g1_locomotion == "stationary",
             "station_hold_enabled": bool(self._g1_locomotion == "policy" and self.g1 and self.g1.STATION_HOLD_ENABLED),
             "turn_hold_enabled": bool(self._g1_locomotion == "policy" and self.g1 and self.g1.TURN_HOLD_ENABLED),
@@ -2915,16 +3259,22 @@ class HumanoidExample(BaseSample):
             "right_button_a": round(right_button_a, 6),
         }
 
-        # Per-finger curl actually sent to the robot's hands, 0 = open, 1 = closed, plus
-        # the source that produced it ("hand_tracking", "controller" or "none"). These
-        # are the finger columns the manipulation half of the dataset needs.
+        # Preserve the operator's smoothed request separately from the target
+        # limited by physical contact. Actual joint positions remain in behavior.csv.
         for side in ("left", "right"):
             curls = self._latest_finger_curls.get(side, {})
+            applied = self._applied_finger_curls.get(side, {})
             record[f"{side}_finger_source"] = self._finger_curl_source.get(side, "none")
             for role in (*self._finger_roles, "thumb_yaw"):
                 value = curls.get(role)
                 record[f"{side}_finger_{role}"] = round(float(value), 6) if value is not None else None
+                target = applied.get(role)
+                record[f"{side}_finger_target_{role}"] = round(float(target), 6) if target is not None else None
             record[f"{side}_hand_closure"] = round(self._get_hand_closure(side), 6)
+            result = self._physical_grasp_results.get(side)
+            record[f"{side}_contact_supported"] = int(bool(result and result.contact_supported))
+            record[f"{side}_contact_object"] = result.object_path if result else None
+            record[f"{side}_contact_mode"] = result.mode if result else None
 
         self._hand_tracking_records.append(record)
 
@@ -3050,6 +3400,19 @@ class HumanoidExample(BaseSample):
                     "vel_z": round(float(velocity[2]), 6),
                     "is_grabbed": int(path in grabbed_by_path),
                     "grabbed_by": grabbed_by_path.get(path),
+                    "grasp_mode": self._grasp_mode,
+                    "contact_supported": int(
+                        any(
+                            result.contact_supported and result.object_path == path
+                            for result in self._physical_grasp_results.values()
+                        )
+                    ),
+                    "contact_hand": "|".join(
+                        side
+                        for side, result in self._physical_grasp_results.items()
+                        if result.contact_supported and result.object_path == path
+                    ),
+                    "contact_health": self._contact_health if self._grasp_mode == "physical" else "not_used",
                 }
             )
 
@@ -3594,7 +3957,7 @@ class HumanoidExample(BaseSample):
         return anchor[1] * anchor[0].GetInverse() * hand_rotation * body_to_world
 
     def _set_arm_rig_target_visible(self, side: str, visible: bool) -> None:
-        """Show or hide one arm-control rig marker without hiding the hand mesh."""
+        """Show an active debug target only when enabled; never hide the robot hand."""
         stage = omni.usd.get_context().get_stage()
         if stage is None:
             return
@@ -3602,13 +3965,13 @@ class HumanoidExample(BaseSample):
         if not prim.IsValid():
             return
         imageable = UsdGeom.Imageable(prim)
-        if visible:
+        if visible and getattr(self, "_arm_rig_markers_enabled", False):
             imageable.MakeVisible()
         else:
             imageable.MakeInvisible()
 
     def _smooth_arm_rig_target(self, side: str, target_body: Gf.Vec3d) -> Gf.Vec3d:
-        """Smooth the visible arm-rig target in G1 body coordinates."""
+        """Smooth the arm-rig target in G1 body coordinates."""
         previous = self._smoothed_arm_rig_targets.get(side)
         if previous is None:
             self._smoothed_arm_rig_targets[side] = Gf.Vec3d(target_body)
@@ -3619,7 +3982,7 @@ class HumanoidExample(BaseSample):
         return smoothed
 
     def _update_arm_rig_target(self, side: str, target_body: Gf.Vec3d, base_position: Gf.Vec3d, yaw: float) -> None:
-        """Move the visible rig target marker to the desired hand target."""
+        """Update the desired hand transform and its optional debug marker."""
         target_op = self._arm_rig_target_ops.get(side)
         if target_op is None:
             return
@@ -3788,6 +4151,8 @@ class HumanoidExample(BaseSample):
 
     def _release_grabbed_object(self, side: str) -> None:
         """Release an object currently held by one hand."""
+        self._physical_grasp_controllers[side].reset()
+        self._physical_grasp_results.pop(side, None)
         object_path = self._grabbed_objects_by_side.pop(side, None)
         self._destroy_grasp_joint(side)
         if object_path is None:
@@ -3803,6 +4168,13 @@ class HumanoidExample(BaseSample):
                 a squeezed controller grip, or fingers curled past
                 ``_finger_grab_threshold`` when hand tracking is driving them.
         """
+        if self._grasp_mode == "physical":
+            # Contact evidence is a diagnostic only. Finger drives and the PhysX
+            # friction solver carry the object; neither proximity nor a fist
+            # creates a joint, teleports it, or prevents it from slipping.
+            result = self._physical_grasp_results.get(side)
+            self._set_grab_candidate(side, result.object_path if result else None)
+            return
         hand_position = self._get_active_hand_world_position(side)
 
         # Y/drop and tracking loss require a fresh open-then-close gesture. Otherwise
@@ -3980,6 +4352,8 @@ class HumanoidExample(BaseSample):
         into the wrist. This distance-gated fixed joint is grasp assistance, not a
         friction/contact-validated grasp, and recordings must be interpreted that way.
         """
+        if self._grasp_mode != "assisted":
+            return False
         stage = omni.usd.get_context().get_stage()
         hand_path = self._get_hand_link_path(side)
         if stage is None or hand_path is None:
@@ -4139,7 +4513,11 @@ class HumanoidExample(BaseSample):
         for side in ("left", "right"):
             self._release_grabbed_object(side)
             self._grab_requires_release[side] = True
-        if held:
+            if self._grasp_mode == "physical" and self.g1 is not None:
+                self.g1.set_finger_curls(side, {role: 0.0 for role in (*self._finger_roles, "thumb_yaw")})
+        if self._grasp_mode == "physical":
+            print("[G1] both hands commanded open; open your hand or release trigger to rearm", flush=True)
+        elif held:
             print(f"[G1] dropped {len(held)} held package(s)", flush=True)
         else:
             print("[G1] nothing was being held", flush=True)
@@ -4491,15 +4869,171 @@ class HumanoidExample(BaseSample):
             targets[dof_index] = smoothed
         return targets
 
+    def _limit_arm_targets_at_contacts(self, targets: dict[int, float], physics_snapshot: dict) -> dict[int, float]:
+        """Remove arm motion into scenery at the measured hand contact points.
+
+        Apply this after command smoothing so an older, blocked target cannot
+        reintroduce inward motion. Each contact's world normal is projected through
+        the arm Jacobian at that contact point, including wrist rotation. Tangential
+        motion and withdrawal remain available. Graspable props are excluded: their
+        contact load is controlled by the finger controller, and they must move.
+
+        This is a local linear motion constraint, not a collision-free path planner.
+        Compliant hand couplings still resolve contact between physics callbacks.
+        """
+        self._arm_contact_limited.clear()
+        if self._grasp_mode != "physical":
+            return targets
+        import numpy as np
+
+        limited = dict(targets)
+        if self._contact_health != "ok":
+            # An unavailable contact read is not evidence of free space. Hold
+            # every commanded arm joint until fresh contact observations return.
+            try:
+                measured = np.asarray(self._first_pose_value(self.g1.robot.get_dof_positions()), dtype=float)
+                if measured.ndim != 1 or not np.isfinite(measured).all():
+                    raise RuntimeError("Invalid measured arm state while contact observations are unavailable")
+                held = {index: float(measured[index]) for index in targets}
+            except Exception as error:
+                self._articulation_health_fault = f"Cannot hold arms without valid measurements: {error}"
+                self._log_physics_step_error("arm contact limit", error)
+                self._pause_faulted_articulation()
+                return {}
+            for side, joint_indices in self._g1_arm_dof_indices_by_side.items():
+                if any(index in held for index in joint_indices.values()):
+                    self._arm_contact_limited[side] = True
+            self._smoothed_arm_targets.update(held)
+            return held
+        for side in ("left", "right"):
+            # PhysX can already apply a predictive contact force at positive
+            # separation. Honor that load before the finger reaches the table;
+            # waiting for near-zero separation loses the first braking step.
+            contacts = [
+                contact
+                for contact in self._latest_hand_contacts.get(side, ())
+                if not contact.eligible_for_grasp
+                and not contact.object_path.startswith(self._g1_prim_path + "/")
+                and contact.normal_force_n >= 0.02
+            ]
+            indices = sorted(
+                index for index in self._g1_arm_dof_indices_by_side.get(side, {}).values() if index in targets
+            )
+            if not contacts or not indices:
+                continue
+            current = None
+            try:
+                if "arm_dof_positions" not in physics_snapshot:
+                    physics_snapshot["arm_dof_positions"] = self.g1.robot.get_dof_positions().numpy().reshape(-1)
+                current = np.asarray(physics_snapshot["arm_dof_positions"], dtype=float)[indices]
+                if "arm_jacobians" not in physics_snapshot:
+                    physics_snapshot["arm_jacobians"] = self.g1.robot.get_jacobian_matrices().numpy()
+                jacobians = physics_snapshot["arm_jacobians"]
+                link_index = self._get_arm_link_index(side)
+                if link_index is None:
+                    raise RuntimeError(f"Missing {side} arm contact Jacobian")
+                num_dofs = int(self.g1.robot.num_dofs)
+                column_offset = 6 if jacobians.shape[-1] == num_dofs + 6 else 0
+                row = link_index - (jacobians.shape[1] == int(self.g1.robot.num_links) - 1)
+                if row < 0 or jacobians.shape[-1] not in (num_dofs, num_dofs + 6):
+                    raise RuntimeError("Unexpected arm contact Jacobian layout")
+                matrix = np.asarray(jacobians[0, row], dtype=float)[:, [index + column_offset for index in indices]]
+                wrist = np.asarray(
+                    self._first_pose_value(self._get_hand_link_prim(side).get_world_poses()[0]), dtype=float
+                )
+                rows = []
+                for contact in contacts:
+                    offset = np.asarray(contact.point_world, dtype=float) - wrist
+                    point_jacobian = matrix[:3] + np.cross(matrix[3:6].T, offset).T
+                    rows.append(np.asarray(contact.normal_world, dtype=float) @ point_jacobian)
+                requested = np.asarray([targets[index] for index in indices]) - current
+                bounds = np.asarray([self._g1_arm_joint_limits.get(index, (-math.inf, math.inf)) for index in indices])
+                # Zero remains feasible even with small measured joint-limit overshoot;
+                # the projection must never command farther into a blocked surface.
+                lead = self._arm_max_tracking_error
+                lower = np.minimum(0.0, np.maximum(-lead, bounds[:, 0] - current))
+                upper = np.maximum(0.0, np.minimum(lead, bounds[:, 1] - current))
+                step = project_contact_step(requested, rows, lower, upper)
+                self._arm_contact_limited[side] = bool(np.max(np.abs(step - requested)) > 1e-8)
+                for index, angle in zip(indices, current + step):
+                    limited[index] = self._smoothed_arm_targets[index] = float(angle)
+            except Exception as error:
+                # A contact projection failure must not fall back to pushing through
+                # the obstacle. Hold the measured arm and surface the diagnostic.
+                self._log_physics_step_error("arm contact limit", error)
+                self._arm_contact_limited[side] = True
+                try:
+                    current = np.asarray(self._first_pose_value(self.g1.robot.get_dof_positions()), dtype=float)[
+                        indices
+                    ]
+                    if not np.all(np.isfinite(current)):
+                        raise RuntimeError("Invalid measured arm state during contact limiting")
+                except Exception as measurement_error:
+                    self._articulation_health_fault = f"Cannot hold contact-loaded arm: {measurement_error}"
+                    self._pause_faulted_articulation()
+                    return {}
+                for index, angle in zip(indices, current):
+                    limited[index] = self._smoothed_arm_targets[index] = float(angle)
+        return limited
+
+    def _get_inactive_arm_targets(self, side: str, physics_snapshot: dict) -> dict[int, float]:
+        """Hold the measured arm posture captured when its input becomes inactive.
+
+        Returning an untracked hand to rest can sweep it through the table. In
+        physical mode, capture a fixed joint target once and retain it until input
+        resumes or the scene resets. Do not recapture each tick: that would let the
+        arm droop under gravity. Finger opening and grasp release remain separate.
+        """
+        indices = self._g1_arm_dof_indices_by_side.get(side, {}).values()
+        if self._grasp_mode != "physical":
+            return {index: self._g1_arm_joint_defaults.get(index, 0.0) for index in indices}
+        if side not in self._inactive_arm_hold_targets:
+            try:
+                if "arm_dof_positions" not in physics_snapshot:
+                    physics_snapshot["arm_dof_positions"] = self._first_pose_value(self.g1.robot.get_dof_positions())
+                positions = physics_snapshot["arm_dof_positions"]
+                held = {index: float(positions[index]) for index in indices}
+                if not all(math.isfinite(value) for value in held.values()):
+                    raise RuntimeError(f"Invalid measured {side} arm state on input loss")
+                self._inactive_arm_hold_targets[side] = held
+                # Discard any remaining filtered command toward the table. The
+                # captured target starts at the actual pose, without a return path.
+                self._smoothed_arm_targets.update(held)
+            except Exception as error:
+                self._articulation_health_fault = f"Cannot hold inactive arm: {error}"
+                self._log_physics_step_error("inactive arm hold", error)
+                self._pause_faulted_articulation()
+                return {}
+        return dict(self._inactive_arm_hold_targets[side])
+
+    def _hold_inactive_arms(self) -> None:
+        """Stop both arms when XR input or the common arm reference is unavailable."""
+        targets = {}
+        snapshot = {}
+        for side in ("left", "right"):
+            self._deactivate_hand(side)
+            if self._grasp_mode == "physical":
+                targets.update(self._get_inactive_arm_targets(side, snapshot))
+        if not targets or self._articulation_health_fault is not None:
+            return
+        targets = self._smooth_and_clamp_arm_targets(targets)
+        targets = self._limit_arm_targets_at_contacts(targets, snapshot)
+        if targets:
+            indices = sorted(targets)
+            self.g1.robot.set_dof_position_targets([targets[index] for index in indices], dof_indices=indices)
+
     def _update_g1_arms_from_hand_tracking(self) -> None:
         """Override G1 arm DOF targets from Meta/OpenXR hand-tracking poses."""
-        if not self._hand_tracking_arm_control_enabled or self._xr_core is None or not self.g1:
+        if not self.g1:
             for side in ("left", "right"):
                 self._deactivate_hand(side)
             return
 
         self._configure_g1_arm_dofs()
         if not self._g1_arm_dofs_configured:
+            return
+        if not self._hand_tracking_arm_control_enabled or self._xr_core is None:
+            self._hold_inactive_arms()
             return
 
         left_xr = self._get_xr_input_device("/user/hand/left")
@@ -4508,8 +5042,7 @@ class HumanoidExample(BaseSample):
 
         base_pose = self._get_g1_base_pose_for_arms()
         if base_pose is None:
-            for side in ("left", "right"):
-                self._deactivate_hand(side)
+            self._hold_inactive_arms()
             return
         base_position, yaw = base_pose
 
@@ -4528,6 +5061,7 @@ class HumanoidExample(BaseSample):
             if hand_pose is None:
                 continue
             if self._arm_input_sources.get(side) != source:
+                self._inactive_arm_hold_targets.pop(side, None)
                 for index in self._g1_arm_dof_indices_by_side.get(side, {}).values():
                     self._smoothed_arm_targets.pop(index, None)
                 self._controller_arm_neutral_positions.pop(side, None)
@@ -4552,26 +5086,30 @@ class HumanoidExample(BaseSample):
         for side in ("left", "right"):
             if side not in active_sides:
                 self._deactivate_hand(side)
-                for index in self._g1_arm_dof_indices_by_side.get(side, {}).values():
-                    raw_targets[index] = self._g1_arm_joint_defaults.get(index, 0.0)
+                raw_targets.update(self._get_inactive_arm_targets(side, physics_snapshot))
 
-        if not raw_targets:
+        if not raw_targets or self._articulation_health_fault is not None:
             return
         targets = self._smooth_and_clamp_arm_targets(raw_targets)
+        targets = self._limit_arm_targets_at_contacts(targets, physics_snapshot)
+        if not targets:
+            return
         dof_indices = sorted(targets)
         self.g1.robot.set_dof_position_targets([targets[index] for index in dof_indices], dof_indices=dof_indices)
 
     def _deactivate_hand(self, side: str) -> None:
         """Release a lost input source and invalidate its clutch calibration."""
-        # Clear the active command once on tracking loss. Repeating this every
-        # inactive tick restarts the return-to-rest slew at the measured joint and
-        # prevents a position drive from building enough error to move promptly.
+        # Discard the moving command once when input disappears. Physical mode
+        # then holds a captured pose; assisted mode retains its return-to-rest slew.
         if side in self._arm_input_sources:
             for index in self._g1_arm_dof_indices_by_side.get(side, {}).values():
                 self._smoothed_arm_targets.pop(index, None)
         if self._grabbed_objects_by_side.get(side) is not None:
             self._grab_requires_release[side] = True
-        self._release_grabbed_object(side)
+        # Controller grip owns arm motion only. Valid finger input may still hold
+        # contact while the arm clutch is released; do not erase that evidence.
+        if self._grasp_mode != "physical" or self._finger_curl_source.get(side) not in ("hand_tracking", "controller"):
+            self._release_grabbed_object(side)
         self._set_grab_candidate(side, None)
         self._active_g1_hand_target_matrices.pop(side, None)
         self._smoothed_arm_rig_targets.pop(side, None)
@@ -4590,6 +5128,7 @@ class HumanoidExample(BaseSample):
         skeleton) and falls back to the controller's trigger. Thumb opposition has
         its own target. Curls are smoothed, sent to the robot, and recorded.
         """
+        self._latest_hand_contacts = {"left": [], "right": []}
         if not self._finger_control_enabled or not self.g1 or not self.g1.has_finger_control():
             return
         if self._xr_core is None:
@@ -4597,10 +5136,23 @@ class HumanoidExample(BaseSample):
             self._latest_finger_curls.clear()
             self._finger_curl_source.clear()
             self._smoothed_finger_curls.clear()
+            self._applied_finger_curls.clear()
             for side in ("left", "right"):
+                self._physical_grasp_controllers[side].reset()
+                self._physical_grasp_results.pop(side, None)
                 self.g1.set_finger_curls(side, {role: 0.0 for role in self._finger_roles})
             return
 
+        contacts = {"left": [], "right": []}
+        if self._grasp_mode == "physical":
+            if self._contact_reader is None:
+                self._contact_health = "not_prepared"
+            else:
+                contacts, self._contact_health = self._contact_reader.read(self._last_physics_dt)
+            if self._contact_health != "ok":
+                self._log_physics_step_error("hand contact reader", RuntimeError(self._contact_health))
+            else:
+                self._latest_hand_contacts = contacts
         for side in ("left", "right"):
             device = self._get_xr_input_device(f"/user/hand/{side}")
             curls = self._get_hand_tracking_finger_curls(device)
@@ -4614,10 +5166,83 @@ class HumanoidExample(BaseSample):
                 curls = {role: 0.0 for role in self._finger_roles}
                 source = "none"
 
+            # Check the current tracked digits before smoothing fills missing
+            # roles with zeros. An occluded finger is not evidence of an open hand.
+            release_requested = self._is_finger_release_requested(curls, source)
             curls = self._smooth_finger_curls(side, curls)
             self._latest_finger_curls[side] = curls
             self._finger_curl_source[side] = source
-            self.g1.set_finger_curls(side, curls)
+            applied = self._apply_physical_finger_contacts(
+                side, curls, contacts[side], source != "none", release_requested=release_requested
+            )
+            self._applied_finger_curls[side] = applied
+            self.g1.set_finger_curls(side, applied)
+
+    def _is_finger_release_requested(self, curls: dict[str, float], source: str) -> bool:
+        """Recognize a valid release without requiring a perfectly straight thumb.
+
+        Optical hands naturally retain some bend while open. Use the existing
+        optical release threshold on all four fingers; thumb flexion and opposition
+        do not veto that gesture. Controllers still require a released trigger.
+        Missing or invalid input must never clear an explicit drop latch.
+        """
+        if source == "hand_tracking":
+            roles = ("index", "middle", "ring", "little")
+            threshold = self._finger_release_threshold
+        elif source == "controller":
+            roles = self._finger_roles
+            threshold = 0.15
+        else:
+            return False
+        return all(role in curls and math.isfinite(curls[role]) and 0.0 <= curls[role] < threshold for role in roles)
+
+    def _apply_physical_finger_contacts(
+        self,
+        side: str,
+        curls: dict[str, float],
+        contacts: list,
+        input_valid: bool,
+        *,
+        release_requested: bool = False,
+    ) -> dict[str, float]:
+        """Limit closing travel at actual contact; opening always wins.
+
+        The position lead is in radians before normalization, so the short-travel
+        thumb and longer-travel fingers receive the same maximum drive error.
+        It bounds static position-drive effort, not measured fingertip pressure.
+        """
+        if self._grasp_mode != "physical":
+            return curls
+        measured = self.g1.get_finger_curls(side)
+        input_valid = (
+            input_valid
+            and self._contact_health == "ok"
+            and all(role in measured for role in (*self._finger_roles, "thumb_yaw"))
+        )
+        if self._grab_requires_release.get(side, False):
+            if input_valid and release_requested:
+                self._grab_requires_release[side] = False
+                # Do not replay a smoothed closed target on the release tick.
+                # Subsequent valid samples resume individual finger control.
+                self._smoothed_finger_curls.pop(side, None)
+                input_valid = False
+            else:
+                input_valid = False
+        leads = {}
+        for role in (*self._finger_roles, "thumb_yaw"):
+            bounds = self.g1.get_finger_joint_range(side, role)
+            span = abs(bounds[1] - bounds[0]) if bounds is not None else 0.0
+            leads[role] = min(1.0, self._finger_contact_lead_rad / span) if span > 1e-6 else 0.0
+        result = self._physical_grasp_controllers[side].update(
+            dt=self._last_physics_dt,
+            requested_curls=curls,
+            measured_curls=measured,
+            contacts=contacts,
+            closing_lead=leads,
+            input_valid=input_valid,
+        )
+        self._physical_grasp_results[side] = result
+        return result.curls
 
     def _smooth_finger_curls(self, side: str, curls: dict[str, float]) -> dict[str, float]:
         """Low-pass the per-finger curls so tracking jitter does not buzz the joints."""
@@ -4867,7 +5492,13 @@ class HumanoidExample(BaseSample):
             self._request_xr_recenter()
         self._xr_recenter_button_down = recenter_down
 
-        drop_down = self._get_xr_gesture_value(left_xr, "y", "click") >= 0.5
+        # Optical hand devices can retain/emulate controller button actions.
+        # Only a physical controller owns Y; a hand gesture must not lock both
+        # hands open. Keep recenter/camera handling independent and unchanged.
+        drop_down = (
+            self._get_hand_input_kind(left_xr) == "controller"
+            and self._get_xr_gesture_value(left_xr, "y", "click") >= 0.5
+        )
         if drop_down and not self._drop_button_down:
             self._drop_everything()
         self._drop_button_down = drop_down

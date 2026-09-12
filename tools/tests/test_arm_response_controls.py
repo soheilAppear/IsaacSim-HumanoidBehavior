@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Regress wall-time filtering and continuous return after hand tracking loss."""
+"""Regress wall-time filtering and the legacy assisted return after tracking loss."""
 
 from __future__ import annotations
 
@@ -60,8 +60,9 @@ class TestArmResponseControls(unittest.TestCase):
             self.assertLessEqual(target, ex._arm_max_tracking_error)
             previous = target
 
-    def test_repeated_tracking_loss_keeps_return_to_rest_command_progress(self) -> None:
+    def test_assisted_tracking_loss_keeps_return_to_rest_command_progress(self) -> None:
         ex = self.example
+        ex._grasp_mode = "assisted"
         ex.g1 = types.SimpleNamespace(robot=types.SimpleNamespace(get_dof_positions=lambda: Array([[0.0]])))
         ex._g1_arm_dof_indices_by_side = {"right": {"elbow": 0}}
         ex._g1_arm_joint_limits = {0: (-1.0, 1.0)}
