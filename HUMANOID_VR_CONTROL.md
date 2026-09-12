@@ -10,11 +10,11 @@ head. Optical hands control individual fingers and thumb opposition; Touch contr
 use grip for arm movement and trigger for pickup. Gaze retains the working implementation.
 
 **An open hand should be tracked immediately when valid optical data arrives.** A fist is
-only a pickup gesture, never an activation gesture. The reported behavior where real hand
-tracking appears only with a fist has **not been verified as resolved**. The simulator's
-finger control passes replay tests, but the headset must supply valid skeletal landmarks.
-Use the [real-hand observer](#real-hand-observation) to distinguish missing input from a
-robot-control problem.
+only a pickup gesture, never an activation gesture. On 12 September the user confirmed
+that starting SteamVR independently restored eye and bare-hand tracking. The subsequent
+working recording contains continuous optical-hand and eye-tracker samples over its last
+recorded minute. Palm alignment, arm bending, and response speed are now the focus;
+the new control changes still need a fresh live acceptance run.
 
 [Screenshots and videos](#screenshots-and-videos) ·
 [Installation](#installation) · [Running](#running) · [Controls](#controls) ·
@@ -87,8 +87,11 @@ GitHub readers.
 
 ### Prerequisites
 
-- Isaac Sim Standalone 6.0.0 and a compatible NVIDIA GPU/driver. Live validation for this
-  project used the Windows installation; Linux commands are included below.
+- Isaac Sim Standalone **6.1.0** and a compatible NVIDIA GPU/driver. The Windows launcher
+  now defaults to 6.1. The recorded 7 September live validation used 6.0.0; see the
+  [11 September 6.1 results](docs/validation/isaac-sim-6.1.md) for current software
+  checks and the later tracking recovery. Linux launch syntax is included below but has
+  not been validated for this project's Quest setup.
 - Isaac Sim's bundled Python 3.12 for the offline test runner and standalone simulation.
   The TCP utility commands use ordinary host Python.
 - For VR, a working OpenXR headset connection. Keep an already-working gaze runtime and
@@ -96,107 +99,92 @@ GitHub readers.
   uses SteamVR and Steam Link.
 - Access to the NVIDIA robot, warehouse, and YCB assets used by the example.
 
-Install the **complete** `isaacsim.robot.policy.examples` extension. Copying only
-`humanoid_example.py` omits the robot wrapper, helpers, registration, and startup settings.
-Save any open scene and close Isaac Sim before replacing an installed extension.
+Load the **complete** `isaacsim.robot.policy.examples` extension from this checkout.
+Copying only `humanoid_example.py` omits the robot wrapper, helpers, registration, and
+startup settings. Isaac Sim 6.1 bundles a newer policy-extension API, so merging individual
+project files into that installed package can also cause import errors.
 
-### Option A — Copy the extension
+### Windows launcher
 
-Keep a backup of the installed extension. Run from this repository's root.
+The repository launcher loads this extension directly with `--ext-path` and selects
+its version, `isaacsim.robot.policy.examples-5.2.11`. The standalone installation's
+bundled files remain intact; no copy or junction is needed.
+
+Its default installation directory is:
+
+```text
+C:\Users\Soheil\Downloads\isaac-sim-standalone-6.1.0-windows-x86_64
+```
+
+For another installation, set an environment override before launching from the
+repository root. It applies to this PowerShell session and does not edit the launcher:
 
 ```powershell
-$isaacRoot = "C:/path/to/isaac-sim-standalone-6.0.0-windows-x86_64"
-$sourceExt = "source/extensions/isaacsim.robot.policy.examples"
-$installedExt = Join-Path $isaacRoot "exts/isaacsim.robot.policy.examples"
-Copy-Item -Path "$sourceExt/*" -Destination $installedExt -Recurse -Force
+$env:ISAAC_DIR = "C:\path\to\isaac-sim-standalone-6.1.0-windows-x86_64"
+.\tools\launch_isaac_vr.bat
 ```
+
+Restart Isaac Sim after Python changes; rebuilding the scene alone does not reload
+imported modules. Save any stage changes and close the previous session first.
+
+### Manual extension selection
+
+For manual launch, use the extension's exact directory and version. From the Isaac Sim
+installation directory, this desktop example loads the same custom package:
+
+```powershell
+.\isaac-sim.bat `
+  --ext-path "C:/path/to/IsaacSim-HumanoidBehavior/source/extensions/isaacsim.robot.policy.examples" `
+  --enable isaacsim.robot.policy.examples-5.2.11
+```
+
+Linux desktop syntax:
 
 ```bash
-ISAAC_ROOT="/path/to/isaac-sim-standalone-6.0.0-linux-x86_64"
-cp -a source/extensions/isaacsim.robot.policy.examples/. "$ISAAC_ROOT/exts/isaacsim.robot.policy.examples/"
+./isaac-sim.sh \
+  --ext-path /path/to/IsaacSim-HumanoidBehavior/source/extensions/isaacsim.robot.policy.examples \
+  --enable isaacsim.robot.policy.examples-5.2.11
 ```
 
-Repeat the copy after updating the checkout, then restart Isaac Sim.
-
-### Option B — Link the extension for development
-
-A junction/symlink makes the installation load the checkout directly. Restart Isaac Sim
-after Python changes; rebuilding the scene alone does not reload imported modules.
-
-Windows, with permission to create a junction:
-
-```powershell
-$standaloneExt = "C:/path/to/isaac-sim-standalone-6.0.0-windows-x86_64/exts/isaacsim.robot.policy.examples"
-$githubExt = "C:/path/to/IsaacSim-HumanoidBehavior/source/extensions/isaacsim.robot.policy.examples"
-Rename-Item -LiteralPath $standaloneExt -NewName "isaacsim.robot.policy.examples.orig"
-New-Item -ItemType Junction -Path $standaloneExt -Target $githubExt
-```
-
-To restore the backup, first verify that `$standaloneExt` is the junction you created:
-
-```powershell
-Get-Item -LiteralPath $standaloneExt | Select-Object FullName, LinkType, Target
-# Only after verifying the junction: remove the link, without -Recurse.
-Remove-Item -LiteralPath $standaloneExt
-Rename-Item -LiteralPath "${standaloneExt}.orig" -NewName "isaacsim.robot.policy.examples"
-```
-
-Linux:
-
-```bash
-STANDALONE_EXT="/path/to/isaac-sim/exts/isaacsim.robot.policy.examples"
-GITHUB_EXT="/path/to/IsaacSim-HumanoidBehavior/source/extensions/isaacsim.robot.policy.examples"
-mv "$STANDALONE_EXT" "${STANDALONE_EXT}.orig"
-ln -s "$GITHUB_EXT" "$STANDALONE_EXT"
-```
-
-To undo the Linux link, verify it with `ls -ld "$STANDALONE_EXT"`, remove only the
-symlink with `unlink "$STANDALONE_EXT"`, and restore the `.orig` directory.
-
-### Option C — Add an extension search folder
-
-From the Isaac Sim installation directory:
-
-```powershell
-.\isaac-sim.xr.vr.bat --ext-folder "C:/path/to/IsaacSim-HumanoidBehavior/source/extensions"
-# Desktop alternative:
-.\isaac-sim.bat --ext-folder "C:/path/to/IsaacSim-HumanoidBehavior/source/extensions"
-```
-
-```bash
-./isaac-sim.xr.vr.sh --ext-folder /path/to/IsaacSim-HumanoidBehavior/source/extensions
-```
-
-Kit resolves extensions by its search paths and versions. Confirm that the loaded extension
-comes from this checkout; equal-version copies can make selection ambiguous. A junction is
-more predictable for repeated local development.
+Adding the entire source extension search folder without selecting a version can choose
+the newer bundled policy extension. Confirm that the Humanoid panel says **Unitree G1**.
+The VR commands below add the Python server and the hand-tracking startup request.
 
 ## Running
 
 ### Full stationary example
 
-For Windows development, edit `ISAAC_DIR` in
-[`tools/launch_isaac_vr.bat`](tools/launch_isaac_vr.bat) if necessary, then run from the repository root:
+Run [`tools/launch_isaac_vr.bat`](tools/launch_isaac_vr.bat) from the repository root.
+It defaults to the extracted 6.1 installation above; use the `ISAAC_DIR` environment
+override only if your installation is elsewhere:
 
 ```powershell
 .\tools\launch_isaac_vr.bat
 ```
 
-Start the headset's existing streaming connection first. This launcher opens Isaac Sim XR VR,
-enables the Python server at `127.0.0.1:8226`, and requests the native OpenXR hand-tracking
-component before XR starts. It preserves the selected runtime and gaze configuration.
+Start the headset's existing streaming connection first. This launcher opens Isaac Sim XR VR
+with the complete repository policy extension, enables the Python server at `127.0.0.1:8226`,
+and requests the native OpenXR hand-tracking component before XR starts. It preserves the
+selected runtime and gaze configuration.
 Do not launch a second Kit process when one is already open.
 
 Manual Windows launch from the installation directory:
 
 ```powershell
-.\isaac-sim.xr.vr.bat --enable isaacsim.code_editor.python_server --/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled=true
+.\isaac-sim.xr.vr.bat `
+  --ext-path "C:/path/to/IsaacSim-HumanoidBehavior/source/extensions/isaacsim.robot.policy.examples" `
+  --enable isaacsim.robot.policy.examples-5.2.11 `
+  --enable isaacsim.code_editor.python_server `
+  --/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled=true
 ```
 
 Linux equivalent:
 
 ```bash
-./isaac-sim.xr.vr.sh --enable isaacsim.code_editor.python_server \
+./isaac-sim.xr.vr.sh \
+  --ext-path /path/to/IsaacSim-HumanoidBehavior/source/extensions/isaacsim.robot.policy.examples \
+  --enable isaacsim.robot.policy.examples-5.2.11 \
+  --enable isaacsim.code_editor.python_server \
   --/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled=true
 ```
 
@@ -226,7 +214,8 @@ workflow. Its commands are listed under [optional experiments](#optional-moving-
 
 | Input | Current behavior |
 |---|---|
-| Valid optical wrist/palm pose | Move the matching arm automatically; no grip, pinch, or fist required |
+| Valid optical wrist and middle-knuckle positions | Move the matching arm automatically; no grip, pinch, or fist required |
+| Rotate a tracked open palm | Align the robot palm anatomically, independent of its starting wrist angle |
 | Bend one tracked finger | Bend that robot finger independently |
 | Move thumb across the palm | Control thumb opposition separately from thumb flexion |
 | Controller side grip | Hold to move/rotate that arm; release to end tracking and drop its object |
@@ -282,10 +271,59 @@ available skeletal hands remain optical.
 
 On the tested SteamVR connection, the runtime advertised `XR_EXT_hand_tracking`, but an
 earlier Kit instance had not requested it. The new hand-component setting fixes that
-application setup omission without changing the working gaze runtime. Real skeletal poses
-subsequently appeared intermittently. Continuous open-hand transport and the reported
-fist-only detection remain to be confirmed on the headset; do not treat the setting or
-successful synthetic replay as proof that every physical finger is arriving.
+application setup omission without changing the working gaze runtime. Earlier observations
+were intermittent. After the user started SteamVR independently, the 12 September recording
+provided 1,627 optical samples on each hand and 1,627 measured-eye samples during its last
+recorded minute. This confirms working transport in that interval, not anatomical accuracy
+or acceptance of later arm-control changes.
+
+### Palm angle, arm bending, and latency
+
+Bare hands now use an anatomical frame built from the wrist and index, middle, and little
+knuckles. The robot frame comes from its fixed knuckle anchors. A flat hand therefore asks
+for a flat robot palm immediately; it no longer inherits an initial 90-degree offset.
+The position target is the wrist-to-middle-knuckle midpoint on both operator and robot.
+Missing endpoints end arm tracking; missing transverse landmarks leave position tracking
+available while withholding orientation. Finger tracking remains independent.
+
+The arm already uses seven-joint IK. Reach has first priority, wrist alignment second,
+and a comfortable default posture resolves redundant motion. A large wrist correction
+cannot consume the reach's step budget. Joint limits remain enforced. Actual human elbow
+swivel is not measured by hand tracking, so the robot's elbow pose is inferred.
+
+The last uninterrupted minute of `session_2026-09-12_02-02-51` advanced 16.26 simulated
+seconds in 59.992 real seconds: real-time factor **0.271**. Input filters now use bounded
+wall-clock intervals to avoid multiplying filter delay by that slowdown. Joint-speed
+limits still use physical simulation time. These changes do not establish real-time
+performance; the full simulator and recording overhead must be measured separately.
+
+Enable **Window → Extensions → Python Server**, keep the scene playing, and run:
+
+```powershell
+python tools/profile_teleop_live.py --seconds 20 --timeout 45
+```
+
+The profiler reports simulation speed, application updates, and control/recording callback
+times. Its temporary wrappers are restored afterwards; gaze and camera are not instrumented.
+Restart Isaac and LOAD a fresh example to apply the source changes before judging them.
+
+### Next research phase
+
+Start after bilateral palm alignment, reachable arm poses, tracking loss/reacquisition,
+repeated pickup/release, and wall-clock latency have passed live checks.
+
+1. Combine existing measured gaze with hand proximity and approach direction to select
+   an intended object. Keep the working eye-gaze reader unchanged.
+2. Infer a gentle-to-firm grip request from finger closing speed, hand approach speed,
+   closure, and object context. Speed is an intent cue, not a measurement of pressure;
+   use real timestamps and handle tracking gaps explicitly.
+3. Add contact/slip feedback and bounded simulated finger effort so grip can adapt to
+   the object. The current assisted fixed joint cannot validate pressure or frictional
+   grasp stability, so evaluate contact-based grasping separately.
+4. Record trials and compare fixed-grip, speed-only, and gaze-plus-speed baselines using
+   success, slip/drop rate, peak contact force, and response latency. Add a training
+   pipeline only when the measurements and labels are reliable enough to beat those
+   baselines on held-out objects and sessions. No training is added in this control fix.
 
 ## Validation
 
@@ -294,7 +332,7 @@ replay at the same time as real-hand observation.
 
 | Check | What it verifies | What it does not establish |
 |---|---|---|
-| Offline regression suite | Production control logic with real USD/matrix libraries; 82 tests passed | Headset transport, rendered behavior, or live physics |
+| Offline regression suite | Production control logic with real USD/matrix libraries; 104 tests passed under 6.1, including the palm/arm response fixes | Headset transport, rendered behavior, or live physics |
 | Humanoid live replay | Actual IK, rigid-body physics, grip, assisted pickup/lift/release, and root stability | Physical controller or optical tracking accuracy |
 | Finger live replay | Measured movement of all ten digits and both thumb-opposition joints, source transitions, tracking loss | Real headset camera recognition |
 | Camera live replay | Constant camera-to-body mount during Play/Pause and simulated head motion | Detailed compositor behavior for every runtime |
@@ -314,9 +352,16 @@ With the updated example loaded and the Python server enabled, use ordinary Pyth
 live replays:
 
 ```powershell
-python tools/validate_humanoid_live.py
-python tools/validate_camera_live.py
-python tools/validate_fingers_live.py --timeout 300
+python tools/validate_humanoid_live.py --reload-example --timeout 300
+python tools/validate_camera_live.py --timeout 180
+```
+
+For the full finger replay, restart Isaac Sim, LOAD a fresh example, press Play,
+and wait until physics has initialized all six finger roles per hand. This avoids
+reusing the post-pickup scene configuration:
+
+```powershell
+python tools/validate_fingers_live.py --timeout 420
 # Shorter verification of controller transitions only:
 python tools/validate_fingers_live.py --controllers-only --timeout 120
 ```
@@ -332,6 +377,15 @@ passed **19.73 simulated seconds**, including independent 0.7 normalized targets
 fingers and both thumb-opposition joints. These are measured simulation results, not an
 assertion that the unresolved headset hand-detection issue is fixed. See the
 [validation details](docs/humanoid-control.md#automated-validation) for scope and measurements.
+
+The [11 September Isaac Sim 6.1 validation](docs/validation/isaac-sim-6.1.md) passed
+pickup/release, camera mounting, and the full finger replay in an initialized fresh
+scene. The finger replay failed on the right little finger when run after pickup;
+the cause of that condition-dependent failure remains unresolved. An earlier
+headset observation supplied no optical skeletons or unified eye gaze; the later
+12 September recording confirms recovery after the user started SteamVR
+independently. New palm/arm changes still await live acceptance. Gaze code and
+settings were not changed.
 
 ### Real-hand observation
 
@@ -619,7 +673,8 @@ python tools/observe_hand_tracking_live.py --seconds 20
 ```
 
 `EX` resolves to the loaded `HumanoidExample`. Logs are under
-`~/.nvidia-omniverse/logs/Kit/Isaac-Sim XR VR/6.0/`. Read the newest log and preserve the first
+`~/.nvidia-omniverse/logs/Kit/Isaac-Sim XR VR/6.1/` for the new default installation
+(`6.0/` contains earlier sessions). Read the newest log and preserve the first
 error, rather than only the repeated downstream exceptions:
 
 ```powershell

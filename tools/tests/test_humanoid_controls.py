@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import math
+import random
 import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -47,6 +48,44 @@ class TestHumanoidControls(unittest.TestCase):
         self.example = HUMANOID.HumanoidExample()
         self.stage = Usd.Stage.CreateInMemory()
         USD.get_context.return_value = types.SimpleNamespace(get_stage=lambda: self.stage)
+
+    def test_referenced_package_fallback_authors_collision_on_nested_geometry(self) -> None:
+        """Dynamic package colliders must use the same mesh's convex approximation."""
+        asset = Usd.Stage.CreateInMemory()
+        asset_root = UsdGeom.Xform.Define(asset, "/Package")
+        asset.SetDefaultPrim(asset_root.GetPrim())
+        asset_root.AddScaleOp().Set(Gf.Vec3f(0.01))
+        UsdPhysics.RigidBodyAPI.Apply(asset_root.GetPrim())
+        UsdGeom.Xform.Define(asset, "/Package/Geometry")
+        mesh = UsdGeom.Mesh.Define(asset, "/Package/Geometry/Mesh")
+        mesh.CreatePointsAttr([(-20, -20, 0), (20, -20, 0), (0, 20, 0), (0, 0, 40)])
+        mesh.CreateFaceVertexCountsAttr([3, 3, 3, 3])
+        mesh.CreateFaceVertexIndicesAttr([0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3])
+        source_before = asset.GetRootLayer().ExportToString()
+
+        def add_reference(usd_path: str, path: str) -> None:
+            self.stage.DefinePrim(path).GetReferences().AddReference(usd_path)
+
+        ex = self.example
+        ex._package_usd_paths = (asset.GetRootLayer().identifier,)
+        with (
+            patch.object(HUMANOID, "get_assets_root_path", return_value="", create=True),
+            patch.object(
+                HUMANOID, "stage_utils", types.SimpleNamespace(add_reference_to_stage=add_reference), create=True
+            ),
+        ):
+            ex._create_package_from_prop("/World/Box", random.Random(12), 1.0, 2.0, 0.8)
+
+        package = self.stage.GetPrimAtPath("/World/Box")
+        referenced_root = self.stage.GetPrimAtPath("/World/Box/Asset")
+        collision_mesh = self.stage.GetPrimAtPath("/World/Box/Asset/Geometry/Mesh")
+        self.assertTrue(package.HasAPI(UsdPhysics.RigidBodyAPI))
+        self.assertFalse(referenced_root.HasAPI(UsdPhysics.RigidBodyAPI))
+        self.assertFalse(referenced_root.HasAPI(UsdPhysics.CollisionAPI))
+        self.assertTrue(collision_mesh.HasAPI(UsdPhysics.CollisionAPI))
+        self.assertEqual(UsdPhysics.MeshCollisionAPI(collision_mesh).GetApproximationAttr().Get(), "convexHull")
+        self.assertEqual(referenced_root.GetAttribute("xformOp:scale").Get(), Gf.Vec3f(0.01))
+        self.assertEqual(asset.GetRootLayer().ExportToString(), source_before)
 
     def test_controller_clutch_ignores_robot_translation_and_turn(self):
         ex = self.example

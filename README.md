@@ -1,10 +1,10 @@
 # VR Humanoid Behavior Lab
 
-Control a **Unitree G1 with Inspire five-finger hands** in Isaac Sim 6.0 using Quest Pro
+Control a **Unitree G1 with Inspire five-finger hands** in Isaac Sim using Quest Pro
 controllers or optical hand tracking. The project records hand input, robot joints,
 gaze, object states, and images for later analysis and learning experiments.
 
-[![Isaac Sim 6.0](https://img.shields.io/badge/Isaac%20Sim-6.0.0-76b900.svg)](https://github.com/isaac-sim/IsaacSim)
+[![Isaac Sim 6.1 default](https://img.shields.io/badge/Isaac%20Sim-6.1.0%20default-76b900.svg)](https://github.com/isaac-sim/IsaacSim)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](tools/run_humanoid_tests.py)
 [![License](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](LICENSE)
 
@@ -59,9 +59,11 @@ and the [validation results](#validation-and-known-limitations) for those distin
 
 ## Quick start
 
-The tested workflow uses a Windows Isaac Sim 6.0 standalone installation and the
-complete modified `isaacsim.robot.policy.examples` extension. A full Isaac Sim source
-build is optional. For Quest Pro, keep the working OpenXR runtime and gaze setup;
+The Windows launcher defaults to Isaac Sim **6.1.0** and loads the complete modified
+`isaacsim.robot.policy.examples` extension directly from this checkout. The
+[6.1 validation record](docs/validation/isaac-sim-6.1.md) covers software replay results
+and the later live tracking recovery. A full
+Isaac Sim source build is optional. For Quest Pro, keep the working OpenXR runtime and gaze setup;
 the documented working connection uses SteamVR with Steam Link.
 
 1. Clone this fork's teleoperation branch and fetch its Git LFS assets:
@@ -73,20 +75,20 @@ the documented working connection uses SteamVR with Steam Link.
    git lfs pull
    ```
 
-2. Follow [Installation](HUMANOID_VR_CONTROL.md#installation) to copy or link the
-   **complete extension** into the standalone installation. It includes the robot
-   wrapper, helper modules, registration, and bundled assets.
-3. Check `ISAAC_DIR` inside [tools/launch_isaac_vr.bat](tools/launch_isaac_vr.bat).
-   Its current value points to the maintainer's Windows installation; edit it if your
-   installation is elsewhere. Save any stage changes and close the previous Isaac
-   session before launching:
+2. Extract Isaac Sim 6.1.0. The launcher uses
+   `C:\Users\Soheil\Downloads\isaac-sim-standalone-6.1.0-windows-x86_64` by default.
+   For another location, set `$env:ISAAC_DIR = "C:\path\to\isaac-sim"` in PowerShell.
+   See [Installation](HUMANOID_VR_CONTROL.md#installation) for manual launch options.
+3. Save any stage changes, close the previous Isaac session, connect the headset,
+   and run:
 
    ```powershell
    .\tools\launch_isaac_vr.bat
    ```
 
-   The launcher enables the Python server and requests OpenXR skeletal hand tracking
-   before the XR session starts.
+   The launcher selects this checkout's complete policy extension, enables the Python
+   server, and requests OpenXR skeletal hand tracking before the XR session starts.
+   No copying into the standalone installation is needed.
 4. Open **Window → Examples → Robotics Examples → Policy → Humanoid**
    (panel title **Humanoid: Unitree G1**), click **LOAD**, then **Play**.
 5. Begin with the reachable packages on the near edge of the small front-right table.
@@ -118,7 +120,7 @@ for optical thresholds, tracking loss, and release behavior.
 
 ## Validation and known limitations
 
-Recorded checks on **7 September 2026**:
+Recorded checks on **7 September 2026**, using Isaac Sim **6.0.0**:
 
 | Check | Result and scope |
 |---|---|
@@ -127,7 +129,7 @@ Recorded checks on **7 September 2026**:
 | Live finger replay | All ten fingers and both thumb-opposition joints moved independently; controller fallback and tracking-loss checks passed |
 | Live camera replay | Fixed camera-to-body mount held during Play and Pause; tested with the Quest session connected |
 | Real eye input | `eye_tracker` was observed with zero failed updates during the connected checks; gaze implementation/settings were preserved |
-| Real Quest finger input | Skeletons arrived intermittently. The reported fist-only detection symptom remains unresolved; full open-hand/finger hardware acceptance is pending |
+| Real Quest finger input | Skeletons arrived intermittently in this historical check; see the 12 September recovery below |
 
 The live replays inject input at the XR boundary and measure real simulation behavior.
 They establish control and physics behavior; they do not establish headset tracking
@@ -135,10 +137,31 @@ quality. Generic grip/aim/pinch/poke interaction poses are insufficient for
 individual fingers. A detected controller model also does not establish that a real
 hand skeleton is reaching Isaac. See [Troubleshooting](HUMANOID_VR_CONTROL.md#troubleshooting).
 
+The **11 September 2026 / Isaac Sim 6.1.0** checks passed NVIDIA's hardware checker,
+all **83 offline tests**, actual PhysX pickup/release, camera mounting during Play
+and Pause, and a full finger replay in an initialized fresh scene. A finger replay
+run immediately after pickup failed on the right little finger; its cause remains
+unresolved. The fresh-scene pass does not establish that all checks pass in every
+manipulation state.
+
+During a separate 60-second real-input observation, the connected headset used
+Oculus/Meta transport through SteamVR and supplied **zero optical hand samples**;
+unified eye gaze was unavailable. Gaze code and settings were preserved. On **12
+September**, the user confirmed that starting SteamVR independently restored both.
+The subsequent recording contains 1,627 optical-hand samples per side and 1,627
+measured-eye samples during its last uninterrupted minute.
+See the [6.1 validation record](docs/validation/isaac-sim-6.1.md) for measurements,
+the corrected package colliders, and exact reproduction steps.
+
+The next arm-control update adds anatomical palm alignment, stable palm-centre
+targets, bounded IK task priorities, and wall-time input filtering. Offline checks
+pass, but these changes still require a fresh live pose/latency/pickup run. See
+[palm angle, arm bending, and latency](HUMANOID_VR_CONTROL.md#palm-angle-arm-bending-and-latency).
+
 Run offline tests with Isaac Sim's Python wrapper:
 
 ```powershell
-& "C:/path/to/isaac-sim-standalone-6.0.0-windows-x86_64/python.bat" tools/run_humanoid_tests.py
+& "C:/path/to/isaac-sim-standalone-6.1.0-windows-x86_64/python.bat" tools/run_humanoid_tests.py
 ```
 
 With the updated example loaded and the Python server enabled, run live checks
@@ -146,7 +169,13 @@ With the updated example loaded and the Python server enabled, run live checks
 
 ```powershell
 python tools/validate_camera_live.py
-python tools/validate_fingers_live.py --timeout 300
+```
+
+Before a full finger replay, restart Isaac Sim, LOAD a fresh example, press Play,
+and wait for initialized finger joints. Then run:
+
+```powershell
+python tools/validate_fingers_live.py --timeout 420
 ```
 
 These replays restore live input and leave the timeline paused. To observe real
@@ -163,8 +192,9 @@ results are in [Automated validation](docs/humanoid-control.md#automated-validat
 ## Performance
 
 **100 Hz physics and 90 Hz rendering are configured rates, not measured performance
-guarantees.** A recent loaded session advanced roughly 0.3 simulated seconds per wall
-second, which stretches control response to about three times normal duration.
+guarantees.** The last active minute of the 12 September recording advanced 16.26
+simulated seconds in 59.992 wall seconds: **0.271× real time**, or roughly 3.7 times
+slower. This is a baseline from before the arm-response changes.
 
 The code performs synchronous PNG encoding and CSV writes inside physics callbacks,
 creates an additional recording-camera render product, and repeats some robot-pose
@@ -193,7 +223,9 @@ for files and columns.
 
 The [learning directory](learning/README.md) contains the planned dataset and
 world-model workflow. A trained planner is not integrated into the current robot
-controller.
+controller. The [next research phase](HUMANOID_VR_CONTROL.md#next-research-phase)
+combines gaze-based object intent, hand/finger speed cues, and simulated grip feedback
+after the current alignment and latency checks pass.
 
 ## Project layout
 

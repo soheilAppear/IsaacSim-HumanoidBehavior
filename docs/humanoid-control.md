@@ -12,9 +12,10 @@ for the current implementation.
 
 Optical control accepts a valid **open hand** immediately. Finger updates do not
 require a fist, a grip/pinch gesture, or an active arm target. Closing the hand is
-only needed to request pickup. The reported real-headset symptom of detection only
-while making a fist remains unresolved: recent hardware observations did not provide
-valid finger skeletons, so continuous open-hand tracking has not been verified there.
+only needed to request pickup. The user confirmed that eye and finger tracking
+returned after starting SteamVR independently. The latest recording also contains
+both optical hands and real eye-gaze samples. This confirms input recovery; the new
+palm alignment and response changes still require a live hardware acceptance check.
 
 ## Controls
 
@@ -26,7 +27,7 @@ valid finger skeletons, so continuous open-hand tracking has not been verified t
 | B | Restore the fixed robot-head view |
 | Y | Drop both objects; release/open before picking up again |
 | Left stick click | Keep the robot-head camera locked in stationary mode |
-| Optical hand tracking | Wrist/palm target, five independent finger curls, and separate thumb opposition; no controller clutch |
+| Optical hand tracking | Anatomical palm position/orientation, five independent finger curls, and separate thumb opposition; no controller clutch |
 | Keyboard arrows/numpad movement keys; gamepad locomotion inputs | No robot movement in the default stationary mode |
 | Head motion/step-in-place | No robot or camera movement; existing gaze and recording remain available |
 
@@ -54,8 +55,9 @@ Stationary mode also prevents stick clicks from selecting a room-scale camera mo
    poses. Present an **open hand** in the tracking cameras' view.
    The launcher and extension enable Kit's OpenXR Hand Tracking component; restart
    an already-running XR session once after updating. Keep the existing OpenXR runtime.
-   No fist or pinch is needed to begin tracking. A valid wrist/palm drives the arm;
-   valid finger landmarks independently drive the fingers.
+   No fist or pinch is needed to begin tracking. Position-valid wrist and middle
+   knuckle landmarks drive the arm; valid finger landmarks independently drive the
+   fingers. Hand-joint orientation flags are not required for this anatomical mapping.
 2. Reach and rotate your hand to guide the corresponding robot palm toward an object
    on the near edge of the small front-right table. Optical tracking does not require
    a grip button or controller clutch.
@@ -109,6 +111,9 @@ Kit's pose descriptor, validates matrix dimensions, finite values, and a nonsing
 positive rotation determinant. A valid descriptor may contain an identity pose.
 The legacy matrix-only API has no validity flags, so an identity matrix is treated
 as unavailable. Missing or invalid input never falls back to a stale matrix.
+Optical arm and finger geometry uses `_get_hand_joint_position()` instead: it accepts
+position-valid landmarks even when the runtime cannot supply their orientation.
+Raw recording poses retain their existing runtime frame and validity semantics.
 
 ## Arm and finger retargeting
 
@@ -118,8 +123,31 @@ are scaled and bounded from those anchors. Translating or turning the robot ther
 does not itself move the target within the body frame. Releasing grip or switching
 input source clears calibration. Optical hands use their current body-frame position.
 
-Wrist orientation is calibrated relatively so the robot keeps its starting wrist
-axes while following operator rotation. With row rotations, the desired rotation is:
+`_get_optical_arm_pose()` places the optical target at the midpoint of `wrist` and
+`middle_proximal`. The robot's corresponding point is the midpoint between its hand
+base origin and middle proximal joint anchor. These stable palm points do not move
+when fingertips curl. Missing or coincident wrist/middle landmarks count as arm
+tracking loss; the controller never switches to a raw wrist/palm origin during an
+occlusion. Missing transverse landmarks leave position tracking active but disable
+the orientation request.
+
+Optical orientation is **absolute anatomical palm alignment**. The wrist-to-middle
+direction and index-to-little knuckle span define a proper frame for each hand, with
+a side-adjusted outward palm normal. The robot frame comes from the Inspire proximal
+joints' fixed `body0` anchors in the rigid hand base, rather than its initial pose or
+moving fingertips. With row rotations:
+
+```text
+desired_robot_wrist_world = inverse(robot_palm_local_frame) * operator_palm_world_frame
+```
+
+A flat operator palm therefore requests a flat robot palm even if the robot starts
+with its palm vertical. Reacquiring optical tracking does not preserve that initial
+misalignment. Degenerate or unavailable landmarks never invent an orientation; an
+asset without the required anatomical anchors receives no absolute orientation target.
+
+Controller wrist orientation retains relative clutch calibration so the robot keeps
+its starting wrist axes while following controller rotation:
 
 ```text
 H = tracked_world_rotation * inverse(base_yaw_rotation)
@@ -131,9 +159,12 @@ A damped-least-squares position step is followed by a wrist-orientation correcti
 in the remaining position nullspace, computed with an SVD projector. An unreachable
 wrist orientation therefore cannot reverse the primary reach step. A small default
 posture gain (`_arm_posture_gain = 0.1`) returns redundant joints toward their standing
-defaults within the combined position/orientation nullspace. If the IK correction
-exceeds the per-joint step cap, one common factor scales the whole correction before
-command limiting, preserving its direction.
+defaults within the combined position/orientation nullspace. The primary reach step
+is fitted to the per-joint correction cap and available joint travel first. Joints
+already at a limit are excluded and the reach is solved again if their correction
+would point farther outward. Wrist and posture corrections then use only the remaining
+budget, each with a common scale that preserves its nullspace direction. They cannot
+shrink the accepted primary step by forcing a rescale of the combined correction.
 
 The solver handles the root row/column differences between fixed- and floating-base
 PhysX Jacobians. Because those Jacobians are world-space, position
@@ -149,7 +180,17 @@ Limiting that error to `speed * dt` every tick had made the arm respond too slow
 External contacts can make the two bounds conflict; the measured-position bound takes
 priority in that case. These are target limits, not a guarantee about measured velocity
 under contact. Source changes and tracking loss clear joint and hand-target smoothing;
-reacquisition starts from the measured joints. Filters account for `dt`.
+reacquisition starts from the measured joints. Deactivation clears the command once
+when an active source is lost, so subsequent inactive ticks can continue the smooth
+return to rest instead of restarting it at the measured position every tick.
+
+Hand-target, joint-target, and finger filters use `_teleop_input_dt`, derived from
+elapsed wall time because XR input arrives in real time. At the default physics rate,
+the filter interval is bounded between one physics step and 50 ms. A nonpositive,
+nonfinite, or greater-than-250-ms gap starts a fresh interval using the physics step;
+it does not permit a large catch-up jump. The 2.5 rad/s joint command slew limit still
+uses **physics time**, with the separate 0.15 rad tracking-error bound unchanged.
+Responsive input filtering does not make an overloaded simulation run in real time.
 If the live Jacobian is unavailable, the existing measured four-joint local map remains
 a degraded position fallback; it cannot reproduce the full wrist-orientation solve.
 
@@ -196,9 +237,10 @@ Pickup is distance-gated **fixed-joint assistance**. It is not a friction/contac
 grasp controller. The object stays dynamic, but the constraint may hold objects that
 the fingers alone could not. The recorder identifies this assisted mode in metadata.
 
-An active hand searches from the measured palm/finger centre: the live wrist-link pose
-plus its rotated palm offset. The candidate search therefore uses the same working
-point as arm IK, rather than the wrist origin or the desired XR marker.
+An active hand searches from the measured rigid palm centre: the live wrist-link pose
+plus its rotated, asset-derived palm offset. Candidate selection therefore uses the
+same working point as arm IK, rather than the wrist origin or the desired XR marker.
+Assets without the Inspire anchors retain the earlier geometric offset fallback.
 Object poses also come from physics tensors; USD transforms may be stale with Fabric.
 The default 0.30 m radius highlights a candidate, 0.18 m permits candidate selection
 for pickup, and 0.09 m gates the nearest palm/finger link-centre distance to the object
@@ -221,7 +263,8 @@ Controller pickup uses 0.60/0.35 close/open hysteresis; optical hands use mean c
 closed hand/held trigger cannot reattach immediately. Releasing grip, disabling tracking,
 losing a usable hand pose, clearing, or resetting removes the constraint and clears
 targets and cached physics handles. Finger tracking loss opens the driven fingers.
-Reconnection starts with fresh calibration and a target slew starting at measured joints.
+Reconnection starts with a target slew from measured joints. Controller reconnection
+starts fresh clutch calibration; optical orientation resumes absolute anatomical alignment.
 
 Gaze and hand highlights share an anonymous session sublayer prepared during scene
 setup, before physics creates tensor views. Grab selection has priority over gaze on
@@ -298,9 +341,10 @@ filters clear so reset discontinuities do not become motion estimates.
 
 The defaults request **100 Hz CPU physics** and **90 Hz rendering**, using the Torch
 backend. These are configured simulation intervals, not a guarantee of 90 displayed
-frames per second or real-time simulation. During a previous live VR run, the
-simulation advanced about **0.3 simulated seconds per wall-clock second**. XR load
-varied between runs; that observation is not a benchmark for every scene or headset.
+frames per second or real-time simulation. The latest uninterrupted recorded interval
+advanced **16.26 simulated seconds in 59.992 wall seconds**, a real-time factor of
+**0.271**. This is evidence from CSV timestamps, not a measurement by the new live
+profiler and not a benchmark of the revised controllers. XR load varies between runs.
 When the simulation falls behind, robot movement and tests that wait for simulated
 time also take longer in the real world.
 
@@ -319,7 +363,7 @@ in the current setup.
 | Recorded camera | An additional 256×256 camera render product and RGB annotator refresh at render cadence, even though PNGs are saved at about 10 Hz |
 | File writes | PNG encoding and saving happen synchronously inside the physics callback; buffered CSVs are also written there about every 2.5 seconds |
 | Camera attachment | The body pose is read and the mounted view scheduled every physics tick and every application frame, including while paused |
-| Arm and pickup poses | Palm/finger poses are read repeatedly for IK, candidate selection, and grasp distance; each active arm separately fetches the full articulation Jacobian and joint positions |
+| Arm and pickup poses | Inspire arm IK and candidate selection use a cached rigid palm offset; detailed grasp-distance checks still read finger links. Both arm solves share Jacobian and joint-position reads within one physics tick |
 
 Finger landmarks are cached within each hand's curl calculation. Joint command
 limits and smoothing also affect movement response, independently of frame rate;
@@ -327,6 +371,30 @@ their current values and purpose are described under arm and finger retargeting.
 A paused, empty session is not executing this example's physics, IK, or recording
 callbacks. Check which application and scene are active before attributing a slowdown
 to those paths. Run only one Kit application during comparisons.
+
+### Profile the active teleoperation session
+
+With the updated example loaded and playing, enable its Python server and use
+ordinary host Python from the repository root:
+
+```powershell
+python tools/profile_teleop_live.py --seconds 20 --timeout 45
+```
+
+The profiler observes real input and temporarily times input arbitration, finger
+updates, arm/pickup updates, recording, and `g1.forward`. It reports wall/simulation
+progress, real-time factor, application-update rate, observed physics intervals,
+per-method timings, and callback errors. It does not alter gaze, camera, recording
+settings, input devices, or the timeline. Temporary wrappers are restored on exit.
+The application-update rate is not headset/compositor FPS; nested method timings
+overlap, and instrumentation adds overhead. Compare repeated runs using the same
+scene and instrumentation.
+
+The current live profiling attempt was blocked because the Python server was
+unavailable. No measured subsystem timings or post-change speedup are claimed.
+A refused connection on port 8226 indicates server availability, not a robot or
+headset diagnosis. The recorded 0.271 real-time factor above establishes slow
+simulation progress but does not isolate its cause.
 
 ### Compare recording on and off
 
@@ -403,6 +471,12 @@ regressions also cover conflicting wrist/position requests, redundant-joint post
 recovery without changing the hand task, and world-axis rotation from a nontrivial pose.
 Open-hand regressions verify acquisition without grip, pinch, or fist and independent
 finger updates without a closed hand or active arm target.
+Palm regressions cover the initial flat-hand/vertical-robot mismatch on both sides,
+world rotation and scale, missing/degenerate landmarks, reacquisition, stable rigid
+palm centres, and preservation of controller clutch behavior. Further regressions
+cover position-valid-only optical poses, partial orientation loss, bounded wall-time
+filtering, IK secondary-task budgets and joint limits, and uninterrupted return-to-rest
+slew after deactivation.
 
 These tests do not validate extension startup/import ordering, live XR bindings, rendered
 visuals, collision/contact dynamics, or balance. Run Kit integration checks separately
@@ -484,9 +558,9 @@ Run it separately from synthetic replays. Motion flags show real optical input a
 corresponding joint variation; they do not measure detailed tracking accuracy. No motion
 can mean absent/occluded tracking, a still hand, or too few physics updates.
 
-The current suite contains **82 offline regression tests**, including two open-hand
-acquisition and independent-finger regressions. On 7 September 2026, the full live finger
-replay passed **19.73 simulated seconds** with all ten fingers and both thumb-opposition
+The offline suite includes open-hand acquisition and independent-finger regressions.
+On 7 September 2026, the full live finger replay passed **19.73 simulated seconds**
+with all ten fingers and both thumb-opposition
 joints reaching their independent 0.7 normalized targets. Partial/full tracking loss,
 normal controller input, and Touch input mislabeled as `hand` passed for both hands;
 root translation was zero and no callback errors occurred.
@@ -497,16 +571,14 @@ computed mount exactly. A separate read of the real headset's virtual eye positi
 matched the mounted camera within `4.25e-8 m` after the physical headset had moved
 over a metre. Gaze still reported `eye_tracker` with zero failed updates.
 
-Actual skeletal poses were seen intermittently after enabling Kit's hand component,
-but subsequent 20- and 45-second real-input observations contained no valid finger landmarks.
-The synthetic replay therefore establishes retargeting and joint-drive behavior;
-it does not establish continuous tracking from the Quest Pro's cameras. The reported
-fist-only detection symptom remains unresolved. There is no application requirement
-to make a fist before acquiring an optical hand, and an open finger's zero curl is
-valid. Without valid incoming skeleton data, the hardware behavior cannot be confirmed
-or described as fixed. Repeat the observer with open hands and individual finger
-movements to separate missing/occluded input from a frozen simulation, without
-altering gaze or the active OpenXR runtime.
+Earlier 20- and 45-second real-input observations contained no valid finger landmarks.
+The user subsequently confirmed that eyes and fingers worked again after starting
+SteamVR independently. In the latest recorded session ending `02-02-51`, the last
+complete minute contains **1,627 rows with both optical hands and `eye_tracker`**.
+This supersedes the earlier missing-skeleton observation and confirms recovered input
+transport. It does not validate the new absolute palm alignment, revised IK response,
+or tracking accuracy on hardware. Repeat the real-input observer and the acceptance
+checks below after loading the changed code; keep the working gaze/runtime settings.
 
 ## Live acceptance procedure
 
@@ -527,9 +599,15 @@ altering gaze or the active OpenXR runtime.
    while trigger remains held; it must stay released until you open and close again.
    Keep grip held while carrying; verify releasing grip also drops the object.
 5. Present open hands first, without making a fist or pinching, and verify tracking
-   starts. Bend each optical finger separately and move the thumb across the palm without
+   starts. Begin with flat palms while the robot hands are vertical: both robot palms
+   should align with yours. Rotate palm-up, palm-down, and sideways, then briefly hide
+   and reacquire each hand; the initial orientation mismatch must not return. Bend
+   each optical finger separately and move the thumb across the palm without
    curling its tip; verify independent robot-finger and thumb-opposition movement.
    Repeat pickup with optical hand tracking, partial occlusion, and device loss/reconnection.
+   Missing wrist/middle landmarks must end arm tracking without a raw-origin jump;
+   losing only transverse landmarks should preserve position tracking while omitting
+   the orientation target.
    Verify objects release and stale hand targets are not used. Reset while holding an
    object; verify no joint remains and the robot returns to its spawn pose.
 6. Hold the head still and move only the eyes. Confirm the runtime reports real

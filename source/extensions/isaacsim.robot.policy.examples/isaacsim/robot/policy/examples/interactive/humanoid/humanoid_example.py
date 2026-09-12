@@ -403,6 +403,8 @@ class HumanoidExample(BaseSample):
         self._head_camera_update_counter = 0
         self._head_camera_update_interval = 1
         self._last_physics_dt = self._world_settings["physics_dt"]  # for subsystems not passed dt
+        self._teleop_input_dt = self._last_physics_dt
+        self._last_teleop_wall_time = None
         self._hand_tracking_arm_control_enabled = True
         self._controller_arm_control_enabled = True
         self._hand_tracking_status_logged = False
@@ -431,6 +433,8 @@ class HumanoidExample(BaseSample):
         self._arm_orientation_weight = 0.2  # metres per radian in the weighted IK residual
         self._arm_posture_gain = 0.1  # resolve redundant motion toward the comfortable starting posture
         self._arm_orientation_anchors = {}
+        self._robot_palm_local_frames = {}
+        self._robot_palm_local_centers = {}
         self._arm_input_sources = {}
         self._arm_ik_link_index = {}  # side -> articulation link index of the hand
         self._arm_ik_logged = False
@@ -923,8 +927,12 @@ class HumanoidExample(BaseSample):
                     # PhysX does not replace collision shapes during initialization.
                     UsdPhysics.MeshCollisionAPI.Apply(descendant).CreateApproximationAttr().Set("convexHull")
             if not any(p.HasAPI(UsdPhysics.CollisionAPI) for p in Usd.PrimRange(asset_prim)):
-                # A package with no collider can never be picked up or rested on.
-                UsdPhysics.CollisionAPI.Apply(asset_prim)
+                # Put fallback colliders on geometry, alongside the mesh approximation
+                # above. A collider on the Asset Xform instead cooks an aggregate
+                # triangle mesh and ignores its children's convexHull settings.
+                for descendant in Usd.PrimRange(asset_prim):
+                    if descendant.IsA(UsdGeom.Gprim):
+                        UsdPhysics.CollisionAPI.Apply(descendant)
         UsdPhysics.RigidBodyAPI.Apply(prim)
 
         return self._measure_prim_size(prim)
@@ -1238,6 +1246,7 @@ class HumanoidExample(BaseSample):
             # Robot is initialized: advance the base and hold the posture, then let the
             # teleoperation layer below override the arm and finger DOFs it owns.
             self._last_physics_dt = float(dt)
+            self._update_teleop_input_clock(float(dt))
             self._grab_time += float(dt)
             self._update_controller_command(dt)
             target_command = self._keyboard_command + self._controller_command
@@ -1311,6 +1320,8 @@ class HumanoidExample(BaseSample):
             self._controller_arm_neutral_positions,
             self._controller_arm_neutral_targets,
             self._arm_orientation_anchors,
+            self._robot_palm_local_frames,
+            self._robot_palm_local_centers,
             self._arm_input_sources,
             self._smoothed_arm_targets,
             self._smoothed_arm_rig_targets,
@@ -1323,6 +1334,8 @@ class HumanoidExample(BaseSample):
         ):
             mapping.clear()
         self._g1_arm_dofs_configured = False
+        self._last_teleop_wall_time = None
+        self._teleop_input_dt = self._last_physics_dt
         self._g1_arm_dof_indices_by_side.clear()
         self._g1_arm_joint_names_by_side.clear()
         self._g1_arm_joint_limits.clear()
@@ -3423,15 +3436,145 @@ class HumanoidExample(BaseSample):
             )
         return hand_body
 
-    def _compute_arm_target_orientation(self, side: str, hand_pose: Gf.Matrix4d, yaw: float) -> Gf.Matrix4d | None:
-        """Retarget wrist rotation relative to the first tracked pose of this clutch.
+    @staticmethod
+    def _build_palm_frame(
+        side: str, wrist: Gf.Vec3d, middle: Gf.Vec3d, index: Gf.Vec3d, little: Gf.Vec3d
+    ) -> Gf.Matrix4d | None:
+        """Build a rotation from rigid palm landmarks, independent of finger curl.
 
-        Operator palms and robot wrists have different local axes. Calibrating the
-        relative rotation preserves the starting robot orientation and then follows
-        the operator's rotation, including after the robot turns in the world.
+        The rows are the distal direction, a side-adjusted transverse direction,
+        and the outward palm normal. Side adjustment keeps a proper right-handed
+        frame for both hands, with the same physical meaning for the palm normal.
+        Collinear or missing landmarks cannot establish a palm orientation.
+        """
+        if side not in ("left", "right") or any(point is None for point in (wrist, middle, index, little)):
+            return None
+        if not all(math.isfinite(float(value)) for point in (wrist, middle, index, little) for value in point):
+            return None
+        forward = middle - wrist
+        if forward.GetLength() <= 1e-6:
+            return None
+        forward.Normalize()
+        radial = index - little
+        width = radial.GetLength()
+        radial -= forward * Gf.Dot(radial, forward)
+        if radial.GetLength() <= max(1e-6, width * 0.05):
+            return None
+        radial.Normalize()
+        transverse = radial if side == "left" else -radial
+        normal = Gf.Cross(forward, transverse).GetNormalized()
+        transverse = Gf.Cross(normal, forward).GetNormalized()
+        return Gf.Matrix4d(
+            forward[0],
+            forward[1],
+            forward[2],
+            0.0,
+            transverse[0],
+            transverse[1],
+            transverse[2],
+            0.0,
+            normal[0],
+            normal[1],
+            normal[2],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        )
+
+    def _get_robot_palm_local_frame(self, side: str) -> Gf.Matrix4d | None:
+        """Read the Inspire palm frame from fixed joint anchors in the hand link.
+
+        Proximal joint anchors on the hand base remain fixed when fingers curl.
+        Read their USD joint schemas once because no prim wrapper exposes these
+        local anchors. Do not calibrate against the robot's initial wrist pose:
+        that would preserve an arbitrary flat-palm/vertical-palm mismatch.
+        """
+        if side in self._robot_palm_local_frames:
+            return self._robot_palm_local_frames[side]
+        stage = omni.usd.get_context().get_stage()
+        hand_path = self._get_hand_link_path(side)
+        if stage is None or hand_path is None:
+            return None
+        letter = "L" if side == "left" else "R"
+        points = {}
+        for role, joint_role in (("middle", "middle"), ("index", "index"), ("little", "pinky")):
+            joint_path = f"{self._g1_prim_path}/{side}_hand/joints/{letter}_{joint_role}_proximal_joint"
+            joint = UsdPhysics.Joint.Get(stage, joint_path)
+            if not joint or joint.GetBody0Rel().GetTargets() != [Sdf.Path(hand_path)]:
+                return None
+            anchor = joint.GetLocalPos0Attr().Get()
+            if anchor is None:
+                return None
+            points[role] = Gf.Vec3d(anchor)
+        frame = self._build_palm_frame(side, Gf.Vec3d(0.0), points["middle"], points["index"], points["little"])
+        if frame is not None:
+            self._robot_palm_local_frames[side] = frame
+            # Match the middle-metacarpal centre rather than a moving fingertip
+            # centroid. This point is rigidly attached to the hand base.
+            self._robot_palm_local_centers[side] = points["middle"] * 0.5
+        return frame
+
+    def _get_robot_palm_local_center(self, side: str) -> Gf.Vec3d | None:
+        """Return the fixed midpoint between the wrist and middle knuckle."""
+        if self._get_robot_palm_local_frame(side) is None:
+            return None
+        return self._robot_palm_local_centers.get(side)
+
+    def _get_optical_palm_frame(self, side: str, input_device: object) -> Gf.Matrix4d | None:
+        """Measure the operator's anatomical palm frame from world joint positions."""
+        names = ("wrist", "middle_proximal", "index_proximal", "little_proximal")
+        try:
+            available = {str(name) for name in input_device.get_pose_names()}
+        except (AttributeError, TypeError, RuntimeError):
+            return None
+        if not all(name in available for name in names):
+            return None
+        points = [self._get_hand_joint_position(input_device, name) for name in names]
+        return self._build_palm_frame(side, *points)
+
+    def _get_optical_arm_pose(self, side: str, input_device: object) -> Gf.Matrix4d | None:
+        """Get a stable palm-centre target from position-valid optical landmarks.
+
+        Runtime palm and wrist pose origins differ. Always use the wrist-to-middle
+        midpoint, and reject missing or degenerate endpoints rather than switching
+        origins during occlusion. Missing transverse landmarks disable orientation
+        tracking separately; they do not discard a usable position target. Raw
+        recording poses retain their existing runtime frame and validity semantics.
+        """
+        if self._get_hand_input_kind(input_device) != "hand_tracking":
+            return None
+        wrist = self._get_hand_joint_position(input_device, "wrist")
+        middle = self._get_hand_joint_position(input_device, "middle_proximal")
+        if wrist is None or middle is None or (middle - wrist).GetLength() <= 1e-6:
+            return None
+        frame = self._get_optical_palm_frame(side, input_device)
+        result = Gf.Matrix4d(frame) if frame is not None else Gf.Matrix4d(1.0)
+        result.SetTranslateOnly((wrist + middle) * 0.5)
+        return result
+
+    def _compute_arm_target_orientation(
+        self, side: str, hand_pose: Gf.Matrix4d, yaw: float, input_device: object | None = None
+    ) -> Gf.Matrix4d | None:
+        """Align optical palms anatomically; retain relative rotation for controllers.
+
+        Optical landmarks give an absolute palm orientation, so an operator's flat
+        palm immediately requests a flat robot palm regardless of the robot's
+        starting posture. Controller grip axes have no anatomical landmarks; their
+        existing clutch calibration continues to preserve the initial wrist pose.
         """
         if not self._arm_track_orientation:
             return None
+        if input_device is not None and self._get_hand_input_kind(input_device) == "hand_tracking":
+            operator_frame = self._get_optical_palm_frame(side, input_device)
+            robot_local_frame = self._get_robot_palm_local_frame(side)
+            if operator_frame is None or robot_local_frame is None:
+                return None
+            # Gf uses row vectors: local anatomy * desired wrist = world anatomy.
+            # World landmarks already include the XR rig and robot heading; there
+            # is no additional yaw correction or initial operator-pose offset.
+            return robot_local_frame.GetInverse() * operator_frame
         body_to_world = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), math.degrees(yaw)))
         hand_rotation = Gf.Matrix4d().SetRotate(hand_pose.ExtractRotationQuat()) * body_to_world.GetInverse()
         anchor = self._arm_orientation_anchors.get(side)
@@ -3470,7 +3613,7 @@ class HumanoidExample(BaseSample):
         if previous is None:
             self._smoothed_arm_rig_targets[side] = Gf.Vec3d(target_body)
             return target_body
-        alpha = smoothing_alpha(self._arm_rig_smoothing, self._last_physics_dt)
+        alpha = smoothing_alpha(self._arm_rig_smoothing, self._teleop_input_dt)
         smoothed = previous + (target_body - previous) * alpha
         self._smoothed_arm_rig_targets[side] = Gf.Vec3d(smoothed)
         return smoothed
@@ -3768,9 +3911,21 @@ class HumanoidExample(BaseSample):
     def _palm_offset_world(self, side: str, wrist_world) -> Gf.Vec3d:
         """Live vector from the hand base link to the centre of its grasping surface.
 
-        Computed from the palm and finger link poses every step rather than hard-coded, so
-        it stays correct as the wrist rotates.
+        Prefer a rigid palm point from the asset's knuckle anchors. Averaging moving
+        fingertips changes the arm's target as fingers close and also requires many
+        individual physics reads. The fallback supports assets without those anchors.
         """
+        local_center = self._get_robot_palm_local_center(side)
+        if local_center is not None:
+            hand_prim = self._get_hand_link_prim(side)
+            if hand_prim is not None:
+                _, orientations = hand_prim.get_world_poses()
+                quaternion = self._first_pose_value(orientations)
+                if quaternion is not None:
+                    rotation = Gf.Matrix4d().SetRotate(
+                        Gf.Quatd(float(quaternion[0]), Gf.Vec3d(*[float(v) for v in quaternion[1:4]]))
+                    )
+                    return rotation.TransformDir(local_center)
         prims = self._get_grasp_link_prims(side)
         if not prims:
             return Gf.Vec3d(0.0, 0.0, 0.0)
@@ -4012,7 +4167,12 @@ class HumanoidExample(BaseSample):
         return index
 
     def _solve_arm_ik_jacobian(
-        self, side: str, hand_body: Gf.Vec3d, target_orientation: Gf.Matrix4d | None = None
+        self,
+        side: str,
+        hand_body: Gf.Vec3d,
+        target_orientation: Gf.Matrix4d | None = None,
+        *,
+        physics_snapshot: dict | None = None,
     ) -> dict[int, float] | None:
         """One damped-least-squares IK step for that arm, on the live Jacobian.
 
@@ -4022,6 +4182,8 @@ class HumanoidExample(BaseSample):
         Closed loop: it reads where the hand actually is and steps the joints toward the
         target, rather than mapping a target through a fixed linear model. That is the
         difference between the arm tracking your hand and merely correlating with it.
+        Both arms may share ``physics_snapshot`` within one synchronous physics
+        callback. Omitting it always reads fresh tensors; never retain it across steps.
         """
         indices = self._g1_arm_dof_indices_by_side.get(side, {})
         if not indices or not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
@@ -4063,7 +4225,15 @@ class HumanoidExample(BaseSample):
                 scale = self._arm_ik_max_error / length
                 error = [component * scale for component in error]
 
-            jacobians = wp.to_torch(self.g1.robot.get_jacobian_matrices()).detach()
+            snapshot = {} if physics_snapshot is None else physics_snapshot
+            if "arm_jacobians" not in snapshot or "arm_dof_positions" not in snapshot:
+                jacobians = wp.to_torch(self.g1.robot.get_jacobian_matrices()).detach().cpu().numpy()
+                current = wp.to_torch(self.g1.robot.get_dof_positions()).reshape(-1).detach().cpu().numpy()
+                # Publish both reads together. A failed read must not leave a partial
+                # snapshot that a second arm could mistake for a complete observation.
+                snapshot.update(arm_jacobians=jacobians, arm_dof_positions=current)
+            jacobians = snapshot["arm_jacobians"]
+            current = snapshot["arm_dof_positions"]
             joint_order = [
                 name for name in (*ARM_IK_JOINT_ORDER, "wrist_roll", "wrist_pitch", "wrist_yaw") if name in indices
             ]
@@ -4079,8 +4249,7 @@ class HumanoidExample(BaseSample):
                 return None
             columns = [indices[name] + column_offset for name in joint_order]
             rows = jacobians[0, row_index, :, :][:, columns]
-            full_matrix = rows.detach().cpu().numpy().astype(float)
-            current = wp.to_torch(self.g1.robot.get_dof_positions()).reshape(-1).detach().cpu().numpy()
+            full_matrix = rows.astype(float)
         except Exception as e:
             self._log_physics_step_error("arm IK jacobian read", e)
             return None
@@ -4092,21 +4261,75 @@ class HumanoidExample(BaseSample):
             # v_palm = v_wrist + omega cross r. Without this, wrist rotation moves
             # the controlled point in a direction that the solver does not predict.
             matrix = full_matrix[:3] + np.cross(full_matrix[3:6].T, np.asarray(palm_offset)).T
-            if not np.all(np.isfinite(full_matrix)) or not np.all(np.isfinite(error)):
+            arm_positions = np.asarray([current[indices[name]] for name in joint_order], dtype=float)
+            if (
+                not np.all(np.isfinite(full_matrix))
+                or not np.all(np.isfinite(error))
+                or not np.all(np.isfinite(arm_positions))
+            ):
                 return None
             damping = self._arm_ik_damping
+            gain = self._arm_ik_gain
+            step_cap = self._arm_ik_max_step
+            if not all(math.isfinite(value) for value in (damping, gain, step_cap)) or step_cap <= 0:
+                return None
 
             def damped_step(jacobian, residual):
                 return jacobian.T @ np.linalg.solve(
                     jacobian @ jacobian.T + damping * damping * np.eye(jacobian.shape[0]), residual
                 )
 
+            # Keep each command within the available joint travel as well as the IK
+            # correction cap. If contact pushed a measured joint beyond a limit, do
+            # not ask it to move farther outward; the final command limiter restores
+            # the authored limit. The zero correction remains feasible in this solve.
+            lower_step = np.full(len(joint_order), -step_cap)
+            upper_step = np.full(len(joint_order), step_cap)
+            for index, name in enumerate(joint_order):
+                lower, upper = self._g1_arm_joint_limits.get(indices[name], (-math.inf, math.inf))
+                if math.isnan(lower) or math.isnan(upper) or lower > upper:
+                    return None
+                lower_step[index] = max(-step_cap, min(0.0, lower - arm_positions[index]))
+                upper_step[index] = min(step_cap, max(0.0, upper - arm_positions[index]))
+
+            def add_within_budget(base, correction):
+                """Fit a secondary direction without shrinking the primary step."""
+                fraction = 1.0
+                for index, value in enumerate(correction):
+                    if value > 1e-12:
+                        fraction = min(fraction, (upper_step[index] - base[index]) / value)
+                    elif value < -1e-12:
+                        fraction = min(fraction, (lower_step[index] - base[index]) / value)
+                # A common scale preserves the correction's nullspace direction.
+                return base + max(0.0, min(1.0, fraction)) * correction
+
             # Reaching is the primary task. A blended position/orientation solve can
             # sacrifice the reach to preserve an infeasible wrist angle, eventually
             # twisting the shoulder against its limits during a sustained grip.
-            step = damped_step(matrix, np.asarray(error, dtype=float))
-            identity = np.eye(len(joint_order))
-            position_null = identity - np.linalg.pinv(matrix, rcond=1e-4) @ matrix
+            # Re-solve without joints already at a limit if their correction points
+            # outward. Otherwise one saturated joint can stop the entire reach.
+            free = np.ones(len(joint_order), dtype=bool)
+            step = np.zeros(len(joint_order))
+            for _ in range(len(joint_order) + 1):
+                step[:] = 0.0
+                step[free] = damped_step(matrix[:, free], np.asarray(error, dtype=float) * gain)
+                blocked = free & (((lower_step >= -1e-8) & (step < 0.0)) | ((upper_step <= 1e-8) & (step > 0.0)))
+                if not np.any(blocked):
+                    break
+                free[blocked] = False
+            step = add_within_budget(np.zeros(len(joint_order)), step)
+
+            def task_nullspace(tasks):
+                """Project only through joints available to the primary task."""
+                projector = np.zeros((len(joint_order), len(joint_order)))
+                free_indices = np.flatnonzero(free)
+                restricted = tasks[:, free]
+                projector[np.ix_(free_indices, free_indices)] = (
+                    np.eye(len(free_indices)) - np.linalg.pinv(restricted, rcond=1e-4) @ restricted
+                )
+                return projector
+
+            position_null = task_nullspace(matrix)
             posture_tasks = matrix
             if target_orientation is not None:
                 quaternion = self._first_pose_value(orientations)
@@ -4122,13 +4345,14 @@ class HumanoidExample(BaseSample):
                 # The exact SVD projector is intentional: a damped projector leaks the
                 # secondary task into the reach when the arm is near a singular pose.
                 orientation_matrix = angular @ position_null * weight
-                orientation_residual = (rotation_vector - angular @ step) * weight
-                step += position_null @ damped_step(orientation_matrix, orientation_residual)
+                orientation_residual = (rotation_vector * gain - angular @ step) * weight
+                orientation_step = position_null @ damped_step(orientation_matrix, orientation_residual)
+                step = add_within_budget(step, orientation_step)
                 posture_tasks = np.vstack((matrix, angular))
 
             # The seven-joint arm still has redundant freedom. Resolve it toward the
             # default posture instead of allowing shoulder/wrist branches to drift.
-            posture_null = identity - np.linalg.pinv(posture_tasks, rcond=1e-4) @ posture_tasks
+            posture_null = task_nullspace(posture_tasks)
             rest_error = np.asarray(
                 [
                     self._g1_arm_joint_defaults.get(indices[name], float(current[indices[name]]))
@@ -4136,15 +4360,10 @@ class HumanoidExample(BaseSample):
                     for name in joint_order
                 ]
             )
-            step += self._arm_posture_gain * (posture_null @ rest_error)
-            step *= self._arm_ik_gain
+            posture_step = self._arm_posture_gain * gain * (posture_null @ rest_error)
+            step = add_within_budget(step, posture_step)
             if not np.all(np.isfinite(step)):
                 return None
-            # Scale the vector together: independent clipping changes the solved
-            # direction and can turn a descent step into motion away from the target.
-            peak = float(np.max(np.abs(step)))
-            if peak > self._arm_ik_max_step:
-                step *= self._arm_ik_max_step / peak
         except Exception:
             return None
 
@@ -4162,7 +4381,12 @@ class HumanoidExample(BaseSample):
         return targets
 
     def _compute_arm_targets_from_body_position(
-        self, side: str, hand_body: Gf.Vec3d, target_orientation: Gf.Matrix4d | None = None
+        self,
+        side: str,
+        hand_body: Gf.Vec3d,
+        target_orientation: Gf.Matrix4d | None = None,
+        *,
+        physics_snapshot: dict | None = None,
     ) -> dict[int, float]:
         """Turn a desired hand position (body frame, relative to the pelvis) into arm joint targets.
 
@@ -4176,13 +4400,15 @@ class HumanoidExample(BaseSample):
             hand_body: Target hand position in the robot's body frame, relative to the
                 pelvis, in metres.
             target_orientation: Desired wrist rotation in world space for the live IK solver.
+            physics_snapshot: Optional tensor reads shared by both arms in this physics
+                callback only. Use a fresh dictionary for every callback.
 
         Returns:
             ``{dof_index: target_angle}`` for the seven live arm joints, or the
             four-joint degraded fallback when a live Jacobian is unavailable.
         """
         if self._arm_ik_use_jacobian:
-            solved = self._solve_arm_ik_jacobian(side, hand_body, target_orientation)
+            solved = self._solve_arm_ik_jacobian(side, hand_body, target_orientation, physics_snapshot=physics_snapshot)
             if solved:
                 return solved
 
@@ -4217,11 +4443,33 @@ class HumanoidExample(BaseSample):
             targets[dof_index] = angle
         return targets
 
+    def _update_teleop_input_clock(self, dt: float, now: float | None = None) -> None:
+        """Keep input filtering responsive when rendering slows simulation progress.
+
+        Hand samples arrive in real time. Filtering them using only simulated time
+        stretches the filter delay whenever the simulation runs below real time.
+        Use bounded wall time for input filters, while physics and joint-speed
+        limits continue using the actual physics timestep. A pause or long stall
+        starts a fresh filter interval rather than permitting a large catch-up jump.
+
+        Args:
+            dt: Positive physics timestep in seconds.
+            now: Optional monotonic timestamp for deterministic validation.
+        """
+        now = time.perf_counter() if now is None else float(now)
+        previous = self._last_teleop_wall_time
+        self._last_teleop_wall_time = now if math.isfinite(now) else None
+        elapsed = 0.0 if previous is None else now - previous
+        if not math.isfinite(elapsed) or elapsed <= 0.0 or elapsed > 0.25:
+            self._teleop_input_dt = dt
+        else:
+            self._teleop_input_dt = max(dt, min(elapsed, 0.05))
+
     def _smooth_and_clamp_arm_targets(self, raw_targets: dict[int, float]) -> dict[int, float]:
         """Smooth hand-tracking joint targets and clamp to joint limits."""
         targets = {}
         positions = self._first_pose_value(self.g1.robot.get_dof_positions())
-        alpha = smoothing_alpha(self._arm_smoothing, self._last_physics_dt)
+        alpha = smoothing_alpha(self._arm_smoothing, self._teleop_input_dt)
         max_step = self._arm_max_joint_speed * self._last_physics_dt
         for dof_index, raw_target in raw_targets.items():
             if not math.isfinite(raw_target):
@@ -4266,9 +4514,12 @@ class HumanoidExample(BaseSample):
         base_position, yaw = base_pose
 
         raw_targets = {}
+        # Both arms observe the same completed physics step. Reuse its full
+        # Jacobian/joint snapshot, and discard it before the next callback.
+        physics_snapshot = {}
         active_sides = set()
         for side, device in (("left", left_xr), ("right", right_xr)):
-            hand_pose = self._get_hand_tracking_pose(device)
+            hand_pose = self._get_optical_arm_pose(side, device)
             source = "hand_tracking" if hand_pose is not None else "controller"
             pose_is_relative = False
             if hand_pose is None and self._controller_arm_control_enabled:
@@ -4289,8 +4540,14 @@ class HumanoidExample(BaseSample):
             target_body = self._smooth_arm_rig_target(side, target_body)
             self._update_arm_rig_target(side, target_body, base_position, yaw)
             self._update_grabbed_object(side, self._is_hand_closed(side, device))
-            orientation = self._compute_arm_target_orientation(side, hand_pose, yaw)
-            raw_targets.update(self._compute_arm_targets_from_body_position(side, target_body, orientation))
+            orientation = self._compute_arm_target_orientation(
+                side, hand_pose, yaw, input_device=device if source == "hand_tracking" else None
+            )
+            raw_targets.update(
+                self._compute_arm_targets_from_body_position(
+                    side, target_body, orientation, physics_snapshot=physics_snapshot
+                )
+            )
 
         for side in ("left", "right"):
             if side not in active_sides:
@@ -4306,8 +4563,12 @@ class HumanoidExample(BaseSample):
 
     def _deactivate_hand(self, side: str) -> None:
         """Release a lost input source and invalidate its clutch calibration."""
-        for index in self._g1_arm_dof_indices_by_side.get(side, {}).values():
-            self._smoothed_arm_targets.pop(index, None)
+        # Clear the active command once on tracking loss. Repeating this every
+        # inactive tick restarts the return-to-rest slew at the measured joint and
+        # prevents a position drive from building enough error to move promptly.
+        if side in self._arm_input_sources:
+            for index in self._g1_arm_dof_indices_by_side.get(side, {}).values():
+                self._smoothed_arm_targets.pop(index, None)
         if self._grabbed_objects_by_side.get(side) is not None:
             self._grab_requires_release[side] = True
         self._release_grabbed_object(side)
@@ -4361,7 +4622,7 @@ class HumanoidExample(BaseSample):
     def _smooth_finger_curls(self, side: str, curls: dict[str, float]) -> dict[str, float]:
         """Low-pass the per-finger curls so tracking jitter does not buzz the joints."""
         previous = self._smoothed_finger_curls.get(side, {})
-        alpha = smoothing_alpha(self._finger_smoothing, self._last_physics_dt)
+        alpha = smoothing_alpha(self._finger_smoothing, self._teleop_input_dt)
         smoothed = {}
         for role in (*self._finger_roles, "thumb_yaw"):
             # Controllers close the whole hand, including opposition. Optical input
