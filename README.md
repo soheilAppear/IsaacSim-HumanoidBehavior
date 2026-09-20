@@ -26,28 +26,134 @@ Robot-camera screenshots from the **7 September 2026** G1 recording, at their na
 The default is **stationary manipulation**. A world constraint anchors the robot's
 pelvis while its arms and fingers remain controllable. Walking, turning, keyboard
 locomotion, and step-in-place inputs cannot move the base in this mode.
+The separate walking launcher now uses **controller sticks for movement and
+optical hands for manipulation**. The old gesture launcher is an alias for it.
 
 | Capability | Current implementation |
 |---|---|
-| Arm control | Controller grip clutches that arm; valid optical wrist/middle-knuckle positions drive an anatomical palm target without a grip button or fist; measured scenery contacts limit inward arm motion |
-| Finger control | Five independent curl targets and separate thumb opposition from the optical skeleton; controller trigger closes the whole hand |
+| Arm control | Valid optical wrist/middle-knuckle positions drive an anatomical palm target without a grip button or fist; measured scenery contacts limit inward arm motion. Controller grip clutches apply only outside the optical-only walking profile |
+| Finger control | Five independent curl targets and separate thumb opposition from the optical skeleton; controller trigger closure applies only outside the optical-only walking profile |
+| Optional webcam | Quest remains primary for each arm and hand; calibrated webcam position, elbow guidance, and optional finger curls are used only for missing Quest input |
 | Pickup | Experimental physical contact grasping with bounded finger targets; objects must be held by fingers and friction, with no hand-to-object fixed joint |
-| Camera | Head turns rotate the view left/right, up/down, and in roll; its position stays mounted to the robot head/torso, including during Pause |
+| Camera | Stabilized robot frame follows travel; HMD orientation rotates the view and its eye offset around the measured neck. Torso roll/pitch, gait bob, and real-world head translation are excluded |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
-| Physics | CPU, with a configured 100 Hz physics timestep; rendering requests 90 Hz |
+| Physics | CPU: 100 Hz stationary / 200 Hz walking; rendering requests 90 Hz stationary / 60 Hz walking |
 | Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
-| Walking and learned control | Optional walking modes and learning scaffolding remain available for experiments; they are outside the stationary-mode acceptance results |
+| Experimental walking | Left stick moves forward/backward/sideways; right stick turns. Controller grip/trigger/buttons do not control the arms or fingers in this profile; blue pointing navigation is disabled but retained |
 
 Inspire has six independent hand actuators. Distal knuckles are coupled, so it cannot
 reproduce every human knuckle angle or finger-splay movement separately.
 
-The first valid headset orientation sets forward; **B** resets it. Walking, leaning,
-or crouching in the room does not translate the camera. This turns the view only:
-the G1's visible head remains fixed to its torso, with no actuated neck joint.
-Eye-gaze tracking is unchanged.
+The latest source passed **881 offline tests**. Earlier controller replays passed all
+six physical walking directions, release/loss/rearm checks, three Stop/Play cycles
+and two Pause/Play cycles. The neck-anchored head and eye-arc camera passed 25 native
+XR pose checks; ten desktop first-person views, including steep downward and
+backward views, were clear with the final 5 cm near plane. These checks use
+synthetic stick/head inputs where indicated; live tracking quality and perceived
+comfort remain operator checks. Shelf pickup and loaded transport are separate tests.
+See the [latest validation record](docs/validation/isaac-sim-6.1.md#controller-walking-and-visible-head--20-september-2026).
 
-The front-right table now offers **six lightweight physical objects**, with varied
-shapes, heights, and thicknesses:
+Residual walking checks now measure foot-centroid travel and mean sole heading,
+allowing small stance corrections during reaching. After braking, a fault requires
+matching root/support motion and more than 15 cm of support travel or 0.35 rad of
+turning from a fixed reference. These are minimum excursions alongside speed/dwell
+checks, not hard travel limits: slow or intermittent drift can evade this guard.
+Fast-runaway and fall guards remain active. Earlier incident and backward/settle
+passes predate this latest correction. The final source also passed a fresh physical
+approach and carton press/withdrawal check without a fault.
+
+During physical decoupled walking, measured upward contact forces on a hand also
+limit inward arm motion into a graspable package. This helps avoid pushing a carton
+down into a shelf while retaining side squeezing and withdrawal. It is a directional
+motion limit, not force control or shelf-support detection; free or tilted cartons
+can also trigger it. The native check verified blocked inward commands and clear
+withdrawal; a complete real-hand lower-and-rotate placement remains unverified.
+
+The latest object-reset investigation traced a carton snapping back to its authored
+position to highlight binding changes. Shared highlights now use prebuilt visual
+shells and change only shader inputs outside the simulated objects. They skip
+writes when the visible color stays unchanged.
+Gaze tracking and its ray are unchanged. A fresh physical test passed: setting and
+clearing the highlight left a carton at its settled position, 20.30 cm away from
+its authored pose, within 1.23e-7 m. Fresh rendered captures also confirmed the
+original carton, green selection, and restored original appearance. The existing
+pickup limitations still apply. Explicit Reset also avoids
+initializing the robot twice and allows a repeated fault to be logged again.
+
+**Windows VR renderer workaround:** the repository launchers now select Direct3D12
+for this process with `--/app/vulkan=false`, leaving installed and global settings
+unchanged. Native XR off/on crashed under Vulkan but passed twice under Direct3D12;
+camera-pose and physical backward/settle checks also passed. This is a local workaround,
+not a performance claim or a guarantee against every native crash. The user reported
+**Stop → Humanoid Reset**, without requesting an XR restart. The registered Reset
+handler and the existing built Reset button's callback passed under Direct3D12 with
+XR enabled. The latter used `Button.call_clicked_fn()`, not a physical mouse click;
+live hand/gaze quality remains an operator check. Restart Isaac through the repository launcher
+to use the new renderer. See the
+[renderer validation](docs/validation/isaac-sim-6.1.md#direct3d12-process-workaround).
+
+A separate Clear/Load crash entered NVIDIA's Metrics Assembler change listener
+during stage closure. The launcher now disables that edit listener while retaining
+initial asset conversion. A fresh load and subsequent Clear/Load both passed with
+the workaround, followed by successful XR startup. In-place asset variant/reference
+changes require a fresh load. The separate Vulkan XR off/on failure is addressed by
+the Direct3D12 workaround above. See the
+[investigation record](docs/validation/isaac-sim-6.1.md#carton-reset-and-explicit-reset-investigation).
+
+The **earlier pointing implementation** also passed a physical detour to an 8.53 m
+destination around a packing table. Reliable close docking and tall-carton pickup
+remained unvalidated. See the
+[validation record](docs/validation/isaac-sim-6.1.md#comfort-camera-factory-routes-and-tall-cartons--20-september-2026)
+for measured results, recording-pause improvements, and remaining limits. Those
+earlier results do not validate shelf pickups or bimanual transport.
+
+The first usable headset heading sets forward; keyboard **B** recenters that heading.
+Calibration keeps the floor upright: startup pitch/roll are never saved as a
+camera offset, while looking up/down and tilting your head remain tracked. Face your
+intended forward direction and press **B** with Isaac focused after putting on the
+headset if it was resting in a different direction at startup. The view uses the
+G1's authored D435 optical-sensor height, about **4.6 cm above** the former head-bounds
+midpoint. After settling, the neutral eye-height reference stays fixed for the level floor.
+Robot travel and heading are smoothed; HMD rotation is applied without that filter.
+The camera validates headset descriptors without adding an HMD filter. This installed
+Kit uses its processed descriptor because the native raw-descriptor method is absent;
+runtime smoothing and rendering latency still apply.
+Turning your head rotates the camera's eye offset around the measured neck in the
+stabilized robot frame, keeping the viewpoint outside the rotating head. Walking,
+leaning, or crouching in the room does not translate the camera. The visible head rotates
+with HMD orientation around a fixed neck pivot on the torso, so camera smoothing
+cannot pull it away from the body. The camera keeps its existing robot-motion filter
+and rejects gait bob and torso roll/pitch. Physical head colliders stay fixed because
+G1 has no actuated neck.
+Eye-gaze tracking is unchanged. This camera mode does not support ramps or stairs.
+
+The current render-head helper keeps the head visible and attached at its measured
+neck pivot in both camera modes. It does not translate the head to follow the
+stabilized eye. Earlier camera-following and reversible hiding helpers remain for
+legacy diagnostics. The fixed-eye camera contract is superseded: its downward view
+looked inside the visible head. The orientation-driven eye arc is paired with a
+fixed **5 cm near plane** in both the USD camera and native XR profile to clear
+residual self-occlusion. Geometry within 5 cm of the eye is clipped, including a
+hand or object brought that close. The prior XR setting is restored on exit.
+Fresh production checks passed 25 native XR poses and visual inspection of ten
+desktop first-person views. Native per-eye visibility and perceived comfort remain
+operator checks.
+
+| Restored visible head | Robot-eye shelf view |
+|:---:|:---:|
+| ![Visible G1 head and both hands in the controller scene](docs/readme/g1-visible-head-controller-scene.png) | ![Three racks of handle-free cartons from the robot-eye camera](docs/readme/g1-controller-shelf-view.png) |
+
+Actual 20 September controller-profile renders. These show head visibility and
+shelf layout, not a successful pickup. The open face is part of the loaded G1 mesh.
+
+![Robot-eye view looking down toward the tall practice carton and its raised handle](docs/readme/g1-comfort-view-tall-carton.png)
+
+Earlier pointing scene from 20 September, looking down 30°. This static check shows camera
+clearance and the raised handle; successful pickup remains unvalidated.
+
+In the default stationary scene, the practice table is centered in front of the G1, with its top **0.92 m above
+the floor**. Six lightweight objects sit in two rows 0.32 m and 0.44 m forward,
+between the arms, with varied shapes, heights, and thicknesses:
 
 | Color | Object | Dimensions | Mass |
 |---|---|---|---:|
@@ -62,7 +168,7 @@ All use gravity and real collisions. The original cube and cylinder retain their
 sizes and masses; earlier historical pickup results used smaller 4 cm objects.
 Grasping the four new shapes has not been validated.
 The sphere, cube, and orange cylinder now sit nearer the robot, with the other
-three shapes staggered behind them. An open-hand replay confirmed that both arms
+three shapes in a second row. An earlier open-hand replay confirmed that both arms
 can nearly straighten fully and retract without a fault. Reach still follows the
 G1's actual geometry and joint limits; this layout change adds no arm length or
 grasp guarantee. See [arm reach](HUMANOID_VR_CONTROL.md#palm-angle-arm-bending-and-latency).
@@ -147,13 +253,215 @@ the documented working connection uses SteamVR with Steam Link.
    No copying into the standalone installation is needed.
 4. Open **Window → Examples → Robotics Examples → Policy → Humanoid**
    (panel title **Humanoid: Unitree G1**), click **LOAD**, then **Play**.
-5. Begin with the small cube and cylinder on the near edge of the front-right table.
+5. Begin with the cube and cylinder on the near edge of the centered practice table.
 
 See [Running](HUMANOID_VR_CONTROL.md#running) for the detailed startup procedure.
 After changing Python source, restart Isaac Sim and reload the example so it uses
 the updated classes.
 
+### Optional webcam alongside Quest
+
+The webcam tracker runs in its own Python environment. It sends landmarks over
+localhost; it does not install ML packages into Isaac. Enable it explicitly and
+calibrate with both hands visible to Quest and the webcam before using fallback.
+See [webcam setup and calibration](HUMANOID_VR_CONTROL.md#webcam-alongside-quest)
+for commands and tracking-loss behavior. This is an experimental single-camera
+input, not full-body locomotion or reliable tracking through occlusion.
+
+### Controller walking and optical manipulation
+
+Close the previous Isaac session, keep SteamVR running, and launch:
+
+```powershell
+Set-Location 'C:\Users\Soheil\Documents\GitHub\IsaacSim-HumanoidBehavior'
+.\tools\launch_controller_walking.bat
+```
+
+LOAD the Humanoid example and press **Play**. `launch_gesture_walking.bat` now
+launches this same controller profile for compatibility. The base
+`launch_isaac_vr.bat` remains the stationary option.
+
+| Input | Controller walking profile |
+|---|---|
+| Center both sticks | Enable walking input after startup, Stop/Pause/Reset, controller loss, or an input interruption |
+| Left stick forward/backward | Request forward/reverse walking |
+| Left stick left/right | Request sideways walking |
+| Right stick left/right | Request turning |
+| Release sticks or lose a valid controller | Clear walking commands; the physical robot must still brake |
+| Optical wrist/palm and finger motion | Control the corresponding robot arm and individual fingers |
+| Controller grips, triggers, face buttons and stick clicks | Ignored in this profile; they do not close fingers, clutch arms, drop objects or change the camera |
+
+The blue ray and pointing selector are disabled; their implementation is retained.
+Gaze and its red ray are unchanged. Keyboard **B** still recenters the view.
+This profile also temporarily disables Kit's built-in VR navigation and object
+manipulation tools so the same sticks/triggers cannot move the native viewer or
+scene objects. Raw headset, eye, hand and controller input remains enabled; the
+previous tools layout is restored on XR/profile exit or example cleanup.
+The same pretrained GR00T WholeBodyControl actor and physical safeguards remain.
+All six walking directions passed physical replays with synthetic stick input.
+Pickup and loaded transport require separate validation.
+
+**The current Quest/SteamVR setup switches between controllers and optical hands.**
+It does not presently supply both simultaneously. Walk with the sticks, center
+them and stop, then switch to bare-hand tracking to manipulate objects. Controller
+poses or inferred controller finger shapes are never substituted for optical
+fingers in this profile. Recognized optical hands also block retained stick values;
+returning to controllers requires centered sticks before movement resumes.
+An explicitly enabled, calibrated webcam with detailed hand tracking can provide
+a separate fallback while the controllers are active;
+this is optional and remains subject to webcam visibility and calibration.
+
+Controller walking adds model-based gravity holding torque to the fourteen arm
+joints, within their existing motor limits. It supports the robot's own arm weight;
+it does not estimate payload weight or grip pressure. This addition is off in the
+stationary and retained pointing profiles. The shared seven-joint arm solver also
+uses remaining joints to align the palm when a wrist reaches its limit, while
+preserving the primary reach. Joint/contact limits still apply, and these changes
+do not establish successful shelf pickup or loaded walking.
+
+The controller scene adds **12 handle-free cartons on three two-level shelves**,
+retaining the six table objects and four floor cartons (**22 movable props**).
+The racks are **1.60 m wide** with shelf heights from **0.68 to 1.06 m**;
+cartons are **0.10–0.25 kg**, with different widths and heights. These represent
+light empty cartons, not loaded warehouse packages. To attempt a two-hand wrap,
+stop, place the palms
+on opposite box sides, curl the fingers around it, and lift gently. Objects use
+real contacts and friction, without attachment joints or adhesive forces.
+The new bimanual diagnostic recognizes opposing contacts across both hands and
+reports measured normal force plus estimated friction capacity. Its status does
+not prove a successful lift, pressure measurement, or stable carried load.
+The latest synthetic replay completed a contact-free approach but failed to hold
+the carton. The revised palm-first validator now checks opposing palm contact
+before curling and opposing side contact before lift. Its live grip-only trial
+failed the palm-contact gate and stopped before curling or lifting.
+See the [validation record](docs/validation/isaac-sim-6.1.md#shelf-pickup-attempts-remain-failed).
+
+### Retained pointing navigation
+
+**Walking is opt-in; the normal launcher remains stationary.** The pretrained
+NVlabs GR00T-WholeBodyControl G1 balance/walk models command 15 leg/waist joints
+while both arms and fingers retain teleoperation. These are upstream models;
+this repository does not train them. This is GR00T **Whole-Body Control**, rather
+than the GR00T foundation/VLA model. The following describes the retained
+**left-hand pointing** profile, which is disabled in both walking launchers.
+To select it explicitly for development, close Isaac and run:
+
+```powershell
+Set-Location 'C:\Users\Soheil\Documents\GitHub\IsaacSim-HumanoidBehavior'
+$env:G1_GESTURE_WALKING = '1'
+$env:G1_LOCOMOTION_INPUT = 'pointing'
+$env:G1_POINTING_NAVIGATION = '1'
+.\tools\launch_isaac_vr.bat
+```
+
+LOAD the Humanoid example and press **Play**:
+
+1. Open your left hand first. This is required again after Stop, Pause, or Reset.
+2. Point with the left **index finger straight**, with middle, ring, and little
+   fingers curled. Thumb position is ignored. A **blue ray** shows your pointing.
+3. Hold the blue ray steadily on a clear floor spot or practice object for **0.6 seconds**. The marker
+   turns cyan during acquisition, then green when the destination is locked.
+4. Keep pointing to walk toward the locked destination. Open your left hand to stop.
+   Your gaze can face anywhere during selection and walking; its existing red ray
+   continues to work independently.
+
+Cruise requests now reach **0.65 m/s** (previously 0.45 m/s). Slowing begins
+within **1.60 m** of the target; the final approach and 30 cm arrival threshold
+retain their previous behavior. Actual speed depends on the learned controller
+and simulation throughput. The 19 September physical replay passed forward walking,
+both turns, and stopping. It averaged **0.488 m/s in simulation** on the straight
+phase; measured world-forward progress per wall second was about **2.29×** the
+earlier 0.45 m/s run. A synthetic 3 m destination replay, reaching at 0.65 m/s,
+and VR Stop/Play checks also passed. Operator pointing accuracy remains unverified.
+
+Choose a visible floor spot **0.5–50 m** away, in any direction around the robot.
+An adaptive angular filter reduces pointing jitter; drawing and collision queries
+use the same filtered ray. Dwell allows **18–30 cm** of drift according to distance,
+measured from the first hit throughout the 0.6-second hold. A ray miss hides the
+hit marker. The ray stops at its first object. A practice-object hit can select a separately
+checked floor approach point; walls and tables block selection. No floor hit is invented.
+The direct route must clear a **0.76 m-wide corridor**, including body clearance
+and a 10 cm braking reserve inside the 30 cm arrival radius. When that route is
+blocked, the robot stands still while a bounded planner checks a detour through
+the factory. Keep pointing during planning; opening the hand cancels it.
+Large heading changes request **0.4 rad/s stepping turns** from the physical actor,
+with zero requested forward travel; the body can drift as its feet step. Curved
+forward steering remains capped at **0.2 rad/s**. Fresh body and route checks use
+the measured position throughout both kinds of turn. A turn stops if heading fails
+to improve by **0.05 rad within 15 wall seconds**; open the hand before retrying.
+A synthetic 180° turn-and-approach replay passed; the stepping phase drifted
+**0.493 m**, so this is not a fixed-position pivot.
+For an object target,
+the blue hit stays on the object and the floor marker shows where the robot stops.
+The robot requests a stop within **0.30 m** of its destination, on invalid hand
+tracking, or if its route becomes blocked. Release the pointing gesture before
+selecting again. There is no reverse or strafe command. The blue collision ray
+extends 60 m; targets beyond the 50 m walking limit remain ineligible. Controller
+or webcam input cannot authorize walking. Eye tracking is not a walking input;
+its availability, direction, and fallback do not gate destination selection.
+
+Starts use bounded wall-time smoothing, so a slow simulation no longer stretches
+the command ramp in proportion to its slowdown. The physical gait still advances
+at the simulation's speed. `gesture_locomotion_status()` reports the selection
+state, target, acquisition progress, input `detail`, requested/filtered velocities,
+and policy mode. Stop invalidates physics caches; Play requires fresh navigation
+input. Camera scheduling waits for ready XR and valid finite poses, preserving
+the mounted-camera mapping. **Three Stop/Play and two Pause/Play cycles passed
+with real XR active and no fault.** The reported restart crash did not recur in
+those checks, which predate the point-only change. The full point-only physical
+replay passed with synthetic pointing; actual Quest pointing accuracy and occlusion
+remain operator checks. The diagnostic mode is `point_only`.
+
+Tracking-loss stopping requires current tracked landmarks, rather than merely
+valid inferred poses. A cached skeleton still incorrectly marked tracked by the
+XR runtime can conceal occlusion, so real Quest tests of
+hands leaving the camera view are still required; immediate stopping in that case
+is not established by synthetic loss tests.
+
+This scene moves the practice table to `(2, -2)` m and adds four physical warehouse
+cartons beside the walking aisle. It uses gravity and pretrained leg/waist actors,
+with no root teleporting or kinematic fallback. Three additional lightweight,
+tall cartons have handles at **0.680, 0.800, and 0.935 m** above the floor after
+settling (authored heights **0.685, 0.805, and 0.940 m**).
+Their stations are `(3.5, 2.8)`, `(3.5, -2.8)`, and `(1.35, 0)` m.
+The tallest carton is directly ahead of the starting robot for an initial pickup
+attempt; it is a physical obstacle, so longer routes must go around it.
+Stop, reach an open hand around a handle, oppose the thumb, then close and lift;
+opening releases it. These props use contact and friction, with no grasp attachment.
+It retains G1's learned controller; the H1 sample's network is not transplanted
+onto this different robot. Planning is bounded: narrow aisles, missing floor,
+blocked turning space, or the search limit can still reject a destination.
+Planned detours reserve approximately **0.687–0.910 m half-width**, depending on
+route angle, to contain the full runtime turning square plus 0.15 m of tracking
+error. Their start and actual corners require about
+**1.037 m half-width**, including 0.50 m for observed stepping drift. Straight
+sections do not all require that larger corner space. Direct close-object
+approaches retain their previous braking-aware clearance. The first physical
+detours stopped safely beside a table. The corrected projected planner passed a
+physical detour to a destination 8.53 m away around that table, stopping 0.299 m
+from its target. This does not establish access to every factory aisle or transport
+while carrying a package.
+**Stop before precision pickup:**
+the tested extended right palm remained about 9–10 cm from its target while walking
+and stopped. The new tall-carton pickup, floor pickup, crouching, and payload
+carrying are not established by earlier replays. Gaze
+and the external webcam fallback pipeline are unchanged. See the
+[walking controls and current limits](HUMANOID_VR_CONTROL.md#controller-walking-and-optical-manipulation)
+and [policy provenance](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/robots/data/README.md).
+
+Walking mode applies the pretrained controller's outward-arm shoulder-roll limits,
+including while balancing at zero command. Arm tracking remains
+live within those limits; stationary-mode reach is unchanged. These limits were
+enabled during the latest physical destination and stopping checks. Arbitrary
+simultaneous reaching and walking remains unvalidated.
+
 ## Controls
+
+These arm and pickup controls apply to the default **stationary** scene. The
+separate walking demo keeps legs and waist under policy control and accepts arm
+and finger input within the walking limits described above.
+In the current controller walking profile, use optical hands instead: the grip,
+trigger, face-button and stick-click actions in this stationary table are disabled.
 
 | Input | Action |
 |---|---|
@@ -161,7 +469,7 @@ the updated classes.
 | **Trigger** | Close that hand around the object; physical pickup depends on contact and friction |
 | Release **grip** | Hold that arm's pose in physical mode; valid trigger input still controls the fingers |
 | Controller **Y** | Force both hands open; release the trigger or open your tracked fingers to rearm |
-| **B** | Make the current headset orientation the forward view |
+| **B** | Recenter forward heading; preserve physical pitch/roll and a level floor reference |
 | Turn / tilt the headset | Rotate the view while its position stays mounted to the robot |
 | Left stick click | Retain the mounted camera mode |
 | Sticks, X/A, locomotion keys, head movement | No base movement in stationary mode |
@@ -180,11 +488,59 @@ for the cube, bring the thumb pad across to face the index pad on opposite sides
 Making a fist nearby is insufficient. See the [full control guide](HUMANOID_VR_CONTROL.md#controls)
 for input mapping, tracking loss, and release behavior.
 
-If optical arm tracking disappears, physical mode holds the measured arm pose until
-tracking returns. Missing finger input still opens the fingers. This prevents an
-automatic return to rest from dragging a hand through the table.
+If optical arm tracking disappears without a calibrated webcam alternative,
+physical mode holds the measured arm pose until tracking returns. Missing finger
+input still opens the fingers. This prevents an automatic return to rest from
+dragging a hand through the table.
 
 ## Validation and known limitations
+
+Point-only walking is experimental. **504 offline checks passed in 9.017 seconds**.
+The full physical replay passed all five phases: destination approach, arrival
+stopping, hand release, explicit tracking loss, and final balance. It advanced
+**0.6047 m**, stopping the approach **0.29987 m** from the target, without a health
+fault or callback error. Only navigation hand measurements were synthetic; real
+scene queries, blue visuals, and the pretrained controller remained active. The
+hand reader was restored, gaze was untouched, and the timeline was paused afterward.
+The updated point-only mode also passed **three Stop/Play and two Pause/Play**
+cycles without faults, requiring a fresh hand release. XR was disabled and no
+devices were connected in that lifecycle run, so it validates desktop physics
+restart only. Point-only Quest hardware, pointing accuracy, and occlusion behavior
+remain operator checks.
+
+**Historical point-and-gaze validation:** **505 offline checks passed.**
+That synthetic-input physical replay moved **0.603 m**, reached **0.29985 m**
+from its selected target, and passed arrival stopping, hand release, and explicit
+tracking-loss checks. Its 300-second wall-time budget expired during the final
+balance hold. A separate **3.01 simulation-second** continuation passed with final
+planar speed about **0.0001 m/s** and no health fault. This is a set of passing
+phases and a separate continuation, not a complete uninterrupted replay pass.
+Input overrides were restored and the gaze tracker was preserved.
+
+**Earlier V-controller-era**
+real PhysX tests passed zero-command
+balance, forward walking, left/right forward steering, and stopping without root
+anchors. A separate replay passed right-arm reaching, finger closure/reopening,
+stopping with the arm extended, and synthetic tracking loss. Extended-palm error
+was about 9–10 cm, so stop before precision pickup and treat accuracy as unfinished.
+These historical replays do not validate the new destination selector. Separate
+real-XR checks passed three Stop/Play and two Pause/Play cycles without faults.
+Actual operator pointing/occlusion acceptance, floor pickup, and payload carrying remain
+unvalidated. Check the [validation record](docs/validation/isaac-sim-6.1.md) for the
+measured configuration and reproducible live-test command.
+
+The **17 September Quest-priority update** passed **329 offline tests**, fresh-scene
+and reset checks, and a synthetic PhysX replay covering both object rows and lowered
+hands while webcam input was unavailable. The centered table measures **0.92 m**
+high. A corrected startup pose prevents the hands from striking props before
+control initializes. See the
+[current validation record](docs/validation/isaac-sim-6.1.md#quest-priority-and-table-reach--17-september-2026).
+
+The earlier **16 September** checks also verified real webcam-to-Isaac packets.
+Real headset-plus-webcam calibration, field-of-view handover, and detailed camera
+finger detection still need an operator check. A headless scene reload crashed in
+Isaac's native debug-draw plugin during that work; subsequent replays used a fresh
+process. See the [webcam validation record](docs/validation/isaac-sim-6.1.md#optional-webcam-integration--16-september-2026).
 
 Historical checks on **7 September 2026**, using Isaac Sim **6.0.0**:
 
@@ -197,8 +553,8 @@ Historical checks on **7 September 2026**, using Isaac Sim **6.0.0**:
 | Real eye input | `eye_tracker` was observed with zero failed updates during the connected checks; gaze implementation/settings were preserved |
 | Real Quest finger input | Skeletons arrived intermittently in this historical check; see the 12 September recovery below |
 
-These camera results concern the former fully fixed view. The current rotation-only
-view has separate checks; they do not retroactively validate its headset behavior.
+These camera results concern the former fully fixed view. The current orientation-driven
+eye arc has separate checks; they do not retroactively validate its headset behavior.
 
 The live replays inject input at the XR boundary and measure real simulation behavior.
 They establish control and physics behavior; they do not establish headset tracking
@@ -233,7 +589,7 @@ the recorded failure were checked separately: the derived path and larger-cylind
 pickup passed; both larger-cube grasp trials failed without destabilizing the robot. See
 [palm angle, arm bending, and latency](HUMANOID_VR_CONTROL.md#palm-angle-arm-bending-and-latency).
 
-The current suite passed **242 offline tests**, including head-turn direction, release-latch recovery, retained contact caps,
+The **12 September head/reach update** passed **242 offline tests**, including head-turn direction, release-latch recovery, retained contact caps,
 arm-contact limits, articulation health, and hand-joint stabilization. See the
 [validation record](docs/validation/isaac-sim-6.1.md) for configurations and results.
 Historical starter-object passes apply only to their recorded settings; no replay
@@ -255,11 +611,10 @@ Run offline tests with Isaac Sim's Python wrapper:
 ```
 
 With the updated example loaded and the Python server enabled, run live checks
-**one at a time** using ordinary host Python:
-
-```powershell
-python tools/validate_camera_live.py
-```
+**one at a time** using ordinary host Python. The older
+`tools/validate_camera_live.py` checks the historical rigid mount; use the
+[current camera acceptance procedure](docs/humanoid-control.md#camera-and-finger-validation)
+for the stabilized view.
 
 For a fresh, initialized physical-mode scene, check light contact with the table:
 
@@ -309,30 +664,47 @@ results are in [Automated validation](docs/humanoid-control.md#automated-validat
 
 ## Performance
 
-**100 Hz physics and 90 Hz rendering are configured rates, not measured performance
+**Stationary mode requests 100 Hz CPU physics and 90 Hz rendering; gesture walking
+requests 200 Hz physics and 60 Hz rendering. These are configured rates, not measured performance
 guarantees.** The last active minute of the 12 September recording advanced 16.26
 simulated seconds in 59.992 wall seconds: **0.271× real time**, or roughly 3.7 times
 slower. This is a baseline from before the arm-response changes.
 
-The code performs synchronous PNG encoding and CSV writes inside physics callbacks,
-creates an additional recording-camera render product, and repeats some robot-pose
-and IK reads. These are candidates for measurement; their individual contribution
-has not yet been isolated. CPU physics was chosen using older scene measurements,
-which do not establish current performance.
+The first 19 September update removed repeated hand calculations and hidden-marker USD
+writes, and uses Fabric to pass CPU physics poses to the renderer. In short live
+windows with Quest optical hands and recording enabled, application updates rose
+from **19.08 to 23.37/second**, and real-time factor from **0.212 to 0.259**.
+These are application measurements, not headset FPS or end-to-end hand latency;
+the simulation remains below real time. Gaze, camera mapping, physical timestep,
+and contact limits remain unchanged.
 
-The next useful comparison is the same scene with recording enabled and disabled
-**before loading**, with only one Isaac session open. The
-[performance guide](docs/humanoid-control.md#performance-and-cpu-physics) explains the
-settings, measurement procedure, and limitations. Gaze and camera behavior should be
-held constant during that comparison.
+The subsequent pointing update batches hand reads, bounds raw arm IK to 100 Hz
+while retaining 200 Hz feedback, removes duplicate body PD work, and uses faster
+lossless PNG compression. Walking rendering is now configured at 60 Hz on startup.
+Comparable short observations advanced from **0.255 to 0.364 simulation seconds
+per wall second** (about **42% more progress**), while application updates changed
+from **23.00 to 21.77/second**. Simulation remains below real time; these are not
+headset-FPS or motion-to-photon measurements. **568 offline tests passed**. The
+0.65 m/s baseline and reaching replays passed without faults. A synthetic 3 m
+destination replay passed approach, arrival, release, loss, and final balance;
+three Stop/Play and two Pause/Play cycles passed with XR active. These checks do
+not establish operator pointing accuracy or perceived jitter.
+
+Rendering uses the GPU; physics and the small walking actor remain on CPU.
+Forcing 100% utilization is not a latency target. The
+[performance guide](docs/humanoid-control.md#performance-and-cpu-physics) explains
+measurements, tradeoffs, recording overhead, and remaining limits.
 
 ## Data and learning
 
 Sessions are written under `~/BehavioralCollection/raw_sessions/` with sensor CSVs,
 `metadata.json`, frame timestamps, and eye-camera PNGs. Rates are defined in simulation
-time; gaze queries run at 50 Hz and their latest result is reused by 100 Hz log rows.
-Periodic flushing limits buffered data, but an interrupted process can still lose
-unflushed rows.
+time; behavior, hand, gaze, and object rows remain nominally **100 Hz in both modes**.
+Recording intervals adjust to the physics timestep, so 200 Hz walking physics does
+not double those log rates. Gaze queries remain 50 Hz and their latest result is reused.
+Periodic CSV flushes use one background writer with up to eight pending batches;
+disk I/O no longer runs in the physics callback. Orderly cleanup drains accepted
+writes, but an interrupted process can still lose queued or unflushed rows.
 
 Gaze hits record the collider intersected by the supplied ray; they are observations
 of the gaze signal, not a guarantee of human intent. Grasp mode must accompany each
@@ -342,11 +714,11 @@ for files and columns.
 
 The [learning directory](learning/README.md) contains the planned dataset and
 world-model workflow. A trained planner is not integrated into the current robot
-controller. After contact grasping passes live checks, the
-[next research phase](HUMANOID_VR_CONTROL.md#next-research-phase) can add a webcam's
-shoulder/elbow posture alongside Quest hands and eyes, then investigate gaze and
-hand/finger velocity as intent cues. Velocity is not measured finger pressure.
-Neither webcam fusion nor a new intent-training pipeline is implemented yet.
+controller. Optional webcam arm and finger fallback is implemented; Quest remains
+the primary source. After live calibration and contact grasping pass operator
+checks, the [next research phase](HUMANOID_VR_CONTROL.md#next-research-phase) can
+investigate gaze and hand/finger velocity as intent cues. Velocity is not measured
+finger pressure. A new intent-training pipeline is not implemented yet.
 
 ## Project layout
 

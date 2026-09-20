@@ -17,12 +17,13 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import math
+import os
 import random
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import carb
 import isaacsim.core.experimental.utils.stage as stage_utils
@@ -34,8 +35,27 @@ from isaacsim.core.simulation_manager.impl.isaac_events import IsaacEvents
 from isaacsim.examples.base.base_sample_experimental import BaseSample
 from isaacsim.robot.policy.examples.interactive.humanoid.arm_contact import project_contact_step
 from isaacsim.robot.policy.examples.interactive.humanoid.articulation_health import find_articulation_fault
+from isaacsim.robot.policy.examples.interactive.humanoid.behavioral_csv_writer import (
+    BehavioralCsvWriter,
+    CsvBatch,
+    CsvWriteResult,
+)
+from isaacsim.robot.policy.examples.interactive.humanoid.bimanual_grasp import BimanualGraspMonitor
+from isaacsim.robot.policy.examples.interactive.humanoid.comfort_camera import ComfortCameraFilter
+from isaacsim.robot.policy.examples.interactive.humanoid.controller_locomotion import ControllerLocomotion
+from isaacsim.robot.policy.examples.interactive.humanoid.factory_route import FactoryRoutePlanner
 from isaacsim.robot.policy.examples.interactive.humanoid.grasp_controller import ContactGraspController
 from isaacsim.robot.policy.examples.interactive.humanoid.material_highlights import MaterialHighlights
+from isaacsim.robot.policy.examples.interactive.humanoid.operator_head import (
+    RobotHeadVisual,
+    compute_level_head_reference,
+)
+from isaacsim.robot.policy.examples.interactive.humanoid.package_shelves import create_shelf_packages
+from isaacsim.robot.policy.examples.interactive.humanoid.point_gaze_navigation import PointNavigation, is_pointing
+from isaacsim.robot.policy.examples.interactive.humanoid.point_navigation_scene import PointNavigationScene
+from isaacsim.robot.policy.examples.interactive.humanoid.point_ray import PointRayFilter
+from isaacsim.robot.policy.examples.interactive.humanoid.tall_packages import create_tall_packages
+from isaacsim.robot.policy.examples.interactive.humanoid.webcam_tracking import WebcamCalibration, WebcamReceiver
 from isaacsim.robot.policy.examples.interactive.humanoid.xr_pose import read_world_pose, smoothing_alpha
 from isaacsim.robot.policy.examples.interactive.utils import (
     restore_physics_simulation_state,
@@ -87,6 +107,64 @@ ARM_IK_PINV = (
 ARM_IK_MAX_OFFSET = 0.30
 
 
+class _WebcamHandDevice:
+    """Adapt 21 anatomical hand landmarks to the existing optical curl reader.
+
+    MediaPipe has no separate metacarpal-base landmarks for the four fingers;
+    a virtual bone in the measured palm plane supplies the MCP flexion reference.
+    Using wrist-to-MCP directly would misread the fingers' lateral spread as a
+    closed knuckle. PIP/DIP bones and the thumb's real landmarks stay unchanged.
+    Only translation-invariant finger angles use this adapter, never room
+    position or wrist orientation.
+    """
+
+    def __init__(self, landmarks):
+        points = [Gf.Vec3d(*position) for position in landmarks]
+        forward = points[9] - points[0]
+        normal = Gf.Cross(forward, points[5] - points[17])
+        if forward.GetLength() <= 1e-6 or normal.GetLength() <= 1e-8:
+            raise ValueError("Webcam hand landmarks do not define a palm plane")
+        forward.Normalize()
+        normal.Normalize()
+        self.positions = {"wrist": landmarks[0]}
+        for offset, role in ((1, "thumb"), (5, "index"), (9, "middle"), (13, "ring"), (17, "little")):
+            suffixes = (
+                ("metacarpal", "proximal", "distal", "tip")
+                if role == "thumb"
+                else ("proximal", "intermediate", "distal", "tip")
+            )
+            self.positions.update(
+                {f"{role}_{suffix}": landmarks[offset + index] for index, suffix in enumerate(suffixes)}
+            )
+            if role != "thumb":
+                proximal = points[offset + 1] - points[offset]
+                reference = proximal - normal * Gf.Dot(proximal, normal)
+                if reference.GetLength() <= 1e-6:
+                    # A knuckle bent by 90 degrees has no distal projection.
+                    # Its radial palm direction still supplies a stable reference.
+                    reference = points[offset] - points[0]
+                    reference -= normal * Gf.Dot(reference, normal)
+                if reference.GetLength() <= 1e-6 or proximal.GetLength() <= 1e-6:
+                    continue
+                # Preserve flexion beyond 90 degrees rather than interpreting the
+                # backwards projection of a folded knuckle as a new open direction.
+                if Gf.Dot(reference, forward) < 0.0:
+                    reference = -reference
+                reference.Normalize()
+                self.positions[f"{role}_metacarpal"] = points[offset] - reference * proximal.GetLength()
+
+    def get_hand_tracking_data_source(self):
+        return "hand"
+
+    def get_pose_names(self):
+        return tuple(self.positions)
+
+    def get_virtual_world_pose_desc(self, name=""):
+        return SimpleNamespace(
+            pose_matrix=Gf.Matrix4d().SetTranslate(Gf.Vec3d(*self.positions[name])), validity_flags=2
+        )
+
+
 class HumanoidExample(BaseSample):
     """A humanoid robot simulation example using the Unitree G1 with dexterous hands.
 
@@ -129,8 +207,8 @@ class HumanoidExample(BaseSample):
 
     def __init__(self):
         super().__init__()
-        # Configure simulation settings for GPU dynamics with high-frequency physics
-        # Physics runs on the CPU at 100 Hz, and both halves of that matter.
+        # Stationary manipulation runs CPU physics at 100 Hz. The optional walking
+        # scene uses the policy's training step of 200 Hz.
         #
         # CUDA was inherited from the H1 sample and is simply the wrong device here. GPU
         # PhysX is built to step thousands of environments in parallel; with a single
@@ -144,8 +222,34 @@ class HumanoidExample(BaseSample):
         # doubles to 10 ms, giving 1.39x real time with headroom. Control stays at 50 Hz
         # because the walking policy's decimation is derived from dt, not hard-coded.
         self._world_settings["stage_units_in_meters"] = 1.0
-        self._world_settings["physics_dt"] = 1.0 / 100.0  # 100 Hz physics
-        self._world_settings["rendering_dt"] = 1.0 / 90.0  # VR-friendly rendering cadence
+        self._gesture_locomotion_enabled = os.environ.get("G1_GESTURE_WALKING", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        # The historical walking flag selects the physical GR00T scene; input
+        # ownership is separate so changing gestures never replaces the gait.
+        self._locomotion_input_mode = os.environ.get("G1_LOCOMOTION_INPUT", "pointing").strip().lower()
+        if self._locomotion_input_mode not in ("pointing", "controller"):
+            raise ValueError("G1_LOCOMOTION_INPUT must be pointing or controller")
+        self._controller_walking_enabled = (
+            self._gesture_locomotion_enabled and self._locomotion_input_mode == "controller"
+        )
+        self._optical_hands_only = self._controller_walking_enabled or os.environ.get(
+            "G1_OPTICAL_HANDS_ONLY", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._pointing_navigation_enabled = not self._controller_walking_enabled and os.environ.get(
+            "G1_POINTING_NAVIGATION", "1"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._controller_locomotion = ControllerLocomotion()
+        self._controller_walking_status = self._controller_locomotion.command.detail
+        self._world_settings["physics_dt"] = 1.0 / (200.0 if self._gesture_locomotion_enabled else 100.0)
+        # Walking keeps the actor at 50 Hz and physics at 200 Hz. A 60 Hz app
+        # timestep advances 3–4 fixed physics steps per render instead of 2–3,
+        # reducing render overhead per simulated second on this heavy VR scene.
+        # Configure this before scene creation; changing it live invalidates views.
+        self._world_settings["rendering_dt"] = 1.0 / (60.0 if self._gesture_locomotion_enabled else 90.0)
         self._world_settings["device"] = "cpu"
         self._world_settings["backend"] = "torch"
 
@@ -156,12 +260,15 @@ class HumanoidExample(BaseSample):
         self._articulation_health_names = None
         self.g1 = None
         self._physics_callback_id = None
+        self._timeline_navigation_sub = None
+        self._timeline_stopped = True
         self._event_timer_callback = None
         self._sub_keyboard = None
         self._input = None
         self._keyboard = None
         self._gamepad = None
         self._xr_core = None
+        self._controller_xr_tools_setting = None
         self._xr_input_status_logged = False
         self._locomotion_input_logged = False
         self._locomotion_brake = False  # raised by the keyboard brake: full stop
@@ -223,11 +330,42 @@ class HumanoidExample(BaseSample):
         self._head_camera_mount_body_path = None
         self._head_camera_mount_local = None
         self._head_camera_mount_prim = None
+        self._operator_head_visual = RobotHeadVisual()
+        self._head_camera_comfort_enabled = True
+        self._head_camera_comfort_filter = ComfortCameraFilter()
+        self._head_camera_comfort_offset = None
+        self._head_camera_eye_height_source = "legacy mount"
+        self._head_camera_comfort_height_calibrated = False
         self._head_camera_update_sub = None
         self._head_camera_operator_rotation_enabled = True
+        self._robot_head_xr_orientation_setting = None
+        # A fixed 5 cm near plane clears residual render-head/body sway around
+        # the stabilized eye without moving it or clipping normal grasp reach.
+        self._head_camera_near_clip_m = 0.05
         self._head_camera_operator_neutral_rotation = None
         self._head_camera_operator_delta_rotation = None
         self._physics_step_error_logged = set()  # (subsystem, error) pairs already warned about
+        # Optional local inference process. Creating the example never binds a
+        # socket or imports MediaPipe/OpenCV into the simulation process.
+        self._webcam_enabled = os.environ.get("G1_WEBCAM_ENABLED", "").lower() in ("1", "true", "yes")
+        self._webcam_port = 8765
+        self._webcam_receiver = None
+        self._webcam_receiver_error = None
+        self._webcam_frame = None
+        self._webcam_calibration = WebcamCalibration()
+        self._webcam_calibration_pending = False
+        self._webcam_calibration_deadline_ns = None
+        self._webcam_calibration_error = None
+        self._webcam_sender_session = None
+        self._webcam_last_request = 0
+        self._webcam_request_counters = {}  # survive reset: a prior C press cannot silently rearm
+        self._webcam_arm_targets = {}
+        self._webcam_handover_targets = {}
+        self._webcam_wrist_hold_rotations = {}
+        self._webcam_robot_links = {}
+        self._webcam_robot_arm_lengths = {}
+        self._webcam_handover_speed = 0.8  # m/s target bound; final joint/contact limits also apply
+        self._webcam_elbow_gain = 0.25  # fallback arm guidance, below palm and wrist tasks
         # Camera geometry, re-tuned for the G1: it stands 1.32 m tall against the H1's
         # 1.80 m, so every offset that was measured against the H1 skull had to shrink.
         self._first_person_head_forward_offset = 0.26  # well ahead of the head so the camera never meets
@@ -387,6 +525,11 @@ class HumanoidExample(BaseSample):
         self._behavioral_data_log_every_n_steps = max(1, round(physics_hz / 100.0))  # ~100 Hz
         self._behavioral_flush_every_n_steps = max(1, round(physics_hz * 2.5))  # ~2.5 s of data
         self._behavioral_csv_fieldnames = {}  # filename -> header columns, fixed at first flush
+        self._behavioral_csv_writer = None
+        # Keep failed batches with their original session paths across resets.
+        # They are not reported as saved or silently mixed into newer sessions.
+        self._behavioral_csv_failed_batches = []
+        self._behavioral_csv_failed_paths = set()
         self._behavioral_data_output_dir = Path.home() / "BehavioralCollection"
         self._behavioral_sessions_root = self._behavioral_data_output_dir / "raw_sessions"
         self._behavioral_session_dir = None  # Path to the current session folder
@@ -397,6 +540,7 @@ class HumanoidExample(BaseSample):
         self._gaze_records = []
         self._object_state_records = []
         self._object_state_prev_positions = {}  # object path -> Gf.Vec3d, for finite-diff velocity
+        self._object_state_pose_batch = None  # generation-bound native view; observations are never retained
         self._gaze_raycast_max_distance = 20.0  # m: range cap for the HMD-forward gaze raycast
         # Meta Quest Pro eye tracking (optional; gaze.csv falls back to HMD-forward without it)
         self._eye_gaze_enabled = True
@@ -415,7 +559,7 @@ class HumanoidExample(BaseSample):
         self._teleop_input_dt = self._last_physics_dt
         self._last_teleop_wall_time = None
         self._hand_tracking_arm_control_enabled = True
-        self._controller_arm_control_enabled = True
+        self._controller_arm_control_enabled = not self._optical_hands_only
         self._hand_tracking_status_logged = False
         self._g1_arm_dofs_configured = False
         self._g1_arm_dof_indices_by_side = {}
@@ -436,6 +580,13 @@ class HumanoidExample(BaseSample):
         self._arm_ik_gain = 0.55  # fraction of the solved step taken per control tick
         self._arm_ik_max_step = 0.25  # rad: cap per joint per tick, so it never snaps
         self._arm_ik_max_error = 0.30  # m: cap the position error supplied to each solve
+        # Walking advances physics at 200 Hz. Refresh raw IK goals at least every
+        # 10 ms, reusing at most one intervening step when the input barely moved.
+        # Measured-pose, speed, contact, and motor feedback still run every step.
+        self._arm_ik_refresh_interval_s = 0.010
+        self._arm_ik_reuse_position_m = 0.02
+        self._arm_ik_reuse_angle_rad = math.radians(5.0)
+        self._arm_ik_target_cache = {}
         self._arm_max_joint_speed = 2.5  # rad/s: applies to IK, fallback, and reacquisition
         self._arm_max_tracking_error = 0.15  # rad: bounded drive error even if an arm is blocked
         self._arm_track_orientation = True
@@ -465,6 +616,9 @@ class HumanoidExample(BaseSample):
         self._contact_health = "not_prepared"
         self._physical_grasp_controllers = {side: ContactGraspController() for side in ("left", "right")}
         self._physical_grasp_results = {}
+        self._bimanual_grasp_monitor = BimanualGraspMonitor()
+        self._bimanual_grasp_result = self._bimanual_grasp_monitor.result
+        self._physical_object_masses = {}
         self._latest_hand_contacts = {"left": [], "right": []}
         self._arm_contact_limited = {}
         self._physical_hand_mimic_joint_paths = []
@@ -537,49 +691,22 @@ class HumanoidExample(BaseSample):
         )
         self._package_spawn_radius = (1.2, 3.0)  # m from the robot: within a short walk
         self._package_use_props = True  # False falls back to procedural cubes
-        # --- Work surfaces ---
-        # Packages go on tables, not the floor, and the reason is measured: standing, the
-        # G1's hand bottoms out at 0.778 m while a crate on the floor tops out at 0.23 m.
-        # It is 0.55 m short, and reaching harder topples it (the walking policy was
-        # trained with fixed arms and cannot compensate for the shift). Picking off the
-        # ground needs a robot that can squat; these tables put the work in the hand's
-        # real 0.78-1.33 m band instead.
+        # Stationary practice surface: put object centres near the standing G1's
+        # comfortable arm workspace instead of its lowest reachable hand height.
         self._work_surface_root_path = "/World/G1_WorkSurfaces"
-        # Both surfaces are the LOWER of the two packing tables on purpose. The taller one
-        # (packing_table.usd, top 1.083 m) put the biggest crate's centre at 1.147 m, which
-        # is above where the teleoperated hand can comfortably get even after the arm IK
-        # was re-centred -- measured reach ceiling 1.097 m in the operator's commanded
-        # range. A table you cannot reach the far half of is not a work surface.
-        # One entry per placement below. The FIRST is a small side table, not a packing
-        # bench: a 2.47 m bench in front of the spawn walls the robot in (measured -- it
-        # could only walk 0.19 m before hitting it), whereas this one is 0.92 x 0.42 m
-        # and can be stepped around. Its top is 0.812 m, inside the hand's reachable
-        # 0.80-1.30 m band, so objects on it are grabbable without moving at all.
+        self._front_work_surface_height = 0.92  # metres above the floor; resizes visual and collision geometry
         self._work_surface_usd_paths = (
-            "/Isaac/Environments/Hospital/Props/SM_SideTable_02a.usd",  # top 0.812 m
+            "/Isaac/Environments/Hospital/Props/SM_SideTable_02a.usd",  # fitted to the requested height
             "/Isaac/Props/PackingTable/props/SM_HeavyDutyPackingTable_C02_01/"
             "SM_HeavyDutyPackingTable_C02_01_physics.usd",  # top 0.994 m
             "/Isaac/Props/PackingTable/props/SM_HeavyDutyPackingTable_C02_01/"
             "SM_HeavyDutyPackingTable_C02_01_physics.usd",
         )
-        #: (x, y, yaw_deg) per surface. Placed to the robot's left and right rather than
-        #: straight ahead: with a table dead ahead at 2.1 m the robot walked into it after
-        #: one metre (measured 1.01 m travelled, versus 3.30 m down a clear aisle), which
-        #: is a poor first thirty seconds in a headset. Yaw 0 puts their 2.47 m length
-        #: across the approach, so a quarter turn faces the long working edge.
-        # (x, y, yaw_deg). The FIRST one is directly in front of the spawn and is the
-        # one that matters: measured, the hand reaches 0.444 m in front of the pelvis,
-        # so a bench whose near edge sits at x ~ 0.30 puts its working edge inside the
-        # reachable shell and the operator can pick things up without moving at all.
-        # The table is 0.762 m deep, so a centre at x = 0.68 puts that edge at 0.30.
-        # The two side benches stay as somewhere to walk to.
+        # (x, y, yaw_deg). Centre the small table between both hands. Its long
+        # axis runs across the view; the near edge is approximately X=0.249 m.
+        # Distant side benches remain available for optional locomotion modes.
         self._work_surface_placements = (
-            # yaw 90 so the LONG axis runs across the robot's view and the shallow 0.42 m
-            # depth points at it. With yaw 0 the long axis ran front-to-back, and the
-            # 'line the packages up with where the robot stands' projection then placed
-            # them beside the robot instead of in front -- 14 cm from the pelvis, inside
-            # the arm's inner limit, where it physically cannot reach.
-            (0.50, -0.28, 90.0),  # small side table, front-right, clear of the walking line
+            (0.46, 0.0, 90.0),
             (0.0, 2.0, 0.0),
             (0.0, -2.0, 0.0),
         )
@@ -621,6 +748,49 @@ class HumanoidExample(BaseSample):
         #   "kinematic" - no policy: the posture is held and the base glides on command.
         # Choose a mode before loading the scene; the fixed anchor changes its topology.
         self._g1_locomotion = "stationary"
+        # Walking is a separate scene configuration: an anchored articulation
+        # cannot become a freely balanced robot through a runtime input toggle.
+        self._locomotion_gesture = PointNavigation(
+            allow_routing=True, allow_turn_in_place=True, max_target_distance_m=50.0
+        )
+        self._gesture_command = self._locomotion_gesture.reset()
+        self._gesture_input_status = self._gesture_command.detail
+        self._navigation_scene = PointNavigationScene(self._g1_prim_path)
+        self._navigation_draw_time = 0.0
+        self._navigation_ray = None
+        self._navigation_ray_filter = PointRayFilter()
+        self._navigation_query_status = {}
+        self._navigation_log_time = 0.0
+        self._navigation_object_approach_cache = None
+        self._navigation_destination_kind = None
+        self._navigation_source_object_root = None
+        self._navigation_route_planner = None
+        self._navigation_plan_time = 0.0
+        self._walking_stop_elapsed = 0.0
+        self._walking_residual_motion_time = 0.0
+        self._walking_residual_window_time = 0.0
+        self._walking_residual_motion_samples = None
+        self._walking_support_pose_batch = None
+        self._walking_support_samples = None
+        self._walking_support_anchor = None
+        self._walking_runaway_time = 0.0
+        if self._gesture_locomotion_enabled:
+            self._g1_locomotion = "policy"
+            # The final physics clamp must match the selected input profile.
+            # Point navigation only walks forward; sticks also need reverse and
+            # sidesteps. Sharing its zero caps silently discarded those inputs.
+            if self._controller_walking_enabled:
+                self._max_forward_speed = 0.65
+                self._max_backward_speed = 0.35
+                self._max_lateral_speed = 0.30
+                self._max_yaw_speed = 0.40
+            else:
+                self._max_forward_speed = self._locomotion_gesture.max_forward_speed
+                self._max_yaw_speed = self._locomotion_gesture.max_requested_yaw_speed
+                self._max_backward_speed = 0.0
+                self._max_lateral_speed = 0.0
+            # Leave the spawn aisle clear while retaining the practice table.
+            self._work_surface_placements = ((2.0, -2.0, 90.0), *self._work_surface_placements[1:])
         # Finger teleoperation
         self._finger_control_enabled = True
         self._finger_smoothing = 0.35  # low-pass on curl, per physics step
@@ -662,6 +832,7 @@ class HumanoidExample(BaseSample):
         self._finger_tracking_status_logged = False
         self._prev_physics_sim_device: str | None = None
         self._prev_fabric_enabled: bool | None = None
+        self._prev_physics_usd_settings: dict[str, bool | None] | None = None
         self._pressed_keys = set()
 
         # Bindings for keyboard to command
@@ -751,10 +922,16 @@ class HumanoidExample(BaseSample):
         ``object_states.csv`` logger, and the eye tracker's highlight filter.
         """
         self._spawned_sample_box_paths = []
+        stage = omni.usd.get_context().get_stage()
         if self._grasp_mode == "physical":
             self._create_contact_grasp_objects()
+            if self._gesture_locomotion_enabled:
+                self._create_floor_cartons()
+                create_packages = create_shelf_packages if self._controller_walking_enabled else create_tall_packages
+                self._spawned_sample_box_paths.extend(
+                    create_packages(stage, self._sample_box_root_path, first_index=len(self._spawned_sample_box_paths))
+                )
             return
-        stage = omni.usd.get_context().get_stage()
         UsdGeom.Xform.Define(stage, self._sample_box_root_path)
         rng = random.Random(self._sample_box_seed)
         assets_root_path = get_assets_root_path()
@@ -799,7 +976,7 @@ class HumanoidExample(BaseSample):
         """Place six light practice shapes on the nearest work surface.
 
         Keep the existing object roots so gaze selection and recordings see the
-        same object namespace. Two staggered rows offer round, tapered, tall, and
+        same object namespace. Two rows offer round, tapered, tall, and
         flat objects within the stationary robot's measured forward reach.
         Low masses let the operator practice without a stronger grip drive.
         Dimensions and masses are not calibrated models of real grip capacity.
@@ -813,16 +990,16 @@ class HumanoidExample(BaseSample):
         center_x, center_y, _, top_z, _, _ = surfaces[0]
         UsdGeom.Xform.Define(stage, self._sample_box_root_path)
         # Shape, XYZ dimensions (m), mass (kg), color, and XY offset from the
-        # table center. The old back row at X=0.54 exceeded the measured ~0.49 m
-        # forward palm reach. Keep centers at X=0.345..0.465, staggered laterally
-        # for finger clearance, rather than forcing joints or stretching the asset.
+        # table center. Centres at X=0.32/0.44 and Y=-0.16/0/0.16 keep both rows
+        # inside the standing arm workspace. At least 4.5 cm separates object
+        # surfaces; dimensions, masses, and physical grasp settings stay unchanged.
         objects = (
-            ("cube", (0.06, 0.06, 0.06), 0.06, (0.15, 0.55, 0.9), (-0.155, 0.14)),
-            ("cylinder", (0.06, 0.06, 0.10), 0.08, (0.95, 0.55, 0.1), (-0.155, -0.08)),
-            ("sphere", (0.07, 0.07, 0.07), 0.05, (0.2, 0.75, 0.35), (-0.155, 0.38)),
-            ("cylinder", (0.04, 0.04, 0.14), 0.06, (0.65, 0.3, 0.85), (-0.035, 0.38)),
-            ("cube", (0.09, 0.06, 0.03), 0.07, (0.95, 0.8, 0.15), (-0.035, 0.215)),
-            ("cone", (0.07, 0.07, 0.10), 0.05, (0.9, 0.25, 0.2), (-0.045, 0.035)),
+            ("cube", (0.06, 0.06, 0.06), 0.06, (0.15, 0.55, 0.9), (-0.14, -0.16)),
+            ("cylinder", (0.06, 0.06, 0.10), 0.08, (0.95, 0.55, 0.1), (-0.14, 0.0)),
+            ("sphere", (0.07, 0.07, 0.07), 0.05, (0.2, 0.75, 0.35), (-0.14, 0.16)),
+            ("cylinder", (0.04, 0.04, 0.14), 0.06, (0.65, 0.3, 0.85), (-0.02, 0.16)),
+            ("cube", (0.09, 0.06, 0.03), 0.07, (0.95, 0.8, 0.15), (-0.02, 0.0)),
+            ("cone", (0.07, 0.07, 0.10), 0.05, (0.9, 0.25, 0.2), (-0.02, -0.16)),
         )
         for index, (kind, dimensions, mass, color, offset) in enumerate(objects):
             width, depth, height = dimensions
@@ -870,6 +1047,64 @@ class HumanoidExample(BaseSample):
             prim.CreateAttribute("g1:packageOnSurface", Sdf.ValueTypeNames.Bool).Set(True)
             self._spawned_sample_box_paths.append(path)
 
+    def _create_floor_cartons(self) -> None:
+        """Add four dynamic shipping cartons beside the clear walking aisle.
+
+        Keep the sample object namespace for existing gaze, contact, and recording
+        consumers. These boxes are physical obstacles; standing arm control does
+        not provide a crouching or two-handed floor-pickup controller.
+        """
+        from pxr import PhysxSchema
+
+        stage = omni.usd.get_context().get_stage()
+        assets_root = get_assets_root_path()
+        if assets_root is None:
+            raise RuntimeError("Walking scene requires the warehouse carton assets")
+        specs = (
+            ("A_01", 1.5, 1.0, 0.22, 0.25),
+            ("B_01", 1.5, -1.0, 0.28, 0.35),
+            ("C_01", 2.6, 1.15, 0.34, 0.50),
+            ("D_04", 2.6, -1.15, 0.40, 0.70),
+        )
+        rng = random.Random(self._sample_box_seed)
+        first_index = len(self._spawned_sample_box_paths)
+        for index, (asset, x, y, size, mass) in enumerate(specs, first_index):
+            path = f"{self._sample_box_root_path}/Box_{index:02d}"
+            self._create_package_from_prop(
+                path,
+                rng,
+                x,
+                y,
+                0.005,
+                usd_path=assets_root + f"/Isaac/Environments/Simple_Warehouse/Props/SM_CardBox{asset}.usd",
+            )
+            prim = stage.GetPrimAtPath(path)
+            wrapper = UsdGeom.Xformable(prim)
+            measured_size = self._measure_prim_size(prim)
+            wrapper.AddScaleOp().Set(Gf.Vec3f(size / measured_size))
+            bounds = (
+                UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+                .ComputeWorldBound(prim)
+                .ComputeAlignedRange()
+            )
+            if bounds.IsEmpty():
+                raise RuntimeError(f"Cannot measure carton geometry: {path}")
+            translate = next(
+                op for op in wrapper.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate
+            )
+            position = translate.Get()
+            center = bounds.GetMidpoint()
+            translate.Set(position + Gf.Vec3d(x - center[0], y - center[1], 0.005 - bounds.GetMin()[2]))
+            UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(mass)
+            body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+            body.CreateSolverPositionIterationCountAttr(16)
+            body.CreateSolverVelocityIterationCountAttr(4)
+            body.CreateEnableCCDAttr(True)
+            prim.CreateAttribute("g1:packageSize", Sdf.ValueTypeNames.Float).Set(size)
+            prim.CreateAttribute("g1:packageMass", Sdf.ValueTypeNames.Float).Set(mass)
+            prim.CreateAttribute("g1:packageOnSurface", Sdf.ValueTypeNames.Bool).Set(False)
+            self._spawned_sample_box_paths.append(path)
+
     def _prepare_physical_grasping(self) -> None:
         """Author hand contact reports and physics materials before Play."""
         if self._grasp_mode != "physical":
@@ -882,6 +1117,13 @@ class HumanoidExample(BaseSample):
         roots = self._spawned_sample_box_paths
         self._contact_reader = ContactReader()
         self._contact_reader.prepare(stage, self._g1_prim_path, roots)
+        self._physical_object_masses = {}
+        for path in roots:
+            prim = stage.GetPrimAtPath(path)
+            if prim.HasAPI(UsdPhysics.MassAPI):
+                mass = UsdPhysics.MassAPI(prim).GetMassAttr().Get()
+                if mass is not None and math.isfinite(float(mass)) and float(mass) > 0:
+                    self._physical_object_masses[path] = float(mass)
         self._prepare_physical_hand_couplings(stage)
         material = UsdShade.Material.Define(stage, "/World/G1_ContactMaterial")
         physics_material = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
@@ -1034,6 +1276,8 @@ class HumanoidExample(BaseSample):
             wrapper.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, yaw_deg))
             usd_path = assets_root_path + self._work_surface_usd_paths[index % len(self._work_surface_usd_paths)]
             stage_utils.add_reference_to_stage(usd_path=usd_path, path=f"{surface_path}/Asset")
+            if index == 0:
+                self._fit_work_surface_height(wrapper, self._front_work_surface_height)
 
             # Static scenery: collision so packages rest on it and the robot cannot walk
             # through it, but no rigid body, so it never gets shoved around.
@@ -1046,7 +1290,26 @@ class HumanoidExample(BaseSample):
             f"under {self._work_surface_root_path}"
         )
 
-    def _get_work_surface_tops(self) -> list[tuple[float, float, float, float, float]]:
+    def _fit_work_surface_height(self, wrapper: UsdGeom.Xform, height: float) -> None:
+        """Resize a referenced static table vertically, keeping its feet on the floor.
+
+        Measure authored geometry before scaling so asset units and origin offsets
+        do not produce a floating table. The wrapper transforms visual meshes and
+        colliders together; package placement then measures the resulting tabletop.
+        """
+        if not math.isfinite(height) or height <= 0.0:
+            raise ValueError("Work surface height must be finite and positive")
+        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+        bounds = cache.ComputeWorldBound(wrapper.GetPrim()).ComputeAlignedRange()
+        if bounds.IsEmpty() or bounds.GetSize()[2] <= 1e-6:
+            raise RuntimeError("Cannot measure the front table height")
+        scale_z = height / float(bounds.GetSize()[2])
+        translate = next(op for op in wrapper.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate)
+        position = translate.Get()
+        translate.Set(Gf.Vec3d(position[0], position[1], -float(bounds.GetMin()[2]) * scale_z))
+        wrapper.AddScaleOp().Set(Gf.Vec3f(1.0, 1.0, scale_z))
+
+    def _get_work_surface_tops(self) -> list[tuple[float, float, float, float, float, float]]:
         """Measure each work surface: ``(x, y, yaw_deg, top_z, length, width)``.
 
         The top height is measured rather than assumed — the two table assets differ by
@@ -1077,7 +1340,9 @@ class HumanoidExample(BaseSample):
             surfaces.append((x, y, yaw_deg, top_z, float(length), float(width)))
         return surfaces
 
-    def _create_package_from_prop(self, box_path: str, rng: random.Random, x: float, y: float, z: float) -> float:
+    def _create_package_from_prop(
+        self, box_path: str, rng: random.Random, x: float, y: float, z: float, *, usd_path: str | None = None
+    ) -> float:
         """Reference a warehouse crate/bin asset as one pickable package.
 
         The asset is referenced onto a *child* prim and the package's own pose is authored
@@ -1091,7 +1356,7 @@ class HumanoidExample(BaseSample):
         """
         stage = omni.usd.get_context().get_stage()
         assets_root_path = get_assets_root_path()
-        usd_path = assets_root_path + rng.choice(self._package_usd_paths)
+        usd_path = usd_path or assets_root_path + rng.choice(self._package_usd_paths)
 
         wrapper = UsdGeom.Xform.Define(stage, box_path)
         wrapper.ClearXformOpOrder()  # safe: this prim is ours, it has no asset ops
@@ -1241,33 +1506,65 @@ class HumanoidExample(BaseSample):
 
     async def load_world_async(self) -> None:
         """Release camera stage handles before the base class replaces the stage."""
+        self._timeline_stopped = True
+        self._timeline_navigation_sub = None
+        self._navigation_scene.cleanup()
+        self._reset_webcam_tracking(close_receiver=True)
         # BaseSample creates the new stage before invoking scene cleanup. Detach
         # first so application frames during that await cannot use the old stage.
         self._head_camera_update_sub = None
         self._head_camera_transform_op = None
         self._head_camera_mount_prim = None
         self._reset_operator_head_rotation()
+        self._operator_head_visual.clear()
         await super().load_world_async()
 
     async def clear_async(self) -> None:
         """Detach the frame callback before asynchronous stage destruction starts."""
+        self._timeline_stopped = True
+        self._timeline_navigation_sub = None
+        self._navigation_scene.cleanup()
+        self._reset_webcam_tracking(close_receiver=True)
         self._head_camera_update_sub = None
         # Also make an already queued frame callback return before using USD or
         # physics handles. Normal loading recreates these before subscribing again.
         self._head_camera_transform_op = None
         self._head_camera_mount_prim = None
         self._reset_operator_head_rotation()
+        self._operator_head_visual.clear()
         await super().clear_async()
 
     def setup_scene(self):
         """Set up the scene with robot and environment."""
-        # Snapshot prior physics device/fabric state so cleanup can restore it.
-        self._prev_physics_sim_device, self._prev_fabric_enabled = snapshot_physics_simulation_state()
+        import carb.settings
+
+        # A failed asset load may be retried before cleanup. Keep the original
+        # app state while this example owns it, rather than capturing our own
+        # Fabric-enabled state as the next restore target.
+        if self._prev_physics_usd_settings is None:
+            settings = carb.settings.get_settings()
+            # `enable_fabric` overwrites these independently configurable outputs.
+            # Read all values before publishing the snapshot or changing state.
+            previous_outputs = {
+                path: settings.get(path)
+                for path in (
+                    "/physics/updateToUsd",
+                    "/physics/updateParticlesToUsd",
+                    "/physics/updateVelocitiesToUsd",
+                    "/physics/updateForceSensorsToUsd",
+                )
+            }
+            self._prev_physics_sim_device, self._prev_fabric_enabled = snapshot_physics_simulation_state()
+            self._prev_physics_usd_settings = previous_outputs
 
         # Select the configured backend/device before creating robot tensor views.
-        # The stationary VR configuration currently uses CPU physics.
+        # Both stationary and walking modes retain CPU physics. Fabric publishes
+        # simulated poses directly to rendering without rewriting USD each step;
+        # controllers, contacts, and the mounted camera read live physics tensors.
+        # Enable it before loading simulation assets, as required by the SDK.
         SimulationManager.set_backend(self._world_settings["backend"])
         SimulationManager.set_physics_sim_device(self._world_settings["device"])
+        SimulationManager.enable_fabric(True)
         SimulationManager.get_available_physics_engines(verbose=True)
 
         self._create_environment()
@@ -1277,27 +1574,32 @@ class HumanoidExample(BaseSample):
         self._apply_ground_material(static_friction=1.0, dynamic_friction=1.0, restitution=0.0)
         self._create_work_surfaces()  # before the packages: they measure its top height
         self._create_sample_boxes()
-        # Material-binding schemas and override prims must exist before physics
-        # builds tensor views. Runtime highlighting changes only relationships.
+        # Nonphysical highlight shells and permanent bindings must exist before
+        # physics builds tensor views. Runtime highlighting changes only shader
+        # inputs outside rigid-body subtrees; binding edits can reset live props.
         self._material_highlights.prepare(
             omni.usd.get_context().get_stage(),
             self._spawned_sample_box_paths,
         )
 
-        # Create the Unitree G1 with dexterous hands. Isaac Sim ships no G1 locomotion
-        # policy, so walking comes from Unitree's own pretrained one, which drives the
-        # legs and leaves the arms to the operator (see G1TeleopRobot).
+        # Physical walking uses the packaged GR00T balance/walk actors for legs
+        # and waist. The teleoperator independently owns the dexterous arms and
+        # hands; this profile also compensates their measured model gravity.
         spawn_position = [self._robot_spawn_xy[0], self._robot_spawn_xy[1], self._g1_spawn_position[2]]
         self.g1 = G1TeleopRobot(
             prim_path=self._g1_prim_path,
             position=spawn_position,
             hand_variant=self._g1_hand_variant,
             locomotion=self._g1_locomotion,
+            physical_locomotion=self._gesture_locomotion_enabled,
+            arm_gravity_compensation=self._controller_walking_enabled,
         )
         self._prepare_physical_grasping()
         self._create_arm_control_rig()
         self._create_head_camera()
         self._create_xr_anchor()
+        if self._gesture_locomotion_enabled and self._pointing_navigation_enabled:
+            self._navigation_scene.create(omni.usd.get_context().get_stage())
 
     async def setup_post_load(self):
         """Setup keyboard input and physics callback after initial load."""
@@ -1315,6 +1617,7 @@ class HumanoidExample(BaseSample):
         except Exception as e:
             self._xr_core = None
             carb.log_warn(f"HumanoidExample: XRCore unavailable for VR controller input: {e}")
+        self._sync_controller_xr_tools()
         # Quest Pro eye-gaze tracker (optional). Imported lazily so a failure here can
         # never break example registration; gaze.csv falls back to HMD-forward gaze.
         self._eye_gaze_tracker = None
@@ -1389,7 +1692,14 @@ class HumanoidExample(BaseSample):
         self._keyboard_command = torch.zeros(3, device=device)
         self._controller_command = torch.zeros(3, device=device)
         self._physics_ready = False
+        self._timeline_stopped = True
         self._set_active_head_camera()
+        self._timeline_navigation_sub = (
+            import_module("omni.timeline")
+            .get_timeline_interface()
+            .get_timeline_event_stream()
+            .create_subscription_to_pop(self._on_navigation_timeline_event, name="G1 navigation lifecycle")
+        )
         # Keep the XR view attached between physics steps and while paused. The
         # camera callback does not read or modify eye-gaze devices or their settings.
         self._head_camera_update_sub = (
@@ -1406,21 +1716,37 @@ class HumanoidExample(BaseSample):
 
     async def setup_pre_reset(self):
         """Called before world reset."""
+        self._timeline_stopped = True
         # Remove live constraints before physics destroys their body handles.
         self._reset_teleoperation_state()
+        # Explicit Reset starts a new attempt. A repeated failure must be logged
+        # again rather than hidden by the previous episode's warning deduplication.
+        self._physics_step_error_logged.clear()
         if self._eye_gaze_tracker is not None:
             self._eye_gaze_tracker.cleanup()
         self._physics_ready = False
 
     async def setup_post_reset(self):
-        """Called after world reset."""
-        # Reset physics ready flag after reset so robot reinitializes on next play
-        self._physics_ready = False
+        """Keep the initialization performed during the base reset's first Play.
+
+        ``BaseSample.reset_async`` already awaits an application update after
+        Play. Our physics callback can initialize the new episode during that
+        update. Invalidating it here would reset joints, arm targets and tracking
+        a second time on the following tick. ``setup_pre_reset`` and the Stop
+        event invalidate the old episode before Play; leave their state intact
+        if the first physics callback has not arrived yet.
+        """
 
     async def setup_post_clear(self):
         """Called after clearing the scene."""
+        self._restore_controller_xr_tools()
+        self._restore_robot_head_xr_orientation()
+        self._timeline_navigation_sub = None
+        self._timeline_stopped = True
+        self._navigation_scene.cleanup()
         self._head_camera_update_sub = None
         self._reset_teleoperation_state()
+        self._operator_head_visual.clear()
         # Deregister physics callback
         if self._physics_callback_id is not None:
             try:
@@ -1443,7 +1769,269 @@ class HumanoidExample(BaseSample):
         self._xr_anchor_op = None
         self._restore_physics_simulation_state()
 
+    def enable_webcam_tracking(self, port: int = 8765) -> dict:
+        """Enable optional loopback landmarks; binding waits for the next physics tick.
+
+        Run ``tools/launch_webcam_tracking.bat`` separately, then press C in its
+        preview while both hands are visible to Quest and the webcam. Enabling
+        reception alone cannot move the robot: explicit alignment is required.
+        """
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("Webcam port must be an integer from 1 to 65535")
+        self._reset_webcam_tracking(close_receiver=True)
+        self._webcam_port = port
+        self._webcam_enabled = True
+        return self.webcam_tracking_status()
+
+    def disable_webcam_tracking(self) -> dict:
+        """Close the local receiver and restore ordinary Quest-only operation."""
+        self._webcam_enabled = False
+        self._reset_webcam_tracking(close_receiver=True)
+        return self.webcam_tracking_status()
+
+    def request_webcam_calibration(self) -> None:
+        """Wait for one fresh webcam frame paired with both valid Quest palms."""
+        if self._webcam_enabled:
+            self._invalidate_webcam_calibration("Waiting for both optical Quest hands and a fresh webcam pose")
+            self._webcam_calibration_pending = True
+            self._webcam_calibration_deadline_ns = time.perf_counter_ns() + 10_000_000_000
+
+    def _invalidate_webcam_calibration(self, reason: str | None = None) -> None:
+        """Remove webcam authority without changing head, gaze, or Quest mapping."""
+        self._webcam_calibration.clear()
+        self._webcam_calibration_pending = False
+        self._webcam_calibration_deadline_ns = None
+        self._webcam_calibration_error = reason
+        self._webcam_arm_targets.clear()
+        self._webcam_wrist_hold_rotations.clear()
+
+    def _reset_webcam_tracking(self, *, close_receiver: bool = False) -> None:
+        """Discard alignment and stage-bound link handles across reload/reset."""
+        self._invalidate_webcam_calibration()
+        self._webcam_frame = None
+        self._webcam_sender_session = None
+        self._webcam_last_request = 0
+        self._webcam_handover_targets.clear()
+        self._webcam_robot_links.clear()
+        self._webcam_robot_arm_lengths.clear()
+        if close_receiver and self._webcam_receiver is not None:
+            self._webcam_receiver.close()
+            self._webcam_receiver = None
+        self._webcam_receiver_error = None
+
+    def webcam_tracking_status(self) -> dict:
+        """Describe reception, calibration, confidence, and selected input sources."""
+        frame = self._webcam_frame
+        age = frame.age_s() if frame is not None else None
+        receiver = self._webcam_receiver
+        return {
+            "enabled": self._webcam_enabled,
+            "port": self._webcam_port,
+            "listening": receiver is not None and receiver.is_open and self._webcam_receiver_error is None,
+            "frame_age_s": age,
+            "fresh": age is not None and 0.0 <= age <= 0.25,
+            "sender_session": self._webcam_sender_session,
+            "calibrated": self._webcam_calibration.is_calibrated,
+            "calibration_pending": self._webcam_calibration_pending,
+            "calibration_error": self._webcam_calibration_error,
+            "receiver_error": self._webcam_receiver_error or (receiver.last_error if receiver is not None else None),
+            "arm_confidence": {side: target.confidence for side, target in self._webcam_arm_targets.items()},
+            "hand_confidence": dict(frame.hand_confidence) if frame is not None else {},
+            "arm_sources": dict(self._arm_input_sources),
+            "finger_sources": dict(self._finger_curl_source),
+            "robot_arm_lengths_m": dict(self._webcam_robot_arm_lengths),
+        }
+
+    def _poll_webcam_tracking(self) -> None:
+        """Bounded, nonblocking receive once per control tick; inference is external."""
+        self._webcam_arm_targets.clear()
+        if not self._webcam_enabled or self._webcam_receiver_error is not None:
+            self._webcam_frame = None
+            return
+        try:
+            now = time.perf_counter_ns()
+            if self._webcam_calibration_pending and now > self._webcam_calibration_deadline_ns:
+                self._invalidate_webcam_calibration("Calibration request expired after 10 seconds; press C again")
+            if self._webcam_receiver is None:
+                self._webcam_receiver = WebcamReceiver(port=self._webcam_port)
+            frame = self._webcam_receiver.poll(now_ns=now)
+            self._webcam_frame = frame
+            if frame is None:
+                return
+            if frame.sender_session != self._webcam_sender_session:
+                restarted = self._webcam_sender_session is not None
+                pending = self._webcam_calibration_pending and not restarted
+                deadline = self._webcam_calibration_deadline_ns if pending else None
+                self._invalidate_webcam_calibration("Press C to align the webcam with both optical Quest hands")
+                self._webcam_calibration_pending = pending
+                self._webcam_calibration_deadline_ns = deadline
+                self._webcam_sender_session = frame.sender_session
+                self._webcam_last_request = self._webcam_request_counters.get(frame.sender_session, 0)
+            if frame.calibration_request > self._webcam_last_request:
+                self.request_webcam_calibration()
+                self._webcam_last_request = frame.calibration_request
+                self._webcam_request_counters[frame.sender_session] = frame.calibration_request
+                if len(self._webcam_request_counters) > 32:
+                    self._webcam_request_counters.pop(next(iter(self._webcam_request_counters)))
+            if self._webcam_calibration_pending and 0.0 <= frame.age_s(now) <= 0.1:
+                base = self._get_g1_base_pose_for_arms()
+                if base is not None:
+                    base_position, yaw = base
+                    paired = {}
+                    for side in ("left", "right"):
+                        device = self._get_xr_input_device(f"/user/hand/{side}")
+                        optical = self._get_optical_arm_pose(side, device)
+                        if optical is not None:
+                            target = self._compute_arm_target_body_position(side, optical, base_position, yaw)
+                            paired[side] = tuple(float(value) for value in target)
+                    try:
+                        self._webcam_calibration.calibrate(
+                            frame, paired, robot_arm_lengths=self._get_webcam_robot_arm_lengths(), now_ns=now
+                        )
+                    except ValueError as error:
+                        self._webcam_calibration_error = str(error)
+                    else:
+                        self._webcam_calibration_pending = False
+                        self._webcam_calibration_deadline_ns = None
+                        self._webcam_calibration_error = None
+                        carb.log_info("HumanoidExample: webcam alignment ready; Quest remains the primary hand source")
+            self._webcam_arm_targets = self._webcam_calibration.map(frame, now_ns=now)
+        except (AttributeError, IndexError, OSError, RuntimeError, TypeError, ValueError) as error:
+            # Camera/bind failure must not interrupt the existing teleoperation.
+            self._webcam_receiver_error = str(error)
+            self._webcam_frame = None
+            self._invalidate_webcam_calibration(str(error))
+            if self._webcam_receiver is not None:
+                self._webcam_receiver.close()
+                self._webcam_receiver = None
+            carb.log_warn(f"HumanoidExample: webcam input unavailable; Quest input retained: {error}")
+
+    def _get_webcam_robot_link(self, side: str, role: str):
+        """Return a cached (articulation link index, live rigid prim) pair."""
+        key = (side, role)
+        if key not in self._webcam_robot_links:
+            result = None
+            try:
+                from isaacsim.core.experimental.prims import RigidPrim
+
+                names = [str(name) for name in self.g1.robot.link_names]
+                candidates = {
+                    "shoulder": (
+                        f"{side}_shoulder_roll_link",
+                        f"{side}_shoulder_pitch_link",
+                        f"{side}_shoulder_yaw_link",
+                    ),
+                    "elbow": (f"{side}_elbow_link",),
+                    "wrist": (f"{side}_wrist_yaw_link",),
+                }[role]
+                for name in candidates:
+                    if name in names:
+                        index = names.index(name)
+                        prim = RigidPrim(paths=str(self.g1.robot.link_paths[0][index]))
+                        prim.get_world_poses()
+                        result = (index, prim)
+                        break
+            except (AttributeError, ImportError, IndexError, RuntimeError, TypeError):
+                pass
+            self._webcam_robot_links[key] = result
+        return self._webcam_robot_links[key]
+
+    def _get_webcam_robot_arm_lengths(self) -> dict[str, float]:
+        """Measure link-to-link arm span; use 0.37 m when unavailable, never pelvis reach."""
+        if not self._webcam_robot_arm_lengths:
+            for side in ("left", "right"):
+                span = 0.37  # approximate G1 shoulder-to-wrist chain, not human room scale
+                try:
+                    points = []
+                    for role in ("shoulder", "elbow", "wrist"):
+                        entry = self._get_webcam_robot_link(side, role)
+                        if entry is None:
+                            break
+                        value = self._first_pose_value(entry[1].get_world_poses()[0])
+                        points.append(Gf.Vec3d(*[float(axis) for axis in value[:3]]))
+                    if len(points) == 3:
+                        measured = (points[1] - points[0]).GetLength() + (points[2] - points[1]).GetLength()
+                        if math.isfinite(measured) and 0.2 <= measured <= 0.7:
+                            span = measured
+                except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+                    pass
+                self._webcam_robot_arm_lengths[side] = span
+        return dict(self._webcam_robot_arm_lengths)
+
+    def _webcam_input_is_fresh(self) -> bool:
+        """Require current calibration and capture age, even between explicit polls."""
+        frame = self._webcam_frame
+        return bool(
+            self._webcam_enabled
+            and frame is not None
+            and self._webcam_calibration.is_calibrated
+            and frame.sender_session == self._webcam_calibration.sender_session
+            and 0.0 <= frame.age_s() <= 0.25
+        )
+
+    def _get_webcam_arm_target(self, side: str):
+        return self._webcam_arm_targets.get(side) if self._webcam_input_is_fresh() else None
+
+    def _get_webcam_finger_curls(self, side: str) -> dict[str, float] | None:
+        """Use optional detailed hand landmarks; body wrists cannot estimate fingers."""
+        if not self._webcam_input_is_fresh():
+            return None
+        frame = self._webcam_frame
+        landmarks = frame.hand_world.get(side)
+        if landmarks is None or frame.hand_confidence.get(side, 0.0) < 0.8:
+            return None
+        try:
+            device = _WebcamHandDevice(landmarks)
+        except ValueError:
+            return None
+        return self._get_hand_tracking_finger_curls(device)
+
+    def _limit_webcam_handover_target(self, side: str, target: Gf.Vec3d, source: str, previous_source: str | None):
+        """Slew webcam motion and the return to Quest from the last commanded palm."""
+        if source != "webcam_body" and previous_source != "webcam_body" and side not in self._webcam_handover_targets:
+            return target
+        previous = self._webcam_handover_targets.get(side, self._smoothed_arm_rig_targets.get(side))
+        if previous is None:
+            base = self._get_g1_base_pose_for_arms()
+            prim = self._get_hand_link_prim(side)
+            if base is None or prim is None:
+                return None
+            value = self._first_pose_value(prim.get_world_poses()[0])
+            world = Gf.Vec3d(*[float(axis) for axis in value[:3]])
+            world += self._palm_offset_world(side, world)
+            previous = self._stage_vector_to_g1_body(world - base[0], base[1])
+        delta = target - previous
+        distance = delta.GetLength()
+        limit = self._webcam_handover_speed * min(max(self._teleop_input_dt, 0.0), 0.05)
+        result = previous + delta * (min(1.0, limit / distance) if distance > 1e-9 else 0.0)
+        self._webcam_handover_targets[side] = Gf.Vec3d(result)
+        if source != "webcam_body" and distance <= limit:
+            self._webcam_handover_targets.pop(side, None)
+        return result
+
+    def _get_webcam_wrist_hold_rotation(self, side: str):
+        """Hold measured wrist orientation when body-only tracking supplies position."""
+        if side not in self._webcam_wrist_hold_rotations:
+            prim = self._get_hand_link_prim(side)
+            if prim is not None:
+                value = self._first_pose_value(prim.get_world_poses()[1])
+                self._webcam_wrist_hold_rotations[side] = Gf.Matrix4d().SetRotate(
+                    Gf.Quatd(float(value[0]), Gf.Vec3d(*[float(axis) for axis in value[1:4]]))
+                )
+        return self._webcam_wrist_hold_rotations.get(side)
+
     def on_physics_step(self, dt: float, context: object) -> None:
+        """Drive one completed physics step with a callback-local hand snapshot."""
+        # XR input is published once per application update. Navigation, fingers,
+        # and both arm tasks can share it during this synchronous callback, but
+        # must never reuse its validity flags or landmarks on a later callback.
+        self._teleop_step_hand_samples = {"devices": {}, "samples": {}}
+        try:
+            self._advance_physics_step(dt, context)
+        finally:
+            self._teleop_step_hand_samples = None
+
+    def _advance_physics_step(self, dt: float, context: object) -> None:
         """Physics step callback - initialize on first step, then drive the robot.
 
         Args:
@@ -1461,18 +2049,26 @@ class HumanoidExample(BaseSample):
         # Check if physics tensors are valid, if not, reinitialize
         if not self.g1.robot.is_physics_tensor_entity_valid():
             self._physics_ready = False
+            self._timeline_stopped = True
+            self.g1.invalidate_physics_state()
+            return
 
         if self._physics_ready:
             # A finite but exploded articulation can otherwise keep producing IK,
             # camera, and recording updates without throwing a Python exception.
             if not self._check_articulation_health():
                 return
+            if not self._check_gesture_balance():
+                return
             # Robot is initialized: advance the base and hold the posture, then let the
             # teleoperation layer below override the arm and finger DOFs it owns.
             self._last_physics_dt = float(dt)
             self._update_teleop_input_clock(float(dt))
+            self._poll_webcam_tracking()
             self._grab_time += float(dt)
             self._update_controller_command(dt)
+            if self._articulation_health_fault is not None:
+                return
             target_command = self._keyboard_command + self._controller_command
             if self._locomotion_brake:
                 # Translation only; the yaw the operator asked for survives so they can
@@ -1483,8 +2079,21 @@ class HumanoidExample(BaseSample):
             target_command[0] = target_command[0].clamp(-self._max_backward_speed, self._max_forward_speed)
             target_command[1] = target_command[1].clamp(-self._max_lateral_speed, self._max_lateral_speed)
             target_command[2] = target_command[2].clamp(-self._max_yaw_speed, self._max_yaw_speed)
+            if not self._check_gesture_motion(dt, target_command):
+                return
             self._smooth_base_command(target_command, dt)
-            self.g1.forward(dt, self._base_command)
+            try:
+                if getattr(self.g1, "uses_explicit_body_efforts", False):
+                    # Arm IK below replaces these targets before simulation. Write
+                    # the complete body torque buffer once, after the arm update.
+                    self.g1.forward(dt, self._base_command, defer_body_efforts=True)
+                else:
+                    self.g1.forward(dt, self._base_command)
+            except Exception as error:
+                self._articulation_health_fault = f"locomotion controller failed: {error}"
+                self._log_physics_step_error("locomotion controller", error)
+                self._pause_faulted_articulation()
+                return
             # Stage edits (undo, prim deletion, clears) can invalidate prims any of
             # these subsystems hold handles to; isolate each one so a single failure
             # cannot abort the step and silently stop behavioral data collection.
@@ -1499,6 +2108,16 @@ class HumanoidExample(BaseSample):
                 self._log_physics_step_error("arm teleoperation", e)
                 for side in ("left", "right"):
                     self._deactivate_hand(side)
+            if getattr(self.g1, "uses_explicit_body_efforts", False):
+                try:
+                    # IK has now written this tick's arm targets. Replace the body
+                    # torque buffer so the policy and tracked arms share one PD step.
+                    self.g1.apply_body_efforts()
+                except Exception as error:
+                    self._articulation_health_fault = f"body motor controller failed: {error}"
+                    self._log_physics_step_error("body motor controller", error)
+                    self._pause_faulted_articulation()
+                    return
             try:
                 self._update_head_camera_view(dt=dt)
             except Exception as e:
@@ -1515,14 +2134,48 @@ class HumanoidExample(BaseSample):
         else:
             # First physics step after play - initialize the robot
             self._reset_teleoperation_state()
-            self.g1.initialize()  # This already sets default state internally
-            if not self.g1._initialized:
+            try:
+                self.g1.initialize()  # This already sets default state internally
+                if not self.g1._initialized:
+                    return
+                self.g1.post_reset()
+                self._update_recorded_locomotion_mode()
+                self._configure_g1_arm_dofs()
+                self._physics_ready = True
+                self._timeline_stopped = False
+                self._update_head_camera_view(force=True, dt=dt)
+            except Exception as error:
+                self._physics_ready = False
+                self._articulation_health_fault = f"robot initialization failed: {error}"
+                self._log_physics_step_error("robot initialization", error)
+                self._pause_faulted_articulation()
                 return
-            self.g1.post_reset()
-            self._update_recorded_locomotion_mode()
-            self._configure_g1_arm_dofs()
-            self._update_head_camera_view(force=True, dt=dt)
-            self._physics_ready = True
+
+    def _on_navigation_timeline_event(self, event: object) -> None:
+        """Disarm on Pause/Stop and discard native handles before the next Play.
+
+        Stop destroys physics views, whereas Pause keeps them. A held pointing
+        gesture never survives either transition. Existing health faults remain
+        latched until the example is explicitly reset or reloaded.
+        """
+        events = import_module("omni.timeline").TimelineEventType
+        if event.type not in (int(events.STOP), int(events.PAUSE)):
+            return
+        self._reset_gesture_locomotion()
+        if event.type == int(events.PAUSE):
+            return
+        self._timeline_stopped = True
+        self._physics_ready = False
+        self._head_camera_mount_prim = None
+        self._xr_last_head_pose = None
+        self._xr_head_pose_age = 0
+        if self.g1 is not None:
+            self.g1.invalidate_physics_state()
+        if self._contact_reader is not None:
+            self._contact_reader.invalidate()
+        for mapping in (self._hand_link_prims, self._grasp_link_prims, self._object_rigid_prims):
+            mapping.clear()
+        self._object_state_pose_batch = None
 
     def _pause_faulted_articulation(self) -> None:
         """Pause invalid physics; pressing Play alone must not bypass the latch."""
@@ -1563,14 +2216,269 @@ class HumanoidExample(BaseSample):
         self._pause_faulted_articulation()
         return False
 
+    def _check_gesture_balance(self) -> bool:
+        """Pause a fallen walking robot before issuing further actuator targets.
+
+        These conservative bounds apply to this flat-floor scene, not a general
+        terrain controller. Joint-limit checks alone cannot detect an intact
+        articulation falling over. Reset deliberately requires the scene reset;
+        this guard never moves the pelvis or pretends to recover balance.
+        """
+        if not self._gesture_locomotion_enabled:
+            return True
+        try:
+            import numpy as np
+
+            positions, orientations = self.g1.robot.get_world_poses()
+            position = np.asarray(self._first_pose_value(positions), dtype=float)
+            quaternion = np.asarray(self._first_pose_value(orientations), dtype=float)
+            if position.shape != (3,) or quaternion.shape != (4,):
+                raise ValueError("unexpected root pose dimensions")
+            if not np.all(np.isfinite(position)) or not np.all(np.isfinite(quaternion)):
+                raise ValueError("nonfinite root pose")
+            norm = float(np.linalg.norm(quaternion))
+            if norm < 1e-6:
+                raise ValueError("zero root quaternion")
+            _, qx, qy, _ = quaternion / norm  # PhysX quaternions are w,x,y,z.
+            up_dot = 1.0 - 2.0 * (qx * qx + qy * qy)
+            if position[2] >= 0.45 and up_dot >= math.cos(math.radians(45.0)):
+                return True
+            reason = f"walking balance lost (pelvis height {position[2]:.3f} m, upright dot {up_dot:.3f})"
+        except Exception as error:
+            reason = f"could not validate walking balance: {type(error).__name__}: {error}"
+        self._articulation_health_fault = reason
+        self._reset_gesture_locomotion()
+        self._log_physics_step_error("walking balance", RuntimeError(reason + ". Use Reset to rebuild the scene."))
+        self._pause_faulted_articulation()
+        return False
+
+    def _read_walking_support_pose(self) -> tuple[float, float, float]:
+        """Read the world foot centroid and mean sole heading without USD edits.
+
+        The native read-only view wraps existing ankle bodies. Unlike creating a
+        high-level rigid wrapper during playback, it cannot author rigid-body or
+        transform state. Cache only the view, never its measured pose. Its native
+        simulation identity and Pause/Stop/Reset invalidation bind it to an episode.
+        """
+        try:
+            simulation = SimulationManager.get_physics_simulation_view()
+            if simulation is None or not simulation.is_valid:
+                raise RuntimeError("Walking foot support requires a valid physics simulation view")
+            paths = tuple(f"{self._g1_prim_path}/{side}_ankle_roll_link" for side in ("left", "right"))
+            batch = self._walking_support_pose_batch
+            if batch is None or batch["simulation"] is not simulation or batch["paths"] != paths:
+                self._walking_support_samples = None
+                if batch is not None:
+                    self._walking_support_anchor = None  # Different physics generation or robot.
+                view = simulation.create_rigid_body_view(list(paths))
+                order = tuple(str(path) for path in view.prim_paths)
+                if len(order) != 2 or set(order) != set(paths):
+                    raise RuntimeError("Walking foot view does not contain the two existing ankle bodies")
+                batch = {"simulation": simulation, "paths": paths, "view": view, "order": order}
+                self._walking_support_pose_batch = batch
+            rows = batch["view"].get_transforms().numpy()
+            if rows.shape != (2, 7):
+                raise RuntimeError("Invalid walking foot pose dimensions")
+            positions = {}
+            directions = []
+            for path, row in zip(batch["order"], rows):
+                values = tuple(float(value) for value in row)
+                norm_squared = sum(v * v for v in values[3:])
+                if (
+                    not all(math.isfinite(value) for value in values)
+                    or not math.isfinite(norm_squared)
+                    or norm_squared < 1e-12
+                ):
+                    raise RuntimeError("Invalid walking foot pose values")
+                positions[path] = values[:3]
+                norm = math.sqrt(norm_squared)
+                qx, qy, qz, qw = (v / norm for v in values[3:])  # Native transforms use XYZW.
+                fx, fy = 1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy + qw * qz)
+                length = math.hypot(fx, fy)
+                if length < 1e-6:
+                    raise RuntimeError("Walking sole has no horizontal forward direction")
+                directions.append((fx / length, fy / length))
+            left, right = (positions[path] for path in paths)
+            fx, fy = (sum(direction[axis] for direction in directions) for axis in (0, 1))
+            if math.hypot(fx, fy) < 1e-6:
+                raise RuntimeError("Walking sole headings oppose each other")
+            # A staggered stance changes the ankle-to-ankle line, not sole yaw.
+            return (left[0] + right[0]) * 0.5, (left[1] + right[1]) * 0.5, math.atan2(fy, fx)
+        except Exception:
+            self._walking_support_pose_batch = None
+            self._walking_support_samples = None
+            raise
+
+    def _update_walking_support_motion(self, elapsed: float) -> tuple[float, float, float, float] | None:
+        """Measure support travel over exactly the latest 0.4 s of zero command.
+
+        Store world positions and unwrapped mean sole heading, interpolating the
+        oldest endpoint for variable physics timesteps. A single advancing foot
+        contributes half its travel to the centroid, without inventing a turn.
+        Preserve the end-of-braking anchor through settling and hand-input changes.
+        Excursions add evidence to speed-based residual-motion classification;
+        they are not hard displacement bounds for slow or intermittent movement.
+        """
+        from collections import deque
+
+        pose = self._read_walking_support_pose()
+        samples = self._walking_support_samples
+        if samples is None or (samples and elapsed <= samples[-1][0]):
+            if samples:
+                self._walking_support_anchor = None
+            samples = self._walking_support_samples = deque()
+        heading = pose[2]
+        if samples:
+            previous = samples[-1][3]
+            heading = previous + math.atan2(math.sin(heading - previous), math.cos(heading - previous))
+        elif self._walking_support_anchor is not None:
+            previous = self._walking_support_anchor[2]
+            heading = previous + math.atan2(math.sin(heading - previous), math.cos(heading - previous))
+        samples.append((elapsed, pose[0], pose[1], heading))
+        if self._walking_support_anchor is None and elapsed >= 1.5 - 1e-9:
+            self._walking_support_anchor = (pose[0], pose[1], heading)
+        cutoff = elapsed - 0.4
+        while len(samples) > 1 and samples[1][0] <= cutoff:
+            samples.popleft()
+        if len(samples) < 2 or samples[0][0] > cutoff + 1e-9:
+            return None
+        first, second = samples[0], samples[1]
+        fraction = max(0.0, (cutoff - first[0]) / (second[0] - first[0]))
+        boundary = (cutoff, *(first[i] + fraction * (second[i] - first[i]) for i in (1, 2, 3)))
+        samples[0] = boundary
+        current = samples[-1]
+        anchor = self._walking_support_anchor
+        return (
+            math.hypot(current[1] - boundary[1], current[2] - boundary[2]) / 0.4,
+            abs(current[3] - boundary[3]) / 0.4,
+            math.hypot(current[1] - anchor[0], current[2] - anchor[1]) if anchor is not None else 0.0,
+            abs(current[3] - anchor[2]) if anchor is not None else 0.0,
+        )
+
+    def _check_gesture_motion(self, dt: float, command) -> bool:
+        """Pause sustained unintended walking, even when the robot stays upright.
+
+        Zeroing a learned controller's input does not guarantee that it stops.
+        After 1.5 s of braking, require both continuous excessive speed for
+        0.4 s and net travel above the same limits over that window.
+        Time-weighted XY vectors and signed yaw distinguish persistent drift
+        from reversing sway. Residual walking also requires measured foot-support
+        travel: a pelvis can shift while both feet remain planted during reaching.
+        Corrective stance steps are permitted before support excursions exceed
+        0.15 m or 0.35 rad. These minimum excursions are not hard travel bounds:
+        slow/intermittent drift can remain below the speed/dwell prerequisites.
+        No grasp/input-source state disables this check. The
+        separate fast-runaway guard still observes instantaneous magnitudes.
+        Bounds are for this slow, flat-floor experiment and do not move the root.
+        """
+        if not self._gesture_locomotion_enabled:
+            return True
+        if not math.isfinite(dt) or dt <= 0.0:
+            # An interrupted/invalid timebase is not evidence of continuous
+            # movement. The normal physics entry point also rejects these ticks.
+            self._walking_stop_elapsed = 0.0
+            self._walking_residual_motion_time = 0.0
+            self._walking_residual_window_time = 0.0
+            self._walking_residual_motion_samples = None
+            self._walking_support_pose_batch = None
+            self._walking_support_samples = None
+            self._walking_support_anchor = None
+            self._walking_runaway_time = 0.0
+            return True
+        try:
+            linear, angular = self.g1.robot.get_velocities()
+            linear = [float(v) for v in self._first_pose_value(linear)]
+            angular = [float(v) for v in self._first_pose_value(angular)]
+            values = [float(v) for v in command]
+            if len(linear) != 3 or len(angular) != 3 or len(values) != 3:
+                raise ValueError("unexpected velocity dimensions")
+            if not all(math.isfinite(v) for v in (*linear, *angular, *values)):
+                raise ValueError("nonfinite velocity or command")
+            speed = math.hypot(linear[0], linear[1])
+            yaw_speed = abs(angular[2])
+            self._walking_runaway_time = self._walking_runaway_time + dt if speed > 0.8 or yaw_speed > 1.2 else 0.0
+            residual = False
+            net_speed = net_yaw_speed = 0.0
+            support_motion = None
+            if self._walking_runaway_time >= 0.25:
+                pass  # Root runaway is unconditional, even if a foot reader fails.
+            elif any(abs(v) > 1e-6 for v in values):
+                self._walking_stop_elapsed = 0.0
+                self._walking_residual_motion_time = 0.0
+                self._walking_residual_window_time = 0.0
+                self._walking_residual_motion_samples = None
+                self._walking_support_samples = None
+                self._walking_support_anchor = None
+            else:
+                self._walking_stop_elapsed += dt
+                support_motion = self._update_walking_support_motion(self._walking_stop_elapsed)
+                window_s = 0.4
+                sample_dt = min(dt, window_s, max(0.0, self._walking_stop_elapsed - 1.5))
+                self._walking_residual_motion_time = (
+                    self._walking_residual_motion_time + sample_dt
+                    if sample_dt > 1e-12 and (speed > 0.10 or yaw_speed > 0.25)
+                    else 0.0
+                )
+                if sample_dt > 1e-12:
+                    if self._walking_residual_motion_samples is None:
+                        from collections import deque
+
+                        self._walking_residual_motion_samples = deque()
+                    samples = self._walking_residual_motion_samples
+                    samples.append((sample_dt, linear[0], linear[1], angular[2]))
+                    self._walking_residual_window_time += sample_dt
+                    excess = max(0.0, self._walking_residual_window_time - window_s)
+                    while excess > 1e-12:
+                        oldest = samples[0]
+                        removed = min(excess, oldest[0])
+                        if oldest[0] <= removed + 1e-12:
+                            samples.popleft()
+                        else:
+                            # Retain the exact partial interval at the window edge.
+                            samples[0] = (oldest[0] - removed, *oldest[1:])
+                        self._walking_residual_window_time -= removed
+                        excess -= removed
+                    if self._walking_residual_window_time >= window_s - 1e-9:
+                        mean = [
+                            sum(sample[0] * sample[axis] for sample in samples) / self._walking_residual_window_time
+                            for axis in (1, 2, 3)
+                        ]
+                        net_speed = math.hypot(mean[0], mean[1])
+                        net_yaw_speed = abs(mean[2])
+                        if self._walking_residual_motion_time >= window_s - 1e-9 and support_motion is not None:
+                            # Match translation with translation and turning with
+                            # turning; an unrelated channel cannot supply evidence.
+                            linear_drift = net_speed > 0.10 and support_motion[0] > 0.10 and support_motion[2] > 0.15
+                            yaw_drift = net_yaw_speed > 0.25 and support_motion[1] > 0.25 and support_motion[3] > 0.35
+                            residual = linear_drift or yaw_drift
+            if self._walking_runaway_time < 0.25 and not residual:
+                return True
+            reason = f"walking did not follow its motion request (speed {speed:.3f} m/s, yaw {yaw_speed:.3f} rad/s)"
+            if residual:
+                reason += f"; 0.4 s net speed {net_speed:.3f} m/s, net yaw {net_yaw_speed:.3f} rad/s"
+                reason += f"; foot support speed {support_motion[0]:.3f} m/s, yaw {support_motion[1]:.3f} rad/s"
+                reason += f"; stance excursion {support_motion[2]:.3f} m, {support_motion[3]:.3f} rad"
+        except Exception as error:
+            reason = f"could not validate walking velocity: {type(error).__name__}: {error}"
+        self._articulation_health_fault = reason
+        self._reset_gesture_locomotion()
+        self._log_physics_step_error("walking velocity", RuntimeError(reason + ". Use Reset before continuing."))
+        self._pause_faulted_articulation()
+        return False
+
     def _reset_teleoperation_state(self) -> None:
         """Release constraints and discard input, calibration, and cached physics handles."""
+        self._teleop_step_hand_samples = None
+        self._reset_webcam_tracking(close_receiver=True)
+        self._reset_gesture_locomotion()
         self._articulation_health_fault = None
         self._articulation_health_limits = None
         self._articulation_health_names = None
         if self._contact_reader is not None:
             self._contact_reader.invalidate()
         self._physical_grasp_results.clear()
+        self._bimanual_grasp_monitor.reset()
+        self._bimanual_grasp_result = self._bimanual_grasp_monitor.result
         self._latest_hand_contacts = {"left": [], "right": []}
         self._arm_contact_limited.clear()
         self._applied_finger_curls.clear()
@@ -1591,6 +2499,7 @@ class HumanoidExample(BaseSample):
             self._grasp_link_prims,
             self._object_rigid_prims,
             self._arm_ik_link_index,
+            self._arm_ik_target_cache,
             self._controller_arm_neutral_positions,
             self._controller_arm_neutral_targets,
             self._arm_orientation_anchors,
@@ -1615,9 +2524,12 @@ class HumanoidExample(BaseSample):
         self._g1_arm_joint_names_by_side.clear()
         self._g1_arm_joint_limits.clear()
         self._object_state_prev_positions.clear()
+        self._object_state_pose_batch = None
         self._camera_filtered_base = None
         self._camera_filtered_yaw = None
         self._head_camera_mount_prim = None
+        self._head_camera_comfort_filter.reset()
+        self._head_camera_comfort_height_calibrated = False
         self._reset_operator_head_rotation()
         self._xr_recenter_button_down = False
         self._xr_mode_button_down = False
@@ -1634,9 +2546,14 @@ class HumanoidExample(BaseSample):
         if key in self._physics_step_error_logged:
             return
         self._physics_step_error_logged.add(key)
+        outcome = (
+            "simulation paused; use the example's Reset to continue"
+            if getattr(self, "_articulation_health_fault", None) is not None
+            else "physics step continues"
+        )
         carb.log_warn(
             f"HumanoidExample: {subsystem} failed with {type(error).__name__}: {error} "
-            "(suppressing repeats; physics step continues)"
+            f"(suppressing repeats; {outcome})"
         )
 
     def _create_head_camera(self) -> None:
@@ -1644,7 +2561,7 @@ class HumanoidExample(BaseSample):
         stage = omni.usd.get_context().get_stage()
         camera = UsdGeom.Camera.Define(stage, self._head_camera_path)
         camera.CreateFocalLengthAttr().Set(16.0)
-        camera.CreateClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
+        camera.CreateClippingRangeAttr().Set(Gf.Vec2f(self._head_camera_near_clip_m, 1000.0))
 
         xformable = UsdGeom.Xformable(camera.GetPrim())
         xformable.ClearXformOpOrder()
@@ -1653,16 +2570,24 @@ class HumanoidExample(BaseSample):
         carb.log_info(f"HumanoidExample: created G1 head camera at {self._head_camera_path}")
 
     def _prepare_robot_head_camera_mount(self, stage: Usd.Stage) -> None:
-        """Record a fixed camera-to-body transform before the physics scene starts.
+        """Attach the neutral camera to the measured render head when available.
 
         G1's visual head is a fixed child of the torso, not a separate articulation
         link in the Inspire asset. Find its rigid ancestor and follow that body's
-        live physics pose. The existing camera path stays stable for recording.
+        live physics pose. A verified render-only head can turn with the operator;
+        its measured eye and neck anchors keep the view attached to that visual.
+        Assets without that separate render subtree retain the existing rigid mount.
+        The camera path stays stable for recording, and no physical neck is added.
         """
         self._head_camera_mount_prim = None
         self._head_camera_mount_local = None
         self._head_camera_mount_body_path = None
+        self._head_camera_comfort_offset = None
+        self._head_camera_eye_height_source = "legacy mount"
+        self._head_camera_comfort_filter.reset()
+        self._head_camera_comfort_height_calibrated = False
         for path in (
+            f"{self._g1_prim_path}/torso_link/visuals/head_link",
             f"{self._g1_prim_path}/torso_link/head_link",
             f"{self._g1_prim_path}/head_link",
             f"{self._g1_prim_path}/torso_link",
@@ -1676,8 +2601,39 @@ class HumanoidExample(BaseSample):
                 self._head_camera_mount_body_path = str(body.GetPath())
                 break
         if self._head_camera_mount_body_path is None:
+            self._operator_head_visual.clear()
             carb.log_warn("HumanoidExample: no rigid head/torso body for the robot camera")
             return
+        if (
+            self._head_camera_mount_body_path == f"{self._g1_prim_path}/torso_link"
+            and self._operator_head_visual.prepare(stage, self._g1_prim_path)
+        ):
+            # The old root-based offset sat above and well in front of the head.
+            # Use its actual front face with 1.5 cm forward eye clearance.
+            # Neutral gaze is level along robot +X, with +Z up.
+            eye = self._operator_head_visual.eye_mount_in_torso + Gf.Vec3d(0.015, 0.0, 0.0)
+            # The render bounding-box midpoint is below the G1's actual optical
+            # sensor. Use the authored sensor origin's height, never its downward
+            # pitch, for a centered, level first-person view.
+            cache = UsdGeom.XformCache()
+            torso_world = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(self._head_camera_mount_body_path))
+            sensor = stage.GetPrimAtPath(f"{self._g1_prim_path}/torso_link/d435_link")
+            if sensor.IsValid():
+                optical = (cache.GetLocalToWorldTransform(sensor) * torso_world.GetInverse()).ExtractTranslation()
+                if all(math.isfinite(float(axis)) for axis in optical):
+                    eye = Gf.Vec3d(eye[0], 0.0, optical[2])
+                    self._head_camera_eye_height_source = str(sensor.GetPath())
+            else:
+                self._head_camera_eye_height_source = "render head bounds (no optical sensor marker)"
+            self._head_camera_mount_local = (
+                Gf.Matrix4d().SetLookAt(eye, eye + Gf.Vec3d(1.0, 0.0, 0.0), Gf.Vec3d(0.0, 0.0, 1.0)).GetInverse()
+            )
+            root_world = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(self._g1_prim_path))
+            self._head_camera_comfort_offset = (
+                self._head_camera_mount_local * torso_world * root_world.GetInverse()
+            ).ExtractTranslation()
+            return
+        self._operator_head_visual.clear()
         cache = UsdGeom.XformCache()
         root_world = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(self._g1_prim_path))
         # Preserve the established eye position and viewing direction at spawn, then
@@ -1696,6 +2652,7 @@ class HumanoidExample(BaseSample):
         camera_world = Gf.Matrix4d().SetLookAt(eye, eye + direction, up).GetInverse()
         body_world = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(self._head_camera_mount_body_path))
         self._head_camera_mount_local = camera_world * body_world.GetInverse()
+        self._head_camera_comfort_offset = (camera_world * root_world.GetInverse()).ExtractTranslation()
 
     def _read_camera_mount_body_pose(self) -> Gf.Matrix4d | None:
         """Read the real head/torso body, including when Fabric leaves USD stale."""
@@ -1712,7 +2669,10 @@ class HumanoidExample(BaseSample):
             # mount. Never substitute authored transforms for a running rigid body.
             return UsdGeom.XformCache().GetLocalToWorldTransform(body)
         try:
-            if self._head_camera_mount_prim is None:
+            if (
+                self._head_camera_mount_prim is None
+                or not self._head_camera_mount_prim.is_physics_tensor_entity_valid()
+            ):
                 from isaacsim.core.experimental.prims import RigidPrim
 
                 self._head_camera_mount_prim = RigidPrim(paths=self._head_camera_mount_body_path)
@@ -1743,25 +2703,31 @@ class HumanoidExample(BaseSample):
         return self._head_camera_mount_local * body_world if body_world is not None else None
 
     def _reset_operator_head_rotation(self) -> None:
-        """Use the next valid headset orientation as forward without changing gaze calibration."""
+        """Recenter headset heading while preserving gravity and eye-gaze calibration."""
         self._head_camera_operator_neutral_rotation = None
         self._head_camera_operator_delta_rotation = None
+        self._operator_head_visual.reset()
 
     def _apply_operator_head_rotation(self, mounted_pose: Gf.Matrix4d) -> Gf.Matrix4d:
-        """Turn the view with the headset while retaining the exact mounted eye position.
+        """Turn the render head and its camera using only headset orientation.
 
         OpenXR and USD cameras both look down local -Z with local +Y up. In Gf's
-        row-vector convention, ``head * neutral^-1`` is the rotation relative to
-        the operator's initial view, expressed in camera coordinates. Applying
-        it before the mount already converts those axes into the robot frame;
-        an additional Y-up/Z-up conversion would turn the view around wrong axes.
+        row-vector convention, ``head * heading^-1`` removes only the operator's
+        initial compass heading. The reference must stay level with physical +Y:
+        subtracting startup pitch/roll tilts the world after a headset is put on
+        and couples subsequent left/right turns into pitch and roll. Applying the
+        delta before the mount already converts camera axes into the robot frame.
+        Recenter changes heading only; physical pitch and roll remain absolute.
 
-        Only orientation is read: physical translation never moves the camera.
-        Losing tracking retains the last relative orientation while the mounted
-        position and body orientation continue following the simulated robot.
-        This camera motion does not add or actuate a neck joint in the G1 asset.
+        Physical translation never moves the camera. The eye follows the verified
+        render head's neck arc using orientation alone. The comfort caller maps
+        this relative arc into its stabilized frame, discarding body bob and tilt.
+        Legacy assets without a verified render head also keep a fixed eye.
+        Tracking loss holds the last relative orientation while the torso keeps
+        following live physics. The physical G1 head and eye-gaze logic are unchanged.
         """
         if not self._head_camera_operator_rotation_enabled:
+            self._operator_head_visual.reset()
             return mounted_pose
         head_pose = self._read_physical_head_pose()
         if head_pose is not None:
@@ -1772,23 +2738,48 @@ class HumanoidExample(BaseSample):
             ):
                 head_rotation = Gf.Matrix4d().SetRotate(head_pose.ExtractRotationQuat().GetNormalized())
                 if self._head_camera_operator_neutral_rotation is None:
-                    self._head_camera_operator_neutral_rotation = head_rotation
-                self._head_camera_operator_delta_rotation = (
-                    head_rotation * self._head_camera_operator_neutral_rotation.GetInverse()
-                )
+                    self._head_camera_operator_neutral_rotation = compute_level_head_reference(head_rotation)
+                if self._head_camera_operator_neutral_rotation is not None:
+                    self._head_camera_operator_delta_rotation = (
+                        head_rotation * self._head_camera_operator_neutral_rotation.GetInverse()
+                    )
         if self._head_camera_operator_delta_rotation is None:
             return mounted_pose
         camera_pose = self._head_camera_operator_delta_rotation * mounted_pose
-        # Keep this invariant explicit even if the rotation representation changes.
+        visual = self._operator_head_visual
+        # The visible head always belongs to the physical torso: rotate about
+        # its neck, never translate it to follow the separately stabilized eye.
+        # Camera comfort changes only the view; it must not detach the geometry.
+        head_applied = visual.ready and visual.apply(
+            self._head_camera_operator_delta_rotation, self._head_camera_mount_local
+        )
+        if head_applied:
+            # Use the same camera-to-torso change of basis as the render head.
+            # The torso pose is recovered from the already-read mount to avoid
+            # a second physics read or any dependency on stale USD body poses.
+            mount_rotation = Gf.Matrix4d().SetRotate(self._head_camera_mount_local.ExtractRotationQuat())
+            torso_delta = mount_rotation.GetInverse() * self._head_camera_operator_delta_rotation * mount_rotation
+            pivot = visual.neck_pivot_in_torso
+            eye = self._head_camera_mount_local.ExtractTranslation()
+            turned_eye = pivot + torso_delta.TransformDir(eye - pivot)
+            torso_pose = self._head_camera_mount_local.GetInverse() * mounted_pose
+            camera_pose.SetTranslateOnly(torso_pose.Transform(turned_eye))
+            return camera_pose
+        # Keep legacy assets fixed to their original rigid eye position.
         camera_pose.SetTranslateOnly(mounted_pose.ExtractTranslation())
         return camera_pose
 
     def _on_robot_camera_update(self, event: object) -> None:
         """Reassert the mounted XR view every application frame, including Pause."""
+        if omni.usd.get_context().get_stage() is None:
+            self._restore_controller_xr_tools()
+            return  # A stage close can precede the example's cleanup callback.
+        try:
+            self._sync_controller_xr_tools()
+        except Exception as error:
+            self._log_physics_step_error("controller XR tool ownership", error)
         if self._g1_locomotion != "stationary" and self._xr_camera_mode != "robot_head":
             return
-        if omni.usd.get_context().get_stage() is None:
-            return  # A stage close can precede the example's cleanup callback.
         try:
             self._update_head_camera_view(force=True, dt=0.0)
         except Exception as error:
@@ -2156,27 +3147,64 @@ class HumanoidExample(BaseSample):
         return None
 
     def _read_physical_head_pose(self):
-        """Return the headset pose in PHYSICAL (playspace) coordinates, or None.
+        """Read valid physical HMD input, preferring the runtime's raw descriptor.
 
-        Physical, not virtual-world: the compose path re-injects this pose so the runtime's
-        own head subtraction cancels it. A virtual-world pose already has the rig transform
-        folded in and would make that cancellation feed back on itself.
+        Raw descriptors, when implemented by the runtime, avoid Kit input
+        smoothing and carry OpenXR orientation/position VALID bits. This Kit's
+        wrapper can expose a raw method missing from its native implementation;
+        only that specific absence permits the validated processed descriptor.
+        Invalid data never falls back to a matrix or another pose source.
+        Matrix-only adapters retain their legacy nonidentity sentinel only when
+        no descriptor API is exposed.
+        Never read virtual-world input here: it already contains the camera rig.
         """
         headset = self._find_xr_head_device()
         pose = None
         if headset is not None:
-            for reader_name in ("get_pose", "get_raw_pose"):
-                reader = getattr(headset, reader_name, None)
-                if reader is None:
-                    continue
-                try:
-                    candidate = Gf.Matrix4d(reader())
-                except Exception:
-                    continue
-                if candidate == Gf.Matrix4d(1.0):
-                    continue  # identity = not tracked this frame
-                pose = candidate
-                break
+            try:
+                raw_reader = getattr(headset, "get_raw_pose_desc", None)
+                descriptor_reader = raw_reader if callable(raw_reader) else getattr(headset, "get_pose_desc", None)
+                if not callable(descriptor_reader):
+                    descriptor_reader = None
+                if descriptor_reader is not None:
+                    try:
+                        descriptor = descriptor_reader("")
+                    except AttributeError as error:
+                        # Isaac 6.1's Python wrapper exposes get_raw_pose_desc,
+                        # but its XRInputDevice_Internal may omit that method.
+                        # Missing matrix fields or other runtime failures are
+                        # invalid samples, never evidence of an absent API.
+                        fallback = getattr(headset, "get_pose_desc", None)
+                        if (
+                            descriptor_reader is not raw_reader
+                            or error.name != "get_raw_pose_desc"
+                            or not callable(fallback)
+                        ):
+                            raise
+                        descriptor = fallback("")
+                    if int(descriptor.validity_flags) & 0x3 == 0x3:
+                        value = descriptor.pose_matrix
+                        if value is not None and len(value) == 4 and all(len(row) == 4 for row in value):
+                            candidate = Gf.Matrix4d(value)
+                            if self._is_valid_rigid_pose(candidate):
+                                pose = candidate
+                else:
+                    for reader_name in ("get_pose", "get_raw_pose"):
+                        reader = getattr(headset, reader_name, None)
+                        if not callable(reader):
+                            continue
+                        try:
+                            value = reader()
+                            if value is None or len(value) != 4 or any(len(row) != 4 for row in value):
+                                continue
+                            candidate = Gf.Matrix4d(value)
+                            if candidate != Gf.Matrix4d(1.0) and self._is_valid_rigid_pose(candidate):
+                                pose = candidate
+                                break
+                        except (AttributeError, IndexError, TypeError, ValueError, RuntimeError, OverflowError):
+                            continue
+            except (AttributeError, IndexError, TypeError, ValueError, RuntimeError, OverflowError):
+                pass
 
         if pose is not None:
             self._xr_last_head_pose = pose
@@ -2290,11 +3318,21 @@ class HumanoidExample(BaseSample):
             print("[G1] Face the way you want to walk and press B to redo this.", flush=True)
 
     def _request_xr_recenter(self) -> None:
-        """Reset the operator's forward view, or recalibrate a legacy moving mode, on B."""
+        """Recenter heading without baking in head tilt, or recalibrate legacy modes, on B."""
+        self._reset_gesture_locomotion()
+        self._invalidate_webcam_calibration("Headset recentered; press C to align the webcam again")
         if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
+            reference = compute_level_head_reference(self._read_physical_head_pose())
+            if reference is None:
+                # Looking almost straight up/down has no reliable floor heading.
+                # Keep the existing view instead of snapping it level while the
+                # user is tilted. Scene resets still clear calibration normally.
+                self._log_xr_camera_state("recenter needs valid horizontal heading; look ahead and press B again")
+                return
             self._reset_operator_head_rotation()
+            self._head_camera_operator_neutral_rotation = reference
             self._update_head_camera_view(force=True, dt=0.0)
-            self._log_xr_camera_state("head view recentered; eye position remains on the robot head mount")
+            self._log_xr_camera_state("head heading recentered; gravity and robot eye position are preserved")
             return
         self._xr_calibrated = False
         self._xr_calibration_samples = []
@@ -2407,7 +3445,20 @@ class HumanoidExample(BaseSample):
         """Compute a first-person camera pose from the G1 head/eye position."""
         if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
             mounted_pose = self._get_robot_head_camera_pose()
-            return self._apply_operator_head_rotation(mounted_pose) if mounted_pose is not None else None
+            if mounted_pose is None:
+                return None
+            articulated_view = self._apply_operator_head_rotation(mounted_pose)
+            if not self._head_camera_comfort_enabled:
+                return articulated_view
+            # Keep the HMD-driven eye arc, but express it in the stabilized robot
+            # frame. Removing the live mount cancels torso bob/pitch/roll before
+            # applying the existing comfort filter. Holding the eye fixed while
+            # turning a neck-anchored head puts its mesh through the view when
+            # looking down. Room-scale HMD translation is still ignored.
+            comfort_mount = self._get_comfort_camera_mount(mounted_pose)
+            if comfort_mount is None:
+                return None
+            return articulated_view * mounted_pose.GetInverse() * comfort_mount
         if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
 
@@ -2452,6 +3503,48 @@ class HumanoidExample(BaseSample):
             - Gf.Vec3d(0.0, 0.0, self._first_person_head_target_drop)
         )
         return Gf.Matrix4d().SetLookAt(eye, target, Gf.Vec3d(0.0, 0.0, 1.0)).GetInverse()
+
+    def _get_comfort_camera_mount(self, mounted_pose: Gf.Matrix4d) -> Gf.Matrix4d | None:
+        """Follow a level robot frame at a fixed optical height on this flat floor.
+
+        The D435 marker supplies eye height. Once the walking actor settles, one
+        measured height calibration accounts for its standing pelvis height; we
+        then discard gait bob instead of continuously chasing the torso's Z.
+        This mode is for this level factory, not ramps or stair climbing.
+        """
+        base = self._get_g1_base_pose_for_arms()
+        if base is None and (not self._physics_ready or self._timeline_stopped):
+            # Like the rigid mount reader, use authored transforms before Play
+            # or after Stop. Never substitute these for unavailable live physics.
+            stage = omni.usd.get_context().get_stage()
+            root = stage.GetPrimAtPath(self._g1_prim_path) if stage is not None else None
+            if root and root.IsValid():
+                root_pose = UsdGeom.XformCache().GetLocalToWorldTransform(root)
+                if self._is_valid_rigid_pose(root_pose):
+                    forward = root_pose.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+                    base = root_pose.ExtractTranslation(), math.atan2(forward[1], forward[0])
+        if base is None or self._head_camera_comfort_offset is None:
+            return None
+        position, yaw = base
+        moving = self._base_command is not None and any(abs(float(axis)) > 0.02 for axis in self._base_command)
+        eye_height = float(mounted_pose.ExtractTranslation()[2])
+        if (
+            not self._head_camera_comfort_height_calibrated
+            and self._physics_ready
+            and (self._g1_locomotion == "stationary" or getattr(self.g1, "_walk_time", 0.0) >= 0.5)
+        ):
+            self._head_camera_comfort_height_calibrated = self._head_camera_comfort_filter.set_eye_height(eye_height)
+        filtered = self._head_camera_comfort_filter.update(
+            position=position, yaw=yaw, eye_height=eye_height, now_s=time.perf_counter(), moving=bool(moving)
+        )
+        if filtered is None:
+            return None
+        center, heading = filtered
+        forward = Gf.Vec3d(math.cos(heading), math.sin(heading), 0.0)
+        left = Gf.Vec3d(-math.sin(heading), math.cos(heading), 0.0)
+        offset = self._head_camera_comfort_offset
+        eye = center + forward * offset[0] + left * offset[1]
+        return Gf.Matrix4d().SetLookAt(eye, eye + forward, Gf.Vec3d(0.0, 0.0, 1.0)).GetInverse()
 
     def _stabilize_camera_pose(self, base: Gf.Vec3d, yaw: float, dt: float) -> tuple[Gf.Vec3d, float]:
         """Low-pass the robot's base pose so the gait does not shake the camera.
@@ -2499,9 +3592,212 @@ class HumanoidExample(BaseSample):
         """Wrap an angle into [-pi, pi]."""
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
+    @staticmethod
+    def _is_valid_rigid_pose(matrix) -> bool:
+        """Reject invalid transforms before native XR anchor inversion can see them."""
+        try:
+            if matrix is None or len(matrix) != 4 or any(len(row) != 4 for row in matrix):
+                return False
+            if not all(math.isfinite(float(matrix[r][c])) for r in range(4) for c in range(4)):
+                return False
+            if any(abs(float(matrix[r][3])) > 1e-5 for r in range(3)) or abs(float(matrix[3][3]) - 1.0) > 1e-5:
+                return False
+            rotation = Gf.Matrix4d(matrix).ExtractRotationMatrix()
+            if abs(rotation.GetDeterminant() - 1.0) > 0.01:
+                return False
+            return all(
+                abs(sum(float(rotation[r][k]) * float(rotation[c][k]) for k in range(3)) - float(r == c)) < 0.01
+                for r in range(3)
+                for c in range(3)
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
+    def _xr_camera_can_schedule(self) -> bool:
+        """Require live physics and ready XR display/viewport resources for an anchor.
+
+        Stop/Play rebuilds physics views, and XR session transitions can remove
+        viewport resources independently of the display flag. Keep the desktop
+        camera usable, but never substitute a cached head for readiness.
+        This blocks new requests during transitions; it cannot repair native
+        OpenXR session re-entry or cancel a teleport already queued by Kit.
+        """
+        if self._timeline_stopped or not self._physics_ready or self.g1 is None or self._xr_core is None:
+            return False
+        try:
+            if not self.g1.robot.is_physics_tensor_entity_valid():
+                return False
+            # A profile-disable request changes the active profile before the
+            # native XR/display flags finish teardown. Do not enqueue another
+            # camera teleport in that interval. XRProfile.is_enabled() and
+            # get_name() are public SDK state queries, not lifecycle commands.
+            profile = self._xr_core.get_current_profile()
+            if profile is None or not profile.get_name() or not profile.is_enabled():
+                return False
+            if (
+                not self._xr_core.is_xr_enabled()
+                or not self._xr_core.is_xr_display_enabled()
+                or not self._xr_core.is_xr_viewport_enabled()
+            ):
+                return False
+            head = self._read_gesture_physical_pose(self._find_xr_head_device(), "", 3)
+            return self._is_valid_rigid_pose(head)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
+    def _configure_robot_head_xr_orientation(self) -> None:
+        """Match the robot camera's orientation and near plane in native XR.
+
+        Kit otherwise levels the physical tracking world, silently dropping part
+        of the requested camera pitch/roll. Use the active profile's persistent
+        path, not a guessed global alias. Restore our exact prior opinion when
+        leaving this camera mode or unloading the example. XR does not copy the
+        USD camera's clipping range, so set its separate near plane explicitly.
+        """
+        profile = self._xr_core.get_current_profile()
+        if profile is None:
+            return
+        prefix = profile.get_persistent_path()
+        if not isinstance(prefix, str) or not prefix.startswith("/"):
+            return
+        key = prefix.rstrip("/") + "/overrideFloorAlignedAnchor"
+        saved = self._robot_head_xr_orientation_setting
+        if saved is not None and saved[1] == key:
+            return
+        self._restore_robot_head_xr_orientation()
+        import carb.settings
+
+        settings = carb.settings.get_settings()
+        near_key = prefix.rstrip("/") + "/render/nearPlane"
+        self._robot_head_xr_orientation_setting = (settings, key, settings.get(key), near_key, settings.get(near_key))
+        settings.set_bool(key, True)
+        settings.set(near_key, self._head_camera_near_clip_m)
+
+    def _sync_controller_xr_tools(self) -> None:
+        """Reserve controller actions without disabling any raw XR input source.
+
+        Kit's default VR action map independently binds sticks to native fly/
+        teleport and grips/triggers to USD manipulation. Scheduling our camera
+        does not disable those tools. The installed XR core documents selecting
+        a custom tools layout to leave them unbound. Scope that override to this
+        controller example and the currently enabled profile, including Pause.
+        Profile exit, XR exit and example cleanup restore the prior preference.
+        The private layout name carries the original string/absence so a later
+        launch, including stationary mode, can recover after a process crash.
+
+        Head, optical hands, eye input, GUI layers and OpenXR action components
+        remain enabled. Our direct stick reader does not use this tool action map.
+        """
+        if self._xr_core is None:
+            self._restore_controller_xr_tools()
+            return
+        if not self._xr_core.is_xr_enabled():
+            self._restore_controller_xr_tools()
+            return
+        profile = self._xr_core.get_current_profile()
+        # The SDK can return an empty-name profile while native XR teardown is
+        # still pending. Never acquire a layout at its parent profile namespace.
+        if profile is None or not profile.get_name() or not profile.is_enabled():
+            self._restore_controller_xr_tools()
+            return
+        prefix = profile.get_persistent_path()
+        if not isinstance(prefix, str) or not prefix.startswith("/"):
+            self._restore_controller_xr_tools()
+            raise RuntimeError("Cannot resolve the active XR profile's tools-layout setting")
+        key = prefix.rstrip("/") + "/tools/layout"
+        saved = self._controller_xr_tools_setting
+        if saved is not None and saved[1] == key and saved[0].get(key) == saved[3]:
+            if self._controller_walking_enabled and self.g1 is not None:
+                return
+            self._restore_controller_xr_tools()
+            return
+        self._restore_controller_xr_tools()
+        import carb.settings
+
+        settings = carb.settings.get_settings()
+        previous = settings.get(key)
+        recognized, recovered = self._decode_controller_xr_tools_layout(previous)
+        if recognized:
+            # Recovery is part of every example mode, not only acquisition. A
+            # stale persistent override must not disable stationary VR tools.
+            if recovered is None:
+                settings.destroy_item(key)
+            else:
+                settings.set(key, recovered)
+            previous = recovered
+        if not self._controller_walking_enabled or self.g1 is None:
+            return
+        layout = self._encode_controller_xr_tools_layout(previous)
+        self._controller_xr_tools_setting = (settings, key, previous, layout)
+        settings.set(key, layout)
+
+    @staticmethod
+    def _encode_controller_xr_tools_layout(previous: str | None) -> str:
+        """One atomic setting stores ownership and the exact prior opinion.
+
+        XR core treats an unregistered layout name as a custom tool layout. Hex
+        keeps the embedded JSON token-safe without adding a recovery file or a
+        second persistent setting that could disagree after an interrupted write.
+        """
+        if previous is not None and not isinstance(previous, str):
+            raise ValueError("XR tools layout must be a string or an absent opinion")
+        return "g1_controller_teleop__v1__" + json.dumps(previous, ensure_ascii=True).encode("utf-8").hex()
+
+    @staticmethod
+    def _decode_controller_xr_tools_layout(layout) -> tuple[bool, str | None]:
+        """Recognize only this example's canonical private recovery marker."""
+        # The previous implementation used this exact private token while this
+        # project owned the default 'vr' layout. Preserve that upgrade path.
+        if layout == "g1_controller_teleop":
+            return True, "vr"
+        prefix = "g1_controller_teleop__v1__"
+        if not isinstance(layout, str) or not layout.startswith(prefix):
+            return False, None
+        try:
+            previous = json.loads(bytes.fromhex(layout[len(prefix) :]).decode("utf-8"))
+        except (ValueError, UnicodeError):
+            return False, None
+        if previous is not None and not isinstance(previous, str):
+            return False, None
+        if HumanoidExample._encode_controller_xr_tools_layout(previous) != layout:
+            return False, None
+        return True, previous
+
+    def _restore_controller_xr_tools(self) -> None:
+        """Restore the exact owned layout opinion without erasing a later edit."""
+        saved = self._controller_xr_tools_setting
+        if saved is None:
+            return
+        settings, key, previous, owned = saved
+        # A different value belongs to a later user/tool edit. Preserve it; the
+        # next sync can capture it as the preference to restore on profile exit.
+        if settings.get(key) == owned:
+            if previous is None:
+                settings.destroy_item(key)
+            else:
+                settings.set(key, previous)
+        self._controller_xr_tools_setting = None
+
+    def _restore_robot_head_xr_orientation(self) -> None:
+        """Restore the exact XR orientation and clipping opinions owned by this view."""
+        saved = self._robot_head_xr_orientation_setting
+        if saved is None:
+            return
+        settings, key, previous, near_key, previous_near = saved
+        for setting_key, value in ((key, previous), (near_key, previous_near)):
+            if value is None:
+                settings.destroy_item(setting_key)
+            else:
+                settings.set(setting_key, value)
+        self._robot_head_xr_orientation_setting = None
+
     def _update_head_camera_view(self, force: bool = False, dt: float | None = None) -> None:
         """Move the viewport/XR camera to the G1 head pose."""
         if self._head_camera_transform_op is None:
+            return
+        if not force and self._head_camera_comfort_enabled and self._head_camera_update_sub is not None:
+            # The application-frame subscription owns the comfort view during
+            # Play and Pause. Do not interleave additional physics-frame writes.
             return
         self._head_camera_update_counter += 1
         if not force and self._head_camera_update_counter % self._head_camera_update_interval != 0:
@@ -2520,12 +3816,19 @@ class HumanoidExample(BaseSample):
                 return
 
         camera_pose = self._get_head_camera_pose(dt)
-        if camera_pose is None:
+        if not self._is_valid_rigid_pose(camera_pose):
             return
+        # The head rotates at the neck and the eye follows its turn. Restore
+        # visibility owned by an older live session so observer cameras and
+        # shadows retain the complete robot.
+        self._operator_head_visual.set_first_person_hidden(False)
         self._head_camera_transform_op.Set(camera_pose)
-        if self._xr_core is not None:
+        if self._g1_locomotion != "stationary" and self._xr_camera_mode != "robot_head":
+            self._restore_robot_head_xr_orientation()
+        if self._xr_camera_can_schedule():
             if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
                 try:
+                    self._configure_robot_head_xr_orientation()
                     self._xr_core.schedule_set_camera(camera_pose)
                 except Exception as error:
                     self._log_physics_step_error("robot-mounted XR camera", error)
@@ -2581,6 +3884,11 @@ class HumanoidExample(BaseSample):
             return
         attack = max(self._command_attack_time, 1e-6)
         release = max(self._command_release_time, 1e-6)
+        if self._gesture_locomotion_enabled:
+            # The wrist joystick arrives in wall time, just like arm input. Using
+            # simulation time here multiplied its delay in a slow VR session.
+            # Motor dynamics and joint-speed limits still use physics time.
+            dt = self._teleop_input_dt
         current = self._base_command
         for axis in range(3):
             if self._locomotion_brake and axis < 2:
@@ -2598,13 +3906,101 @@ class HumanoidExample(BaseSample):
         """Return an OpenXR input device such as /user/hand/left, if XR is active."""
         if self._xr_core is None:
             return None
+        snapshot = getattr(self, "_teleop_step_hand_samples", None)
+        devices = (
+            snapshot["devices"] if snapshot is not None and handle in ("/user/hand/left", "/user/hand/right") else None
+        )
+        if devices is not None and handle in devices:
+            return devices[handle]
         try:
-            return self._xr_core.get_input_device(handle)
+            device = self._xr_core.get_input_device(handle)
         except Exception:
+            device = None
+        if devices is not None:
+            devices[handle] = device
+        return device
+
+    def _get_teleop_hand_snapshot(self, input_device: object) -> dict | None:
+        """Return a hand's shared sample only during the current physics callback."""
+        snapshot = getattr(self, "_teleop_step_hand_samples", None)
+        if snapshot is None or input_device is None:
+            return None
+        # Keep a reference with the identity key: short-lived webcam adapters
+        # must not collide if Python reuses an object ID during this callback.
+        samples = snapshot["samples"]
+        key = id(input_device)
+        if key not in samples or samples[key]["device"] is not input_device:
+            samples[key] = {"device": input_device}
+        return samples[key]
+
+    @staticmethod
+    def _copy_hand_world_pose_sample(descriptor: object) -> tuple[int, tuple[float, float, float]] | None:
+        """Copy position evidence and all validity bits without requiring orientation."""
+        try:
+            flags = int(descriptor.validity_flags)
+            matrix = descriptor.pose_matrix
+            if matrix is None or len(matrix) != 4 or any(len(row) != 4 for row in matrix):
+                return None
+            coordinates = tuple(float(matrix[3][axis]) for axis in range(3))
+            if not all(math.isfinite(value) for value in coordinates):
+                return None
+            return flags, coordinates
+        except (AttributeError, IndexError, TypeError, ValueError, RuntimeError, OverflowError):
+            return None
+
+    def _get_hand_world_pose_sample(self, input_device: object, pose_name: str):
+        """Read one landmark from a fresh, callback-local bulk skeleton snapshot.
+
+        Isaac's public XR API returns every virtual-world pose in one native
+        call. Navigation and finger control share its copied positions and flags
+        during this synchronous callback; no sample survives the next callback.
+        Older adapters without that API use individual descriptor reads. A bulk
+        read that exists but fails never falls back to possibly stale poses.
+        """
+        if input_device is None:
+            return None
+        snapshot = self._get_teleop_hand_snapshot(input_device)
+        try:
+            bulk_reader = getattr(input_device, "get_all_virtual_world_poses", None)
+            if callable(bulk_reader):
+                if snapshot is not None and "world_pose_samples" in snapshot:
+                    return snapshot["world_pose_samples"].get(pose_name)
+                # Publish an empty result before reading, so a failed native
+                # call also stays unavailable for the rest of this callback.
+                if snapshot is not None:
+                    snapshot["world_pose_samples"] = {}
+                descriptors = bulk_reader()
+                if not isinstance(descriptors, dict):
+                    return None
+                samples = {
+                    str(name): self._copy_hand_world_pose_sample(descriptor) for name, descriptor in descriptors.items()
+                }
+                if snapshot is not None:
+                    snapshot["world_pose_samples"] = samples
+                return samples.get(pose_name)
+            samples = snapshot.setdefault("world_pose_samples", {}) if snapshot is not None else {}
+            if pose_name not in samples:
+                samples[pose_name] = None
+                samples[pose_name] = self._copy_hand_world_pose_sample(
+                    input_device.get_virtual_world_pose_desc(pose_name)
+                )
+            return samples[pose_name]
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OverflowError):
             return None
 
     def _get_xr_gesture_value(self, input_device, input_name: str, gesture_name: str) -> float:
-        """Read an XR controller gesture value, returning 0.0 when unsupported/inactive."""
+        """Share an action sample within this callback, including unavailable actions."""
+        snapshot = self._get_teleop_hand_snapshot(input_device)
+        if snapshot is None:
+            return self._read_xr_gesture_value(input_device, input_name, gesture_name)
+        values = snapshot.setdefault("gesture_values", {})
+        key = (input_name, gesture_name)
+        if key not in values:
+            values[key] = self._read_xr_gesture_value(input_device, input_name, gesture_name)
+        return values[key]
+
+    def _read_xr_gesture_value(self, input_device, input_name: str, gesture_name: str) -> float:
+        """Read one current XR action, returning zero for unsupported/invalid input."""
         if input_device is None:
             return 0.0
         try:
@@ -2771,6 +4167,8 @@ class HumanoidExample(BaseSample):
         """
         if not self._behavioral_data_enabled:
             return
+        if self._behavioral_session_dir is not None:
+            self._save_behavioral_data()
 
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         session_id = f"session_{timestamp}"
@@ -2814,6 +4212,12 @@ class HumanoidExample(BaseSample):
             "robot_hand_variant": self._g1_hand_variant,
             "robot_locomotion_requested": self._g1_locomotion,
             "robot_locomotion": getattr(self.g1, "_locomotion", self._g1_locomotion),
+            "gesture_walking_enabled": self._gesture_locomotion_enabled,
+            "locomotion_input": self._locomotion_input_mode,
+            "optical_hands_only": self._optical_hands_only,
+            "pointing_navigation_enabled": self._pointing_navigation_enabled,
+            "walking_policy": getattr(self.g1, "walking_policy_name", None),
+            "arm_gravity_compensation": getattr(self.g1, "arm_gravity_compensation_enabled", False),
             "grasp_mode": self._grasp_mode,
             "grasp_contact_lead_rad": self._finger_contact_lead_rad,
             "hand_mimic_coupling": "compliant" if self._grasp_mode == "physical" else "asset_authored",
@@ -2836,13 +4240,25 @@ class HumanoidExample(BaseSample):
                 else "asset_authored"
             ),
             "grasp_status_meaning": (
-                "contact_supported means sustained opposing contacts, not guaranteed hold; is_grabbed is false"
+                "contact_supported means sustained opposing contacts from either one hand or both hands, not guaranteed hold; "
+                "per-hand contact fields retain single-hand classification, bimanual fields describe cross-hand evidence; "
+                "capacity is an upper estimate, not measured friction or lift; is_grabbed is false"
                 if self._grasp_mode == "physical"
                 else "is_grabbed means distance-gated fixed-joint attachment"
             ),
             "base_fixed_to_world": self._g1_locomotion == "stationary",
-            "station_hold_enabled": bool(self._g1_locomotion == "policy" and self.g1 and self.g1.STATION_HOLD_ENABLED),
-            "turn_hold_enabled": bool(self._g1_locomotion == "policy" and self.g1 and self.g1.TURN_HOLD_ENABLED),
+            "station_hold_enabled": bool(
+                not self._gesture_locomotion_enabled
+                and self._g1_locomotion == "policy"
+                and self.g1
+                and self.g1.STATION_HOLD_ENABLED
+            ),
+            "turn_hold_enabled": bool(
+                not self._gesture_locomotion_enabled
+                and self._g1_locomotion == "policy"
+                and self.g1
+                and self.g1.TURN_HOLD_ENABLED
+            ),
             "arm_orientation_tracking": self._arm_track_orientation,
             "finger_control_enabled": self._finger_control_enabled,
             "finger_roles": list(self._finger_roles),
@@ -2982,8 +4398,8 @@ class HumanoidExample(BaseSample):
         self._headset_gait_step_event = False  # consume the flag
         self._behavioral_data_records.append(record)
 
-    def _append_csv(self, path: Path, records: list) -> None:
-        """Append dict records to a session CSV, writing the header on first creation.
+    def _append_csv(self, path: Path, records: list) -> bool:
+        """Queue detached rows for ordered disk append without blocking physics.
 
         The header is fixed at the first append (union of the buffered rows' keys in
         first-seen order) and reused for the rest of the session. This matters for
@@ -2993,7 +4409,9 @@ class HumanoidExample(BaseSample):
         raising (extrasaction) — losing one exotic column beats losing the file.
         """
         if not records:
-            return
+            return True
+        if path in self._behavioral_csv_failed_paths:
+            return False
         fieldnames = self._behavioral_csv_fieldnames.get(path.name)
         if fieldnames is None:
             seen: dict[str, None] = {}
@@ -3002,41 +4420,71 @@ class HumanoidExample(BaseSample):
                     seen.setdefault(key)
             fieldnames = list(seen)
             self._behavioral_csv_fieldnames[path.name] = fieldnames
-        write_header = not path.exists()
-        with open(path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="", extrasaction="ignore")
-            if write_header:
-                writer.writeheader()
-            writer.writerows(records)
+        if self._behavioral_csv_writer is None:
+            self._behavioral_csv_writer = BehavioralCsvWriter(max_pending=8)
+        # These five collectors already create native immutable scalar cells;
+        # copy their dictionaries without per-cell validation in the callback.
+        return self._behavioral_csv_writer.enqueue_scalar_records(path, records, fieldnames)
 
-    def _flush_behavioral_csvs(self) -> None:
-        """Append all buffered rows to the session CSVs and clear the buffers.
-
-        Called every ~10 s during play and once at session close. Incremental
-        appends mean a crash or force-quit loses at most the last few seconds.
-        (Previously the CSVs were only written at scene clear — which never runs
-        when the app window is simply closed, so whole sessions ended up with
-        camera frames but no sensor logs at all.)
-        """
-        if self._behavioral_session_dir is None:
+    def _collect_behavioral_csv_results(self, *, close: bool = False) -> None:
+        """Report errors on the main thread and retain their complete original rows."""
+        writer = self._behavioral_csv_writer
+        if writer is None:
             return
-        streams = (
+        results = writer.close() if close else writer.collect_completed()
+        if close:
+            self._behavioral_csv_writer = None
+        for result in results:
+            if result.error is not None:
+                self._behavioral_csv_failed_batches.append(result)
+                self._behavioral_csv_failed_paths.add(result.batch.path)
+                carb.log_warn(
+                    f"HumanoidExample: CSV write failed for {result.batch.path}: {result.error}; "
+                    f"retained {len(result.batch.rows)} rows in _behavioral_csv_failed_batches"
+                )
+
+    def _behavioral_csv_streams(self) -> tuple:
+        """Return current-session buffers in the established output order."""
+        return (
             ("behavior.csv", self._behavioral_data_records),
             ("frame_timestamps.csv", self._behavioral_frame_records),
             ("hand_tracking.csv", self._hand_tracking_records),
             ("gaze.csv", self._gaze_records),
             ("object_states.csv", self._object_state_records),
         )
-        for filename, records in streams:
-            if not records:
-                continue
-            try:
-                self._append_csv(self._behavioral_session_dir / filename, records)
-            except Exception as e:
-                carb.log_warn(f"HumanoidExample: failed to flush {filename}: {e}")
-                continue
-            # clear() keeps the same list object so every collector stays bound to it
-            records.clear()
+
+    def _flush_behavioral_csvs(self) -> None:
+        """Queue buffered rows; leave unaccepted batches in place for the next flush.
+
+        Called every ~2.5 s during play and once at session close. Incremental
+        appends reduce buffered data; a force-quit can lose queued/unsaved rows,
+        and a stalled disk can retain more than one interval in memory.
+        (Previously the CSVs were only written at scene clear — which never runs
+        when the app window is simply closed, so whole sessions ended up with
+        camera frames but no sensor logs at all.)
+        """
+        if self._behavioral_session_dir is None:
+            return
+        self._collect_behavioral_csv_results()
+        streams = self._behavioral_csv_streams()
+        if not any(records for _, records in streams):
+            return
+        if self._behavioral_csv_writer is None:
+            self._behavioral_csv_writer = BehavioralCsvWriter(max_pending=8)
+        # Let all five streams detach before this batch's CSV formatting starts;
+        # otherwise the worker can contend for Python's GIL during later copies.
+        with self._behavioral_csv_writer.submission_group():
+            for filename, records in streams:
+                if not records:
+                    continue
+                try:
+                    accepted = self._append_csv(self._behavioral_session_dir / filename, records)
+                except Exception as e:
+                    carb.log_warn(f"HumanoidExample: failed to flush {filename}: {e}")
+                    continue
+                if accepted:
+                    # A full queue keeps this exact buffer for a later flush.
+                    records.clear()
 
     def _save_behavioral_data(self) -> None:
         """Flush any remaining rows and close the current recording session.
@@ -3044,11 +4492,28 @@ class HumanoidExample(BaseSample):
         Runs when the scene is cleared or the example is torn down. Idempotent: the
         buffers and the session handle are reset afterwards, so a second call is a no-op.
         """
-        if not self._behavioral_data_enabled or self._behavioral_session_dir is None:
+        if self._behavioral_session_dir is None:
             return
 
         session_dir = self._behavioral_session_dir
         self._flush_behavioral_csvs()
+        self._collect_behavioral_csv_results(close=True)
+        # If the queue was full, its drain frees space for at most five remaining
+        # streams. Session teardown is allowed to wait; physics never waits here.
+        self._flush_behavioral_csvs()
+        self._collect_behavioral_csv_results(close=True)
+        for filename, records in self._behavioral_csv_streams():
+            if records:
+                path = session_dir / filename
+                fields = self._behavioral_csv_fieldnames.get(filename)
+                if fields is None:
+                    fields = list(dict.fromkeys(key for record in records for key in record))
+                failure = CsvWriteResult(
+                    CsvBatch.snapshot(path, records, fields), "Rows could not be queued before session close"
+                )
+                self._behavioral_csv_failed_batches.append(failure)
+                self._behavioral_csv_failed_paths.add(path)
+                carb.log_warn(f"HumanoidExample: retained {len(records)} unsaved rows for {path}")
         carb.log_info(f"HumanoidExample: closed behavioral session {self._behavioral_session_id} at {session_dir}")
 
         # Reset buffers and close the session.
@@ -3059,6 +4524,7 @@ class HumanoidExample(BaseSample):
         self._object_state_records = []
         self._object_state_prev_positions = {}
         self._behavioral_csv_fieldnames = {}
+        self._object_state_pose_batch = None
         self._behavioral_data_step_counter = 0
         self._behavioral_frame_counter = 0
         self._behavioral_session_dir = None
@@ -3081,7 +4547,8 @@ class HumanoidExample(BaseSample):
         """Lazily wrap the existing /World/G1_HeadCamera prim in a Camera sensor.
 
         Camera.initialize() attaches a render product + RGB annotator to the prim.
-        Frame data refreshes at RENDER rate (rendering_dt, ~90 Hz here), not physics
+        Frame data refreshes at the app render rate (60 Hz configured for walking,
+        90 Hz for stationary mode; actual throughput may be lower), not physics
         rate, so later get_rgba() calls are cheap: they return the most recently
         rendered frame, or None until the first frame is available. Initialization is
         deferred to the first capture attempt because the render pipeline is not ready
@@ -3129,7 +4596,9 @@ class HumanoidExample(BaseSample):
         try:
             from PIL import Image
 
-            Image.fromarray(rgba[:, :, :3]).save(self._behavioral_frame_dir / image_name)
+            # Level 1 preserves every pixel while reducing time spent encoding
+            # inside the physics callback; the tradeoff is larger PNG files.
+            Image.fromarray(rgba[:, :, :3]).save(self._behavioral_frame_dir / image_name, compress_level=1)
         except Exception as e:
             carb.log_warn(f"HumanoidExample: failed to save eye-camera frame: {e}")
             return
@@ -3276,6 +4745,22 @@ class HumanoidExample(BaseSample):
             record[f"{side}_contact_object"] = result.object_path if result else None
             record[f"{side}_contact_mode"] = result.mode if result else None
 
+        # Keep each hand's pinch/wrap classification separate. Two palms may
+        # support a carton together while neither hand encloses it individually.
+        bimanual = self._bimanual_grasp_result
+        record.update(
+            bimanual_state=bimanual.state,
+            bimanual_object_path=bimanual.object_path,
+            bimanual_contact_supported=int(bimanual.contact_supported),
+            bimanual_opposing_contacts=int(bimanual.opposing_contacts),
+            bimanual_left_normal_force_n=bimanual.normal_force_n_by_side["left"],
+            bimanual_right_normal_force_n=bimanual.normal_force_n_by_side["right"],
+            bimanual_estimated_vertical_capacity_n=bimanual.estimated_total_vertical_capacity_n,
+            bimanual_required_vertical_support_n=bimanual.required_vertical_support_n,
+            bimanual_capacity_exceeds_weight=(
+                int(bimanual.capacity_exceeds_weight) if bimanual.capacity_exceeds_weight is not None else None
+            ),
+        )
         self._hand_tracking_records.append(record)
 
     def _collect_gaze_sample(self) -> None:
@@ -3349,26 +4834,89 @@ class HumanoidExample(BaseSample):
 
         self._gaze_records.append(record)
 
+    def _get_object_state_pose_batch(self, stage, paths: tuple[str, ...]) -> dict | None:
+        """Read existing package bodies once, with no schema edits or physics flush.
+
+        The native tensor view supplies XYZ + XYZW rows in its own documented
+        prim order. Retain only that view, never pose data, and rebuild it after
+        a stage/physics generation or package-membership change. Any failed
+        batch leaves the existing per-object reader available for this sample.
+        """
+        if not paths:
+            self._object_state_pose_batch = None
+            return {}
+        try:
+            simulation = SimulationManager.get_physics_simulation_view()
+            if simulation is None or not simulation.is_valid:
+                self._object_state_pose_batch = None
+                return None
+            batch = self._object_state_pose_batch
+            if (
+                batch is None
+                or batch["stage"] != stage
+                or batch["simulation"] is not simulation
+                or batch["paths"] != paths
+            ):
+                # These exact paths were checked for RigidBodyAPI by the
+                # collector. A native read-only view cannot create new bodies,
+                # unlike constructing a high-level RigidPrim during playback.
+                view = simulation.create_rigid_body_view(list(paths))
+                view_paths = tuple(str(path) for path in view.prim_paths)
+                if len(view_paths) != len(paths) or set(view_paths) != set(paths):
+                    raise RuntimeError("Package pose batch does not match existing rigid roots")
+                batch = {"stage": stage, "simulation": simulation, "paths": paths, "view": view, "order": view_paths}
+                self._object_state_pose_batch = batch
+            rows = batch["view"].get_transforms().numpy()
+            if rows.shape != (len(paths), 7):
+                raise RuntimeError("Invalid package pose batch dimensions")
+            poses = {}
+            for path, row in zip(batch["order"], rows):
+                values = tuple(float(value) for value in row)
+                # A bad body does not erase valid neighboring rows. The caller
+                # retries only the missing body through its existing reader.
+                if not all(math.isfinite(value) for value in values):
+                    continue
+                if sum(value * value for value in values[3:]) <= 1e-16:
+                    continue
+                poses[path] = (
+                    Gf.Vec3d(*values[:3]),
+                    Gf.Quatd(values[6], Gf.Vec3d(*values[3:6])).GetNormalized(),
+                )
+            return poses
+        except Exception:
+            self._object_state_pose_batch = None
+            return None
+
     def _collect_object_state_sample(self) -> None:
         """Record one row per sample box: world pose, velocity, and grab state, ~100 Hz.
 
-        Velocity is a finite difference between consecutive logged positions (the boxes
-        are plain USD rigid bodies, not tensor-API entities, so there is no cheap
-        velocity getter). The first row for each box therefore reports zero velocity.
+        Preserve the dataset's existing velocity convention: finite differences
+        between consecutive logged positions, with zero velocity in the first row.
+        Batched native pose reads do not change that convention.
         """
         stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            self._object_state_pose_batch = None
+            return
         root = stage.GetPrimAtPath(self._sample_box_root_path)
         if not root.IsValid():
+            self._object_state_pose_batch = None
             return
+
+        # Sample roots already carry the rigid-body API; ignore decorative
+        # children rather than accidentally promoting them to physical objects.
+        paths = tuple(str(prim.GetPath()) for prim in root.GetChildren() if prim.HasAPI(UsdPhysics.RigidBodyAPI))
+        poses = self._get_object_state_pose_batch(stage, paths)
 
         unix_now = round(time.time(), 6)
         sim_now = round(self._headset_gait_time, 6)
         dt = self._world_settings.get("physics_dt", 1.0 / 200.0) * self._behavioral_data_log_every_n_steps
 
         grabbed_by_path = {path: side for side, path in self._grabbed_objects_by_side.items()}
-        for prim in root.GetChildren():
-            path = str(prim.GetPath())
-            pose = self._get_object_world_pose(path)
+        for path in paths:
+            pose = poses.get(path) if poses is not None else None
+            if pose is None:
+                pose = self._get_object_world_pose(path)
             if pose is None:
                 continue
             position, quat = pose
@@ -3380,6 +4928,18 @@ class HumanoidExample(BaseSample):
             else:
                 velocity = Gf.Vec3d(0.0, 0.0, 0.0)
             self._object_state_prev_positions[path] = Gf.Vec3d(position)
+
+            bimanual = self._bimanual_grasp_result
+            bimanual_supported = bimanual.contact_supported and bimanual.object_path == path
+            supported_sides = (
+                ["left", "right"]
+                if bimanual_supported
+                else [
+                    side
+                    for side, result in self._physical_grasp_results.items()
+                    if result.contact_supported and result.object_path == path
+                ]
+            )
 
             self._object_state_records.append(
                 {
@@ -3401,17 +4961,10 @@ class HumanoidExample(BaseSample):
                     "is_grabbed": int(path in grabbed_by_path),
                     "grabbed_by": grabbed_by_path.get(path),
                     "grasp_mode": self._grasp_mode,
-                    "contact_supported": int(
-                        any(
-                            result.contact_supported and result.object_path == path
-                            for result in self._physical_grasp_results.values()
-                        )
-                    ),
-                    "contact_hand": "|".join(
-                        side
-                        for side, result in self._physical_grasp_results.items()
-                        if result.contact_supported and result.object_path == path
-                    ),
+                    "contact_supported": int(bool(supported_sides)),
+                    "contact_hand": "|".join(supported_sides),
+                    "bimanual_contact_supported": int(bimanual_supported),
+                    "bimanual_opposing_contacts": int(bimanual.opposing_contacts and bimanual.object_path == path),
                     "contact_health": self._contact_health if self._grasp_mode == "physical" else "not_used",
                 }
             )
@@ -3419,11 +4972,12 @@ class HumanoidExample(BaseSample):
     def _collect_all_behavioral_data(self) -> None:
         """Advance the shared logging counter and dispatch every per-modality collector.
 
-        Called once per physics step (200 Hz). One counter drives all modalities so
+        Called once per physics step. One counter drives all modalities so
         their rows stay aligned by step_index:
-        - eye-camera frames: every 20 steps (~10 Hz) — PNG encode is comparatively slow
-        - behavior / hand / gaze / object rows: every 2 steps (~100 Hz)
-        - CSV flush to disk: every 2000 steps (~10 s), so a crash loses seconds, not the session
+        - eye-camera frames: nominally 10 Hz — PNG encoding remains synchronous
+        - behavior / hand / gaze / object rows: nominally 100 Hz
+        - CSV batch submission: every 2.5 simulation seconds, with disk writes on
+          the worker. A force-quit can still lose pending or buffered rows.
         """
         if not self._behavioral_data_enabled:
             return
@@ -3642,6 +5196,15 @@ class HumanoidExample(BaseSample):
         carb.log_info(f"HumanoidExample G1 hand-tracked arm DOFs: {self._g1_arm_joint_names_by_side}")
 
     def _get_hand_input_kind(self, input_device) -> str:
+        """Classify the current device once per synchronous physics callback."""
+        snapshot = self._get_teleop_hand_snapshot(input_device)
+        if snapshot is None:
+            return self._read_hand_input_kind(input_device)
+        if "input_kind" not in snapshot:
+            snapshot["input_kind"] = self._read_hand_input_kind(input_device)
+        return snapshot["input_kind"]
+
+    def _read_hand_input_kind(self, input_device) -> str:
         """Distinguish optical landmarks from a live controller despite source metadata.
 
         Kit can report `hand` immediately after its hand component starts, while the
@@ -3707,7 +5270,7 @@ class HumanoidExample(BaseSample):
         `_compute_arm_target_body_position`, so moving or turning the robot cannot
         masquerade as operator hand motion.
         """
-        if self._get_hand_input_kind(input_device) != "controller":
+        if self._optical_hands_only or self._get_hand_input_kind(input_device) != "controller":
             return None
         if not self._is_controller_arm_pose_enabled(input_device):
             self._controller_arm_neutral_positions.pop(side, None)
@@ -3886,6 +5449,17 @@ class HumanoidExample(BaseSample):
         return self._robot_palm_local_centers.get(side)
 
     def _get_optical_palm_frame(self, side: str, input_device: object) -> Gf.Matrix4d | None:
+        """Share anatomical orientation within a callback without aliasing its matrix."""
+        snapshot = self._get_teleop_hand_snapshot(input_device)
+        if snapshot is None:
+            return self._measure_optical_palm_frame(side, input_device)
+        frames = snapshot.setdefault("palm_frames", {})
+        if side not in frames:
+            frames[side] = self._measure_optical_palm_frame(side, input_device)
+        frame = frames[side]
+        return None if frame is None else Gf.Matrix4d(frame)
+
+    def _measure_optical_palm_frame(self, side: str, input_device: object) -> Gf.Matrix4d | None:
         """Measure the operator's anatomical palm frame from world joint positions."""
         names = ("wrist", "middle_proximal", "index_proximal", "little_proximal")
         try:
@@ -3966,8 +5540,11 @@ class HumanoidExample(BaseSample):
             return
         imageable = UsdGeom.Imageable(prim)
         if visible and getattr(self, "_arm_rig_markers_enabled", False):
-            imageable.MakeVisible()
-        else:
+            if imageable.ComputeVisibility() != UsdGeom.Tokens.inherited:
+                imageable.MakeVisible()
+        elif imageable.GetVisibilityAttr().Get() != UsdGeom.Tokens.invisible:
+            # Input loss may call this every physics step. Reauthoring the same
+            # hidden state needlessly notifies USD/Hydra even though no marker is drawn.
             imageable.MakeInvisible()
 
     def _smooth_arm_rig_target(self, side: str, target_body: Gf.Vec3d) -> Gf.Vec3d:
@@ -3984,8 +5561,6 @@ class HumanoidExample(BaseSample):
     def _update_arm_rig_target(self, side: str, target_body: Gf.Vec3d, base_position: Gf.Vec3d, yaw: float) -> None:
         """Update the desired hand transform and its optional debug marker."""
         target_op = self._arm_rig_target_ops.get(side)
-        if target_op is None:
-            return
         target_world = self._g1_body_point_to_stage(target_body, base_position, yaw)
         if side not in self._arm_rig_world_offsets and side in self._manual_arm_rig_target_world_positions:
             self._arm_rig_world_offsets[side] = self._manual_arm_rig_target_world_positions[side] - target_world
@@ -3994,8 +5569,12 @@ class HumanoidExample(BaseSample):
             )
         target_world += self._arm_rig_world_offsets.get(side, Gf.Vec3d(0.0, 0.0, 0.0))
         target_matrix = Gf.Matrix4d().SetTranslate(target_world)
-        target_op.Set(target_matrix)
         self._active_g1_hand_target_matrices[side] = target_matrix
+        # The control path consumes the in-memory target above. Hidden debug
+        # geometry does not need 200 Hz USD transform edits; write the latest
+        # pose before making a newly enabled marker visible.
+        if target_op is not None and getattr(self, "_arm_rig_markers_enabled", False):
+            target_op.Set(target_matrix)
         self._set_arm_rig_target_visible(side, True)
 
     def _get_hand_link_prim(self, side: str):
@@ -4173,7 +5752,9 @@ class HumanoidExample(BaseSample):
             # friction solver carry the object; neither proximity nor a fist
             # creates a joint, teleports it, or prevents it from slipping.
             result = self._physical_grasp_results.get(side)
-            self._set_grab_candidate(side, result.object_path if result else None)
+            bimanual = self._bimanual_grasp_result
+            candidate = bimanual.object_path if bimanual.opposing_contacts else result.object_path if result else None
+            self._set_grab_candidate(side, candidate)
             return
         hand_position = self._get_active_hand_world_position(side)
 
@@ -4544,6 +6125,31 @@ class HumanoidExample(BaseSample):
         self._arm_ik_link_index[side] = index
         return index
 
+    def _get_arm_target_limits(self, dof_index: int) -> tuple[float, float]:
+        """Intersect asset limits with the deployed walking controller's arm range.
+
+        GR00T's teleoperation model keeps each shoulder roll on its own side;
+        the asset's broader mechanical range also permits cross-body postures.
+        Match the pinned upstream supplemental model rather than inventing a
+        new walking posture. Source: ``robots/data/g1_decoupled_policy.json``
+        ``source_joint_names_and_initial_arm_pose``, commit
+        ``7f151314d4d1606544bf249d2a7a1cb754c64582``.
+
+        These bounds apply while the decoupled actor balances as well as walks,
+        so an unsupported arm posture cannot accumulate before walking starts.
+        Stationary and other control modes retain the asset's full arm range.
+        """
+        lower, upper = self._g1_arm_joint_limits.get(dof_index, (-math.inf, math.inf))
+        if getattr(self.g1, "walking_policy_name", None) == "decoupled" and getattr(
+            self.g1, "uses_explicit_body_efforts", False
+        ):
+            for side, policy_bounds in (("left", (0.19, 2.2515)), ("right", (-2.2515, -0.19))):
+                if self._g1_arm_dof_indices_by_side.get(side, {}).get("shoulder_roll") == dof_index:
+                    lower = max(lower, policy_bounds[0])
+                    upper = min(upper, policy_bounds[1])
+                    break
+        return lower, upper
+
     def _solve_arm_ik_jacobian(
         self,
         side: str,
@@ -4605,8 +6211,12 @@ class HumanoidExample(BaseSample):
 
             snapshot = {} if physics_snapshot is None else physics_snapshot
             if "arm_jacobians" not in snapshot or "arm_dof_positions" not in snapshot:
-                jacobians = wp.to_torch(self.g1.robot.get_jacobian_matrices()).detach().cpu().numpy()
-                current = wp.to_torch(self.g1.robot.get_dof_positions()).reshape(-1).detach().cpu().numpy()
+                jacobians = snapshot.get("arm_jacobians")
+                if jacobians is None:
+                    jacobians = wp.to_torch(self.g1.robot.get_jacobian_matrices()).detach().cpu().numpy()
+                current = snapshot.get("arm_dof_positions")
+                if current is None:
+                    current = wp.to_torch(self.g1.robot.get_dof_positions()).reshape(-1).detach().cpu().numpy()
                 # Publish both reads together. A failed read must not leave a partial
                 # snapshot that a second arm could mistake for a complete observation.
                 snapshot.update(arm_jacobians=jacobians, arm_dof_positions=current)
@@ -4660,54 +6270,68 @@ class HumanoidExample(BaseSample):
             # Keep each command within the available joint travel as well as the IK
             # correction cap. If contact pushed a measured joint beyond a limit, do
             # not ask it to move farther outward; the final command limiter restores
-            # the authored limit. The zero correction remains feasible in this solve.
+            # the control range gradually. Zero remains feasible in this solve,
+            # including a measured pose outside the narrower walking arm range.
             lower_step = np.full(len(joint_order), -step_cap)
             upper_step = np.full(len(joint_order), step_cap)
             for index, name in enumerate(joint_order):
-                lower, upper = self._g1_arm_joint_limits.get(indices[name], (-math.inf, math.inf))
+                lower, upper = self._get_arm_target_limits(indices[name])
                 if math.isnan(lower) or math.isnan(upper) or lower > upper:
                     return None
                 lower_step[index] = max(-step_cap, min(0.0, lower - arm_positions[index]))
                 upper_step[index] = min(step_cap, max(0.0, upper - arm_positions[index]))
 
-            def add_within_budget(base, correction):
-                """Fit a secondary direction without shrinking the primary step."""
+            def budget_fraction(base: np.ndarray, correction: np.ndarray) -> float:
+                """Find a common feasible scale that preserves the task direction."""
                 fraction = 1.0
                 for index, value in enumerate(correction):
                     if value > 1e-12:
                         fraction = min(fraction, (upper_step[index] - base[index]) / value)
                     elif value < -1e-12:
                         fraction = min(fraction, (lower_step[index] - base[index]) / value)
-                # A common scale preserves the correction's nullspace direction.
-                return base + max(0.0, min(1.0, fraction)) * correction
+                return max(0.0, min(1.0, fraction))
+
+            def add_within_budget(base: np.ndarray, correction: np.ndarray) -> np.ndarray:
+                """Fit a secondary direction without shrinking the primary step."""
+                return base + budget_fraction(base, correction) * correction
 
             # Reaching is the primary task. A blended position/orientation solve can
             # sacrifice the reach to preserve an infeasible wrist angle, eventually
             # twisting the shoulder against its limits during a sustained grip.
-            # Re-solve without joints already at a limit if their correction points
-            # outward. Otherwise one saturated joint can stop the entire reach.
+            # Consume available travel, then resolve the remaining palm error
+            # without exhausted joints. Checking only joints exactly at a limit
+            # lets a tiny nonzero budget scale every joint almost to a stop.
             free = np.ones(len(joint_order), dtype=bool)
             step = np.zeros(len(joint_order))
+            position_residual = np.asarray(error, dtype=float) * gain
             for _ in range(len(joint_order) + 1):
-                step[:] = 0.0
-                step[free] = damped_step(matrix[:, free], np.asarray(error, dtype=float) * gain)
-                blocked = free & (((lower_step >= -1e-8) & (step < 0.0)) | ((upper_step <= 1e-8) & (step > 0.0)))
+                correction = np.zeros(len(joint_order))
+                correction[free] = damped_step(matrix[:, free], position_residual - matrix @ step)
+                fraction = budget_fraction(step, correction)
+                step += fraction * correction
+                if fraction >= 1.0 - 1e-12:
+                    break
+                blocked = free & (
+                    ((upper_step - step <= 1e-8) & (correction > 1e-12))
+                    | ((step - lower_step <= 1e-8) & (correction < -1e-12))
+                )
                 if not np.any(blocked):
                     break
                 free[blocked] = False
-            step = add_within_budget(np.zeros(len(joint_order)), step)
+            # The final free set also bounds the secondary nullspaces: an
+            # exhausted primary joint cannot be pushed outward by wrist/posture.
 
-            def task_nullspace(tasks):
-                """Project only through joints available to the primary task."""
+            def task_nullspace(tasks: np.ndarray, available: np.ndarray | None = None) -> np.ndarray:
+                """Preserve task motion using only the currently available joints."""
+                available = free if available is None else available
                 projector = np.zeros((len(joint_order), len(joint_order)))
-                free_indices = np.flatnonzero(free)
-                restricted = tasks[:, free]
+                free_indices = np.flatnonzero(available)
+                restricted = tasks[:, available]
                 projector[np.ix_(free_indices, free_indices)] = (
                     np.eye(len(free_indices)) - np.linalg.pinv(restricted, rcond=1e-4) @ restricted
                 )
                 return projector
 
-            position_null = task_nullspace(matrix)
             posture_tasks = matrix
             if target_orientation is not None:
                 quaternion = self._first_pose_value(orientations)
@@ -4722,15 +6346,67 @@ class HumanoidExample(BaseSample):
                 # Use only motion that preserves the primary palm task to first order.
                 # The exact SVD projector is intentional: a damped projector leaks the
                 # secondary task into the reach when the arm is near a singular pose.
-                orientation_matrix = angular @ position_null * weight
-                orientation_residual = (rotation_vector * gain - angular @ step) * weight
-                orientation_step = position_null @ damped_step(orientation_matrix, orientation_residual)
-                step = add_within_budget(step, orientation_step)
+                orientation_free = free.copy()
+                for _ in range(len(joint_order) + 1):
+                    position_null = task_nullspace(matrix, orientation_free)
+                    orientation_matrix = angular @ position_null * weight
+                    orientation_residual = (rotation_vector * gain - angular @ step) * weight
+                    orientation_step = position_null @ damped_step(orientation_matrix, orientation_residual)
+                    fraction = budget_fraction(step, orientation_step)
+                    step += fraction * orientation_step
+                    if fraction >= 1.0 - 1e-12:
+                        break
+                    # One saturated wrist must not cancel useful motion from the
+                    # other joints. Keep the accepted primary/secondary motion,
+                    # lock only newly exhausted directions, and solve the remaining
+                    # angle through a fresh exact palm-position nullspace. Every
+                    # pass removes at least one joint, so this work is bounded.
+                    blocked = orientation_free & (
+                        ((upper_step - step <= 1e-8) & (orientation_step > 1e-12))
+                        | ((step - lower_step <= 1e-8) & (orientation_step < -1e-12))
+                    )
+                    if not np.any(blocked):
+                        break
+                    orientation_free[blocked] = False
                 posture_tasks = np.vstack((matrix, angular))
 
             # The seven-joint arm still has redundant freedom. Resolve it toward the
             # default posture instead of allowing shoulder/wrist branches to drift.
             posture_null = task_nullspace(posture_tasks)
+            try:
+                # The webcam may guide an elbow only while it owns that arm's
+                # fallback position. Valid Quest/controller input keeps the
+                # original arm posture solve, independent of camera visibility.
+                webcam_elbow = (
+                    self._get_webcam_arm_target(side) if self._arm_input_sources.get(side) == "webcam_body" else None
+                )
+                elbow_entry = self._get_webcam_robot_link(side, "elbow") if webcam_elbow is not None else None
+                if elbow_entry is not None:
+                    # Webcam elbows only resolve remaining redundancy. They cannot
+                    # reduce the Quest palm reach or change its wrist orientation.
+                    elbow_index, elbow_prim = elbow_entry
+                    elbow_row = elbow_index - (int(jacobians.shape[1]) == int(self.g1.robot.num_links) - 1)
+                    if 0 <= elbow_row < int(jacobians.shape[1]):
+                        elbow_matrix = jacobians[0, elbow_row, :3, :][:, columns].astype(float)
+                        elbow_world = self._first_pose_value(elbow_prim.get_world_poses()[0])
+                        elbow_target = self._g1_body_point_to_stage(
+                            Gf.Vec3d(*webcam_elbow.elbow_body), base_position, yaw
+                        )
+                        residual = np.asarray(elbow_target) - np.asarray(elbow_world[:3], dtype=float)
+                        if np.all(np.isfinite(elbow_matrix)) and np.all(np.isfinite(residual)):
+                            length = float(np.linalg.norm(residual))
+                            if length > 0.15:
+                                residual *= 0.15 / length
+                            projected = elbow_matrix @ posture_null
+                            correction = posture_null @ damped_step(
+                                projected, residual * gain * self._webcam_elbow_gain - elbow_matrix @ step
+                            )
+                            step = add_within_budget(step, correction)
+                            posture_null = task_nullspace(np.vstack((posture_tasks, elbow_matrix)))
+            except Exception as error:
+                # A lost optional elbow tensor must not replace the valid palm
+                # solve with the degraded linear fallback.
+                self._log_physics_step_error("webcam elbow guidance", error)
             rest_error = np.asarray(
                 [
                     self._g1_arm_joint_defaults.get(indices[name], float(current[indices[name]]))
@@ -4759,6 +6435,86 @@ class HumanoidExample(BaseSample):
         return targets
 
     def _compute_arm_targets_from_body_position(
+        self,
+        side: str,
+        hand_body: Gf.Vec3d,
+        target_orientation: Gf.Matrix4d | None = None,
+        *,
+        physics_snapshot: dict | None = None,
+    ) -> dict[int, float]:
+        """Reuse only raw walking IK goals for one intervening 200 Hz step.
+
+        The 100 Hz stationary solver remains unchanged. This cache never retains
+        physics tensors or the final filtered/contact-limited motor command:
+        those must be recomputed from fresh measurements on every physics step.
+        Input loss, source changes, large target changes, and nonmonotonic clocks
+        invalidate reuse. Callers receive a copy so later filtering cannot change
+        the saved raw solution.
+        """
+        interval = self._arm_ik_refresh_interval_s
+        cache_enabled = (
+            self._gesture_locomotion_enabled
+            and self._arm_ik_use_jacobian
+            and math.isclose(self._last_physics_dt, 0.005, rel_tol=0.0, abs_tol=1e-9)
+            and math.isfinite(interval)
+            and 0.0 < interval <= 0.010
+        )
+        now = float(self._grab_time)
+        source = self._arm_input_sources.get(side)
+        position = orientation = None
+        if cache_enabled:
+            try:
+                cache_enabled = self.g1 is not None and bool(self.g1.robot.is_physics_tensor_entity_valid())
+                position = tuple(float(hand_body[axis]) for axis in range(3))
+                if target_orientation is not None:
+                    rotation = target_orientation.ExtractRotationMatrix()
+                    orientation = tuple(float(rotation[row][column]) for row in range(3) for column in range(3))
+                    if abs(rotation.GetDeterminant() - 1.0) > 0.01:
+                        cache_enabled = False
+                cache_enabled = (
+                    cache_enabled
+                    and math.isfinite(now)
+                    and all(math.isfinite(value) for value in (*position, *(orientation or ())))
+                )
+            except (AttributeError, IndexError, TypeError, ValueError, RuntimeError, OverflowError):
+                cache_enabled = False
+        cached = self._arm_ik_target_cache.get(side) if cache_enabled else None
+        if cached is not None:
+            elapsed = now - cached["time"]
+            same_rotation = orientation is None and cached["orientation"] is None
+            if orientation is not None and cached["orientation"] is not None:
+                # trace(R_previous^T R_current) = 1 + 2 cos(rotation angle).
+                cosine = (sum(first * second for first, second in zip(orientation, cached["orientation"])) - 1) / 2
+                same_rotation = cosine >= math.cos(self._arm_ik_reuse_angle_rad)
+            small_motion = sum((first - second) ** 2 for first, second in zip(position, cached["position"])) <= (
+                self._arm_ik_reuse_position_m**2
+            )
+            if (
+                0.0 <= elapsed < interval - 1e-12
+                and cached["source"] == source
+                and cached["reuse_time"] in (None, now)
+                and small_motion
+                and same_rotation
+            ):
+                if elapsed > 0.0:
+                    cached["reuse_time"] = now
+                return dict(cached["targets"])
+        self._arm_ik_target_cache.pop(side, None)
+        targets = self._compute_raw_arm_targets_from_body_position(
+            side, hand_body, target_orientation, physics_snapshot=physics_snapshot
+        )
+        if cache_enabled and targets and all(math.isfinite(value) for value in targets.values()):
+            self._arm_ik_target_cache[side] = {
+                "time": now,
+                "position": position,
+                "orientation": orientation,
+                "source": source,
+                "targets": dict(targets),
+                "reuse_time": None,
+            }
+        return targets
+
+    def _compute_raw_arm_targets_from_body_position(
         self,
         side: str,
         hand_body: Gf.Vec3d,
@@ -4843,10 +6599,15 @@ class HumanoidExample(BaseSample):
         else:
             self._teleop_input_dt = max(dt, min(elapsed, 0.05))
 
-    def _smooth_and_clamp_arm_targets(self, raw_targets: dict[int, float]) -> dict[int, float]:
-        """Smooth hand-tracking joint targets and clamp to joint limits."""
+    def _smooth_and_clamp_arm_targets(
+        self, raw_targets: dict[int, float], physics_snapshot: dict | None = None
+    ) -> dict[int, float]:
+        """Smooth arm commands, returning gradually to the walking posture range."""
         targets = {}
-        positions = self._first_pose_value(self.g1.robot.get_dof_positions())
+        snapshot = {} if physics_snapshot is None else physics_snapshot
+        if "arm_dof_positions" not in snapshot:
+            snapshot["arm_dof_positions"] = self._first_pose_value(self.g1.robot.get_dof_positions())
+        positions = snapshot["arm_dof_positions"]
         alpha = smoothing_alpha(self._arm_smoothing, self._teleop_input_dt)
         max_step = self._arm_max_joint_speed * self._last_physics_dt
         for dof_index, raw_target in raw_targets.items():
@@ -4854,8 +6615,18 @@ class HumanoidExample(BaseSample):
                 continue
             current = float(positions[dof_index])
             previous = self._smoothed_arm_targets.get(dof_index, current)
+            lower, upper = self._get_arm_target_limits(dof_index)
+            if math.isnan(lower) or math.isnan(upper) or lower > upper:
+                raise RuntimeError(f"Invalid arm control limits for DOF {dof_index}: {(lower, upper)}")
+            asset_lower, asset_upper = self._g1_arm_joint_limits.get(dof_index, (-math.inf, math.inf))
+            walking_bounds = lower != asset_lower or upper != asset_upper
+            if walking_bounds:
+                # Bound the requested goal before filtering, not the measured pose.
+                # A newly selected walking mode or external contact can leave the
+                # arm outside this narrower range; pulling it straight to the limit
+                # would bypass the joint-speed and tracking-lead protections.
+                raw_target = self._clamp_value(raw_target, lower, upper)
             smoothed = previous + alpha * (raw_target - previous)
-            lower, upper = self._g1_arm_joint_limits.get(dof_index, (-math.inf, math.inf))
             # Slew-limit the COMMAND, then bound its lead over the measured joint.
             # Limiting target-current to speed*dt instead starves a position drive:
             # at 100 Hz its persistent 0.025 rad error produces very slow arm motion.
@@ -4864,19 +6635,29 @@ class HumanoidExample(BaseSample):
             smoothed = self._clamp_value(smoothed, previous - max_step, previous + max_step)
             max_error = self._arm_max_tracking_error
             smoothed = self._clamp_value(smoothed, current - max_error, current + max_error)
-            smoothed = self._clamp_value(smoothed, lower, upper)
+            if walking_bounds:
+                # Never ask an out-of-range joint to move farther outward. Retire
+                # a stale outward command at the measured pose rather than snap
+                # the robot to the policy limit. Contact projection may still hold
+                # recovery when returning would push through the table.
+                smoothed = self._clamp_value(smoothed, min(lower, current), max(upper, current))
+            smoothed = self._clamp_value(smoothed, asset_lower, asset_upper)
             self._smoothed_arm_targets[dof_index] = smoothed
             targets[dof_index] = smoothed
         return targets
 
     def _limit_arm_targets_at_contacts(self, targets: dict[int, float], physics_snapshot: dict) -> dict[int, float]:
-        """Remove arm motion into scenery at the measured hand contact points.
+        """Yield at scenery and downward-loaded package contacts while walking.
 
         Apply this after command smoothing so an older, blocked target cannot
         reintroduce inward motion. Each contact's world normal is projected through
         the arm Jacobian at that contact point, including wrist rotation. Tangential
-        motion and withdrawal remain available. Graspable props are excluded: their
-        contact load is controlled by the finger controller, and they must move.
+        motion and withdrawal remain available. Graspable props normally remain
+        free to move. During physical walking/balancing, an upward contact normal
+        on the hand also limits inward arm motion into a package: continuing to
+        push it down onto a shelf can destabilize the base. Horizontal side
+        contacts remain free for palm squeezing and lifting. The finger controller
+        limits finger travel separately; it cannot limit force from arm motion.
 
         This is a local linear motion constraint, not a collision-free path planner.
         Compliant hand couplings still resolve contact between physics callbacks.
@@ -4891,7 +6672,9 @@ class HumanoidExample(BaseSample):
             # An unavailable contact read is not evidence of free space. Hold
             # every commanded arm joint until fresh contact observations return.
             try:
-                measured = np.asarray(self._first_pose_value(self.g1.robot.get_dof_positions()), dtype=float)
+                if "arm_dof_positions" not in physics_snapshot:
+                    physics_snapshot["arm_dof_positions"] = self._first_pose_value(self.g1.robot.get_dof_positions())
+                measured = np.asarray(physics_snapshot["arm_dof_positions"], dtype=float)
                 if measured.ndim != 1 or not np.isfinite(measured).all():
                     raise RuntimeError("Invalid measured arm state while contact observations are unavailable")
                 held = {index: float(measured[index]) for index in targets}
@@ -4905,6 +6688,9 @@ class HumanoidExample(BaseSample):
                     self._arm_contact_limited[side] = True
             self._smoothed_arm_targets.update(held)
             return held
+        protect_downward_prop_contacts = getattr(self.g1, "walking_policy_name", None) == "decoupled" and getattr(
+            self.g1, "uses_explicit_body_efforts", False
+        )
         for side in ("left", "right"):
             # PhysX can already apply a predictive contact force at positive
             # separation. Honor that load before the finger reaches the table;
@@ -4912,7 +6698,14 @@ class HumanoidExample(BaseSample):
             contacts = [
                 contact
                 for contact in self._latest_hand_contacts.get(side, ())
-                if not contact.eligible_for_grasp
+                if (
+                    not contact.eligible_for_grasp
+                    # The reader supplies unit normals for force ON the hand.
+                    # +Z therefore means the arm pushes DOWN on the package.
+                    # This is directional yielding, not a support detector or
+                    # force regulator; sideways squeeze is intentionally free.
+                    or (protect_downward_prop_contacts and contact.normal_world[2] >= 0.5)
+                )
                 and not contact.object_path.startswith(self._g1_prim_path + "/")
                 and contact.normal_force_n >= 0.02
             ]
@@ -4947,7 +6740,7 @@ class HumanoidExample(BaseSample):
                     point_jacobian = matrix[:3] + np.cross(matrix[3:6].T, offset).T
                     rows.append(np.asarray(contact.normal_world, dtype=float) @ point_jacobian)
                 requested = np.asarray([targets[index] for index in indices]) - current
-                bounds = np.asarray([self._g1_arm_joint_limits.get(index, (-math.inf, math.inf)) for index in indices])
+                bounds = np.asarray([self._get_arm_target_limits(index) for index in indices])
                 # Zero remains feasible even with small measured joint-limit overshoot;
                 # the projection must never command farther into a blocked surface.
                 lead = self._arm_max_tracking_error
@@ -5016,23 +6809,28 @@ class HumanoidExample(BaseSample):
                 targets.update(self._get_inactive_arm_targets(side, snapshot))
         if not targets or self._articulation_health_fault is not None:
             return
-        targets = self._smooth_and_clamp_arm_targets(targets)
+        targets = self._smooth_and_clamp_arm_targets(targets, physics_snapshot=snapshot)
         targets = self._limit_arm_targets_at_contacts(targets, snapshot)
         if targets:
             indices = sorted(targets)
             self.g1.robot.set_dof_position_targets([targets[index] for index in indices], dof_indices=indices)
 
     def _update_g1_arms_from_hand_tracking(self) -> None:
-        """Override G1 arm DOF targets from Meta/OpenXR hand-tracking poses."""
+        """Use valid Quest poses first, and optional webcam fallback independently per arm."""
         if not self.g1:
             for side in ("left", "right"):
                 self._deactivate_hand(side)
+            return
+        if self._gesture_locomotion_enabled and not getattr(self.g1, "supports_arm_teleoperation", False):
+            # The whole-body velocity actor was not trained for arbitrary arm
+            # overrides. Only a decoupled balance controller may give these DOFs
+            # to IK while walking; otherwise the actor keeps all body joints.
             return
 
         self._configure_g1_arm_dofs()
         if not self._g1_arm_dofs_configured:
             return
-        if not self._hand_tracking_arm_control_enabled or self._xr_core is None:
+        if not self._hand_tracking_arm_control_enabled or (self._xr_core is None and not self._webcam_enabled):
             self._hold_inactive_arms()
             return
 
@@ -5052,30 +6850,56 @@ class HumanoidExample(BaseSample):
         physics_snapshot = {}
         active_sides = set()
         for side, device in (("left", left_xr), ("right", right_xr)):
+            if side == "left" and self._gesture_command.owns_hand:
+                continue  # The navigation hand holds its robot arm while steering.
+            # POSITION_VALID is the existing Quest control contract. Camera
+            # confidence and optional POSITION_TRACKED flags cannot veto it.
             hand_pose = self._get_optical_arm_pose(side, device)
             source = "hand_tracking" if hand_pose is not None else "controller"
             pose_is_relative = False
             if hand_pose is None and self._controller_arm_control_enabled:
                 hand_pose = self._get_controller_arm_pose(side, device)
                 pose_is_relative = hand_pose is not None
+            # A live controller with a released grip deliberately holds its arm.
+            # Optical occlusion can fall back to the camera; clutch release cannot.
+            webcam_target = None
             if hand_pose is None:
-                continue
-            if self._arm_input_sources.get(side) != source:
+                if not self._optical_hands_only and self._get_hand_input_kind(device) == "controller":
+                    continue
+                webcam_target = self._get_webcam_arm_target(side)
+                if webcam_target is None:
+                    continue
+                source = "webcam_body"
+            previous_source = self._arm_input_sources.get(side)
+            if previous_source != source:
                 self._inactive_arm_hold_targets.pop(side, None)
-                for index in self._g1_arm_dof_indices_by_side.get(side, {}).values():
-                    self._smoothed_arm_targets.pop(index, None)
+                if "webcam_body" not in (previous_source, source):
+                    for index in self._g1_arm_dof_indices_by_side.get(side, {}).values():
+                        self._smoothed_arm_targets.pop(index, None)
+                    self._smoothed_arm_rig_targets.pop(side, None)
                 self._controller_arm_neutral_positions.pop(side, None)
                 self._controller_arm_neutral_targets.pop(side, None)
                 self._arm_orientation_anchors.pop(side, None)
-                self._smoothed_arm_rig_targets.pop(side, None)
+                self._webcam_wrist_hold_rotations.pop(side, None)
                 self._arm_input_sources[side] = source
+            target_body = (
+                Gf.Vec3d(*webcam_target.wrist_body)
+                if source == "webcam_body"
+                else self._compute_arm_target_body_position(side, hand_pose, base_position, yaw, pose_is_relative)
+            )
+            target_body = self._limit_webcam_handover_target(side, target_body, source, previous_source)
+            if target_body is None:
+                continue
             active_sides.add(side)
-            target_body = self._compute_arm_target_body_position(side, hand_pose, base_position, yaw, pose_is_relative)
             target_body = self._smooth_arm_rig_target(side, target_body)
             self._update_arm_rig_target(side, target_body, base_position, yaw)
             self._update_grabbed_object(side, self._is_hand_closed(side, device))
-            orientation = self._compute_arm_target_orientation(
-                side, hand_pose, yaw, input_device=device if source == "hand_tracking" else None
+            orientation = (
+                self._get_webcam_wrist_hold_rotation(side)
+                if source == "webcam_body"
+                else self._compute_arm_target_orientation(
+                    side, hand_pose, yaw, input_device=device if source == "hand_tracking" else None
+                )
             )
             raw_targets.update(
                 self._compute_arm_targets_from_body_position(
@@ -5090,7 +6914,7 @@ class HumanoidExample(BaseSample):
 
         if not raw_targets or self._articulation_health_fault is not None:
             return
-        targets = self._smooth_and_clamp_arm_targets(raw_targets)
+        targets = self._smooth_and_clamp_arm_targets(raw_targets, physics_snapshot=physics_snapshot)
         targets = self._limit_arm_targets_at_contacts(targets, physics_snapshot)
         if not targets:
             return
@@ -5099,6 +6923,12 @@ class HumanoidExample(BaseSample):
 
     def _deactivate_hand(self, side: str) -> None:
         """Release a lost input source and invalidate its clutch calibration."""
+        self._arm_ik_target_cache.pop(side, None)
+        snapshot = getattr(self, "_teleop_step_hand_samples", None)
+        if snapshot is not None:
+            device = snapshot["devices"].pop(f"/user/hand/{side}", None)
+            if device is not None:
+                snapshot["samples"].pop(id(device), None)
         # Discard the moving command once when input disappears. Physical mode
         # then holds a captured pose; assisted mode retains its return-to-rest slew.
         if side in self._arm_input_sources:
@@ -5108,7 +6938,11 @@ class HumanoidExample(BaseSample):
             self._grab_requires_release[side] = True
         # Controller grip owns arm motion only. Valid finger input may still hold
         # contact while the arm clutch is released; do not erase that evidence.
-        if self._grasp_mode != "physical" or self._finger_curl_source.get(side) not in ("hand_tracking", "controller"):
+        if self._grasp_mode != "physical" or self._finger_curl_source.get(side) not in (
+            "hand_tracking",
+            "controller",
+            "webcam_hand",
+        ):
             self._release_grabbed_object(side)
         self._set_grab_candidate(side, None)
         self._active_g1_hand_target_matrices.pop(side, None)
@@ -5117,6 +6951,8 @@ class HumanoidExample(BaseSample):
         self._controller_arm_neutral_targets.pop(side, None)
         self._arm_orientation_anchors.pop(side, None)
         self._arm_input_sources.pop(side, None)
+        self._webcam_handover_targets.pop(side, None)
+        self._webcam_wrist_hold_rotations.pop(side, None)
         self._hand_closed_by_side[side] = False
         self._set_arm_rig_target_visible(side, False)
 
@@ -5130,19 +6966,13 @@ class HumanoidExample(BaseSample):
         """
         self._latest_hand_contacts = {"left": [], "right": []}
         if not self._finger_control_enabled or not self.g1 or not self.g1.has_finger_control():
+            self._bimanual_grasp_monitor.reset()
+            self._bimanual_grasp_result = self._bimanual_grasp_monitor.result
             return
-        if self._xr_core is None:
-            # Also discard previous samples if a runtime disappears during play.
-            self._latest_finger_curls.clear()
-            self._finger_curl_source.clear()
-            self._smoothed_finger_curls.clear()
-            self._applied_finger_curls.clear()
-            for side in ("left", "right"):
-                self._physical_grasp_controllers[side].reset()
-                self._physical_grasp_results.pop(side, None)
-                self.g1.set_finger_curls(side, {role: 0.0 for role in self._finger_roles})
-            return
-
+        # Contacts describe the simulated robot, independently of whether an XR
+        # device is present. Keep them fresh during tracking loss: treating a
+        # healthy contact reader as unavailable would recapture measured arm
+        # positions each step and let an unanchored robot's arms sag under gravity.
         contacts = {"left": [], "right": []}
         if self._grasp_mode == "physical":
             if self._contact_reader is None:
@@ -5153,13 +6983,33 @@ class HumanoidExample(BaseSample):
                 self._log_physics_step_error("hand contact reader", RuntimeError(self._contact_health))
             else:
                 self._latest_hand_contacts = contacts
+        if self._xr_core is None and not self._webcam_enabled:
+            # Also discard previous samples if a runtime disappears during play.
+            self._latest_finger_curls.clear()
+            self._finger_curl_source.clear()
+            self._smoothed_finger_curls.clear()
+            self._applied_finger_curls.clear()
+            for side in ("left", "right"):
+                self._physical_grasp_controllers[side].reset()
+                self._physical_grasp_results.pop(side, None)
+                self.g1.set_finger_curls(side, {role: 0.0 for role in self._finger_roles})
+            self._bimanual_grasp_monitor.reset()
+            self._bimanual_grasp_result = self._bimanual_grasp_monitor.result
+            return
+
         for side in ("left", "right"):
             device = self._get_xr_input_device(f"/user/hand/{side}")
+            # Navigation reserves the left arm, not the optical skeleton or
+            # finger joints. Keep both hands visibly responsive, including the
+            # Pointing and its release, through the normal contact-limited path.
             curls = self._get_hand_tracking_finger_curls(device)
             source = "hand_tracking"
             if curls is None:
                 curls = self._get_controller_finger_curls(device)
                 source = "controller"
+            if curls is None and (self._optical_hands_only or self._get_hand_input_kind(device) != "controller"):
+                curls = self._get_webcam_finger_curls(side)
+                source = "webcam_hand"
             if curls is None:
                 # No device on this side: let the hand relax open rather than freezing
                 # it in whatever pose it held when tracking was lost.
@@ -5178,6 +7028,24 @@ class HumanoidExample(BaseSample):
             self._applied_finger_curls[side] = applied
             self.g1.set_finger_curls(side, applied)
 
+        # Existing per-hand pinch/wrap evidence cannot recognize two opposing
+        # palms on one carton. This cross-hand diagnostic reads actual contacts;
+        # it does not attach the object or manufacture closing force. For side
+        # palms, the static support estimate is mu * (N_left + N_right) >= m*g.
+        self._bimanual_grasp_result = self._bimanual_grasp_monitor.update(
+            dt=self._last_physics_dt,
+            contacts_by_side=contacts,
+            curls_by_side=self._latest_finger_curls,
+            input_valid_by_side={
+                side: self._finger_curl_source.get(side) in ("hand_tracking", "webcam_hand")
+                and not self._grab_requires_release.get(side, False)
+                for side in ("left", "right")
+            },
+            object_masses_kg=self._physical_object_masses,
+            contact_health=self._contact_health,
+            friction_coefficient=0.6,
+        )
+
     def _is_finger_release_requested(self, curls: dict[str, float], source: str) -> bool:
         """Recognize a valid release without requiring a perfectly straight thumb.
 
@@ -5186,7 +7054,7 @@ class HumanoidExample(BaseSample):
         do not veto that gesture. Controllers still require a released trigger.
         Missing or invalid input must never clear an explicit drop latch.
         """
-        if source == "hand_tracking":
+        if source in ("hand_tracking", "webcam_hand"):
             roles = ("index", "middle", "ring", "little")
             threshold = self._finger_release_threshold
         elif source == "controller":
@@ -5265,6 +7133,17 @@ class HumanoidExample(BaseSample):
         return smoothed
 
     def _get_hand_tracking_finger_curls(self, input_device) -> dict[str, float] | None:
+        """Share one optical curl measurement between navigation and finger control."""
+        snapshot = self._get_teleop_hand_snapshot(input_device)
+        if snapshot is None:
+            return self._measure_hand_tracking_finger_curls(input_device)
+        if "curls" not in snapshot:
+            snapshot["curls"] = self._measure_hand_tracking_finger_curls(input_device)
+        curls = snapshot["curls"]
+        # A consumer must not alter the raw curl evidence used by another one.
+        return None if curls is None else dict(curls)
+
+    def _measure_hand_tracking_finger_curls(self, input_device) -> dict[str, float] | None:
         """Measure each finger's curl from the OpenXR tracked hand skeleton.
 
         Read each digit independently; a missing joint relaxes only that digit.
@@ -5317,6 +7196,17 @@ class HumanoidExample(BaseSample):
         return curls
 
     def _get_hand_joint_position(self, input_device, pose_name: str):
+        """Reuse validated landmarks only inside the current physics callback."""
+        snapshot = self._get_teleop_hand_snapshot(input_device)
+        if snapshot is None:
+            return self._read_hand_joint_position(input_device, pose_name)
+        positions = snapshot.setdefault("positions", {})
+        if pose_name not in positions:
+            positions[pose_name] = self._read_hand_joint_position(input_device, pose_name)
+        position = positions[pose_name]
+        return None if position is None else Gf.Vec3d(position)
+
+    def _read_hand_joint_position(self, input_device, pose_name: str):
         """Read a finite world joint position without requiring tracked orientation.
 
         Finger bend uses translation only. OpenXR may mark a joint's position valid
@@ -5325,19 +7215,14 @@ class HumanoidExample(BaseSample):
         """
         try:
             reader = getattr(input_device, "get_virtual_world_pose_desc", None)
-            if not callable(reader):
+            bulk_reader = getattr(input_device, "get_all_virtual_world_poses", None)
+            if not callable(reader) and not callable(bulk_reader):
                 pose = read_world_pose(input_device, pose_name)
                 return Gf.Vec3d(pose.ExtractTranslation()) if pose is not None else None
-            descriptor = reader(pose_name)
-            if int(descriptor.validity_flags) & 0x2 == 0:
+            sample = self._get_hand_world_pose_sample(input_device, pose_name)
+            if sample is None or sample[0] & 0x2 == 0:
                 return None
-            matrix = descriptor.pose_matrix
-            if matrix is None or len(matrix) != 4 or any(len(row) != 4 for row in matrix):
-                return None
-            coordinates = tuple(float(matrix[3][axis]) for axis in range(3))
-            if not all(math.isfinite(value) for value in coordinates):
-                return None
-            return Gf.Vec3d(*coordinates)
+            return Gf.Vec3d(*sample[1])
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return None
 
@@ -5389,7 +7274,7 @@ class HumanoidExample(BaseSample):
         Keeping the clutch separate lets the operator reach with an open hand, then
         curl around the target without changing the arm's calibration.
         """
-        if self._get_hand_input_kind(input_device) != "controller":
+        if self._optical_hands_only or self._get_hand_input_kind(input_device) != "controller":
             return None
         trigger = max(
             self._get_xr_gesture_value(input_device, "trigger", "value"),
@@ -5416,9 +7301,12 @@ class HumanoidExample(BaseSample):
         gesture.
         """
         was_closed = self._hand_closed_by_side.get(side, False)
-        if self._finger_curl_source.get(side) == "hand_tracking":
+        if self._finger_curl_source.get(side) in ("hand_tracking", "webcam_hand"):
             value = self._get_hand_closure(side)
             threshold = self._finger_release_threshold if was_closed else self._finger_grab_threshold
+        elif self._optical_hands_only:
+            self._hand_closed_by_side[side] = False
+            return False
         else:
             value = max(
                 self._get_xr_gesture_value(input_device, "trigger", "value"),
@@ -5546,7 +7434,7 @@ class HumanoidExample(BaseSample):
         guess, the operator cycles the modes while wearing the headset and keeps the one
         that puts them in the robot.
         """
-        if self._g1_locomotion == "stationary":
+        if self._g1_locomotion == "stationary" or self._gesture_locomotion_enabled:
             self._xr_camera_mode = "robot_head"
             self._log_xr_camera_state("stationary mode keeps the camera fixed to the robot head")
             return
@@ -5583,6 +7471,402 @@ class HumanoidExample(BaseSample):
         yaw = stick_yaw if abs(stick_yaw) > abs(button_yaw) else button_yaw
         return forward, yaw
 
+    def _reset_gesture_locomotion(self) -> None:
+        """Require a new deliberate gesture after resets, recentering, or faults."""
+        self._controller_locomotion.reset()
+        self._controller_walking_status = self._controller_locomotion.command.detail
+        self._gesture_command = self._locomotion_gesture.reset()
+        self._gesture_input_status = self._gesture_command.detail
+        self._navigation_ray = None
+        self._navigation_ray_filter.reset()
+        self._navigation_query_status = {}
+        self._navigation_object_approach_cache = None
+        self._navigation_destination_kind = None
+        self._navigation_source_object_root = None
+        self._navigation_route_planner = None
+        self._navigation_plan_time = 0.0
+        self._navigation_draw_time = 0.0
+        self._navigation_scene.hide()
+        self._walking_stop_elapsed = 0.0
+        self._walking_residual_motion_time = 0.0
+        self._walking_residual_window_time = 0.0
+        self._walking_residual_motion_samples = None
+        self._walking_support_pose_batch = None
+        self._walking_support_samples = None
+        self._walking_support_anchor = None
+        self._walking_runaway_time = 0.0
+        if self._gesture_locomotion_enabled:
+            for name in ("_base_command", "_keyboard_command", "_controller_command"):
+                command = getattr(self, name, None)
+                if command is not None:
+                    command[:] = 0.0
+
+    @staticmethod
+    def _read_gesture_physical_pose(device, name: str, flags: int = 2):
+        """Read uncached playspace input; virtual robot motion must not steer itself."""
+        try:
+            descriptor = device.get_pose_desc(name)
+            if int(descriptor.validity_flags) & flags != flags:
+                return None
+            source = descriptor.pose_matrix
+            if source is None or len(source) != 4 or any(len(row) != 4 for row in source):
+                return None
+            matrix = Gf.Matrix4d(source)
+            if not all(math.isfinite(matrix[row][column]) for row in range(4) for column in range(4)):
+                return None
+            if flags & 1 and abs(matrix.ExtractRotationMatrix().GetDeterminant() - 1.0) > 0.01:
+                return None
+            return matrix
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+
+    def _read_navigation_hand(self) -> tuple:
+        """Read fresh Quest landmarks in stage coordinates for pointing selection."""
+        device = self._get_xr_input_device("/user/hand/left")
+        optical = self._get_hand_input_kind(device) == "hand_tracking"
+        if optical:
+            required = {"wrist"}
+            for role in ("index", "middle", "ring", "little"):
+                required.update(self._finger_curl_joint_chains[role])
+            # VALID alone permits inferred poses after an occlusion. Navigation
+            # needs current measured tracking, especially when a slow render
+            # frame lengthens the interval between physics/input callbacks.
+            try:
+                samples = (self._get_hand_world_pose_sample(device, name) for name in required)
+                optical = all(sample is not None and sample[0] & 0xA == 0xA for sample in samples)
+            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+                optical = False
+        curls = self._get_hand_tracking_finger_curls(device) if optical else None
+        tip = self._get_hand_joint_position(device, "index_tip") if optical else None
+        knuckle = self._get_hand_joint_position(device, "index_proximal") if optical else None
+        wrist = self._get_hand_joint_position(device, "wrist") if optical else None
+        return curls, tip, knuckle, wrist
+
+    def _update_gesture_locomotion(self) -> None:
+        """Select a floor destination using only the blue index-finger ray.
+
+        Hold a clear floor hit, or a registered practice object with a clear floor
+        approach, to lock a world destination. The blue ray always ends at its
+        real nearest hit; the destination ring marks the floor standing goal.
+        Eye tracking and its red visualization remain independent of navigation.
+        """
+        if not self._pointing_navigation_enabled:
+            self._navigation_scene.hide()
+            return
+        now = time.perf_counter()
+        previous = self._gesture_command
+        curls, tip, knuckle, wrist = self._read_navigation_hand()
+        direction = tip - knuckle if tip is not None and knuckle is not None else None
+        hand_valid = wrist is not None and direction is not None and 0.015 <= direction.GetLength() <= 0.20
+        pointing = hand_valid and is_pointing(curls, retaining=previous.state in ("acquiring", "planning", "active"))
+        hit = None
+        self._navigation_ray = None
+        ray_error = None
+        if pointing:
+            ray = self._navigation_ray_filter.update(origin=tip, direction=direction, now_s=now)
+            if ray is None:
+                hand_valid = False
+            else:
+                origin, direction = (Gf.Vec3d(*value) for value in ray)
+                # Selection and visualization must use the same stabilized ray:
+                # never smooth only the drawing or project through an obstacle.
+                hit = self._navigation_scene.cast_ray(origin, direction)
+                ray_error = self._navigation_scene.last_error
+                end = Gf.Vec3d(*hit["position"]) if hit else origin + direction * PointNavigationScene.MAX_DISTANCE
+                self._navigation_ray = (origin, end)
+        else:
+            self._navigation_ray_filter.reset()
+        point_hit = hit["position"] if hit else None
+        base = self._get_g1_base_pose_for_arms()
+        position, yaw = base if base is not None else (None, 0.0)
+        # The actor stops at the arrival radius. Retain an extra 10 cm of the
+        # center route for braking, plus the scene query's unchanged body padding.
+        shortfall = max(0.0, self._locomotion_gesture.arrival_radius_m - 0.10)
+        point_walkable = bool(hit and hit["walkable"])
+        target = previous.target if previous.state in ("planning", "active", "arrived", "blocked") else None
+        destination_kind = "floor" if point_walkable else None
+        source_object_root = None
+        approach_error = None
+        blockers = ()
+        if target is not None:
+            # Locked destinations are world-fixed. Moving the ray across another
+            # object must not start a new approach search while walking or latched.
+            destination_kind = self._navigation_destination_kind
+            source_object_root = self._navigation_source_object_root
+            self._navigation_object_approach_cache = None
+        elif pointing and hit is not None and not point_walkable and position is not None:
+            hit_path = str(hit.get("path", ""))
+            registered_root = next(
+                (
+                    root
+                    for root in self._spawned_sample_box_paths
+                    if hit_path == root or hit_path.startswith(root + "/")
+                ),
+                None,
+            )
+            if registered_root is not None:
+                surface = tuple(float(axis) for axis in point_hit)
+                base_point = tuple(float(axis) for axis in position)
+                cached = self._navigation_object_approach_cache
+                reuse = (
+                    cached is not None
+                    and 0.0 <= now - cached["time"] <= 0.05
+                    and cached["object_root"] == registered_root
+                    and cached["shortfall"] == shortfall
+                    and math.dist(cached["surface"], surface) <= 0.02
+                    and math.dist(cached["base"], base_point) <= 0.02
+                )
+                if not reuse:
+                    result = self._navigation_scene.resolve_object_approach(
+                        position,
+                        hit,
+                        self._spawned_sample_box_paths,
+                        stopping_shortfall_m=shortfall,
+                        allow_routing=self._locomotion_gesture.allow_routing,
+                    )
+                    cached = {
+                        "time": now,
+                        "object_root": registered_root,
+                        "surface": surface,
+                        "base": base_point,
+                        "shortfall": shortfall,
+                        "result": result,
+                        "error": self._navigation_scene.last_error,
+                        "blockers": self._navigation_scene.last_blocking_paths,
+                    }
+                    self._navigation_object_approach_cache = cached
+                approach = cached["result"]
+                approach_error = cached["error"]
+                blockers = cached["blockers"]
+                if approach is not None:
+                    point_hit = approach["target"]
+                    point_walkable = True
+                    destination_kind = "object_approach"
+                    source_object_root = approach["source_object_root"]
+            else:
+                self._navigation_object_approach_cache = None
+        else:
+            self._navigation_object_approach_cache = None
+        if target is None and point_hit is not None and point_walkable:
+            target = tuple(float(value) for value in point_hit)
+        # Reusing a candidate search never reuses movement authorization. Check
+        # the current corridor on every step, including during the dwell period.
+        waypoint = self._locomotion_gesture.waypoint if previous.state == "active" else target
+        segment_shortfall = shortfall if self._locomotion_gesture.is_final_waypoint else 0.0
+        path_clear = bool(
+            target is not None
+            and position is not None
+            and self._navigation_scene.is_path_clear(position, waypoint, stopping_shortfall_m=segment_shortfall)
+        )
+        corridor_error = self._navigation_scene.last_error if target is not None and not path_clear else None
+        if target is not None:
+            blockers = self._navigation_scene.last_blocking_paths
+        # A pointing pose near a held object must not authorize navigation.
+        grasp_conflict = bool(
+            any(c.eligible_for_grasp for c in self._latest_hand_contacts.get("left", ()))
+            or self._grabbed_objects_by_side.get("left")
+        )
+        if grasp_conflict:
+            path_clear = False
+            point_walkable = False
+        turn_clear = bool(pointing and position is not None and self._navigation_scene.is_turn_clear(position) is True)
+        planned_route = None
+        planner = self._navigation_route_planner
+        if previous.state == "planning" and pointing and hand_valid and not grasp_conflict and position is not None:
+            if planner is None or planner.target != tuple(previous.target):
+                planner = FactoryRoutePlanner(
+                    tuple(position),
+                    previous.target,
+                    self._navigation_scene.floor_at,
+                    self._navigation_scene.is_route_segment_clear,
+                    self._navigation_scene.is_turn_clear,
+                    corner_clear=self._navigation_scene.is_route_corner_clear,
+                )
+                self._navigation_route_planner = planner
+                self._navigation_plan_time = 0.0
+            if now >= self._navigation_plan_time and planner.state == "planning":
+                # Scene queries run incrementally at ten wall-clock updates per
+                # second, not a whole occupancy grid on every 200 Hz physics step.
+                self._navigation_plan_time = now + 0.1
+                planner.advance(max_queries=24)
+            if planner.state == "ready":
+                planned_route = planner.route
+        command = self._locomotion_gesture.update(
+            curls=curls,
+            hand_valid=bool(hand_valid),
+            point_hit=point_hit,
+            point_walkable=point_walkable,
+            path_clear=path_clear,
+            robot_position=position,
+            robot_yaw=yaw,
+            now_s=now,
+            route=planned_route,
+            route_failed=bool(grasp_conflict or (planner is not None and planner.state == "failed")),
+            turn_clear=turn_clear,
+        )
+        self._gesture_command = command
+        previous_detail = self._gesture_input_status
+        self._gesture_input_status = command.detail
+        if command.state == "planning" and planner is not None:
+            self._gesture_input_status = planner.detail + "; keep pointing, or open your hand to cancel"
+        if command.state == "acquiring" and destination_kind == "object_approach":
+            self._gesture_input_status = "Hold pointing at the object to approach the floor marker"
+        elif command.state == "idle" and pointing and isinstance(approach_error, str):
+            self._gesture_input_status = approach_error
+        elif command.state == "idle" and pointing and not point_walkable and isinstance(ray_error, str):
+            self._gesture_input_status = ray_error
+        elif command.state in ("idle", "blocked") and isinstance(corridor_error, str):
+            self._gesture_input_status = f"{command.detail}: {corridor_error}"
+        selected = command.target is not None or command.candidate is not None
+        self._navigation_destination_kind = destination_kind if selected else None
+        self._navigation_source_object_root = source_object_root if selected else None
+        if not pointing or not hand_valid or command.state == "awaiting_release":
+            self._navigation_object_approach_cache = None
+        if command.state not in ("planning", "active"):
+            self._navigation_route_planner = None
+            self._navigation_plan_time = 0.0
+        self._navigation_query_status = {
+            "ray_hit_path": hit.get("path") if hit else None,
+            "ray_hit_distance_m": hit.get("distance") if hit else None,
+            "ray_walkable": bool(hit and hit["walkable"]),
+            "ray_error": ray_error if isinstance(ray_error, str) else None,
+            "corridor_error": corridor_error if isinstance(corridor_error, str) else None,
+            "approach_error": approach_error if isinstance(approach_error, str) else None,
+            "destination_kind": self._navigation_destination_kind,
+            "source_object_root": self._navigation_source_object_root,
+            "blocking_paths": tuple(blockers),
+            "stopping_shortfall_m": segment_shortfall,
+            "waypoint": self._locomotion_gesture.waypoint,
+            "route_state": planner.state if planner is not None else None,
+            "route_waypoints": planner.route if planner is not None else (),
+            "route_queries": planner.queries if planner is not None else 0,
+            "route_expanded": planner.expanded if planner is not None else 0,
+            "turn_clear": turn_clear,
+        }
+        if command.state != previous.state or (
+            self._gesture_input_status != previous_detail and now >= self._navigation_log_time
+        ):
+            self._navigation_log_time = now + 0.5
+            carb.log_info(f"G1 pointing walking: {command.state}. {self._gesture_input_status}")
+        for axis, value in enumerate(command.velocity):
+            self._controller_command[axis] = value
+        self._keyboard_command[:] = 0.0
+        if not any(command.velocity):
+            # Do not allow command filtering to prolong a released gesture.
+            self._base_command[:] = 0.0
+        if self._navigation_ray is None:
+            self._navigation_scene.hide()
+        elif now >= self._navigation_draw_time:
+            # At 20 Hz, a ~23 Hz app skipped every other visible update. Allow a
+            # fresh blue ray on each VR frame, bounded at 60 edits per second.
+            self._navigation_draw_time = now + 1.0 / 60.0
+            self._navigation_scene.draw(
+                *self._navigation_ray,
+                target=command.target or command.candidate,
+                progress=command.acquisition_progress,
+                state=command.state,
+                hit_valid=hit is not None,
+            )
+
+    def gesture_locomotion_status(self) -> dict:
+        """Report navigation state without changing gaze or input ownership."""
+        if self._controller_walking_enabled:
+            return {
+                "enabled": True,
+                "mode": "controller_sticks",
+                "state": self._controller_locomotion.command.state,
+                "detail": self._articulation_health_fault or self._controller_walking_status,
+                "hand_reserved": False,
+                "blue_ray_enabled": False,
+                "requested_velocity": (
+                    self._controller_command.tolist() if self._controller_command is not None else [0, 0, 0]
+                ),
+                "filtered_velocity": self._base_command.tolist() if self._base_command is not None else [0, 0, 0],
+                "fault": self._articulation_health_fault,
+            }
+        return {
+            "enabled": self._gesture_locomotion_enabled,
+            "state": self._gesture_command.state,
+            "mode": "point_only",
+            **self._navigation_query_status,
+            "forward": self._gesture_command.velocity[0],
+            "turn": self._gesture_command.velocity[2],
+            "target": self._gesture_command.target,
+            "candidate": self._gesture_command.candidate,
+            "acquisition_progress": self._gesture_command.acquisition_progress,
+            "hand_reserved": self._gesture_command.owns_hand,
+            "detail": self._articulation_health_fault or self._gesture_input_status,
+            "requested_velocity": (
+                self._controller_command.tolist() if self._controller_command is not None else [0.0, 0.0, 0.0]
+            ),
+            "filtered_velocity": self._base_command.tolist() if self._base_command is not None else [0.0, 0.0, 0.0],
+            "policy_mode": getattr(getattr(self.g1, "_velocity_policy", None), "active_mode", None),
+            "fault": self._articulation_health_fault,
+        }
+
+    def _read_tracked_controller_stick(self, device) -> tuple[bool, float, float]:
+        """Read real stick components with a currently tracked physical grip pose.
+
+        This Quest transport switches between controllers and optical hands.
+        Optical input must invalidate sticks even if Kit retains analog actions
+        beside its skeleton. Webcam input remains an independent hand source.
+        Kit exposes no per-action timestamp here; tracked pose flags, finite
+        components and the callback interruption interlock are also required.
+        Missing actions never become synthetic zero/valid controller samples.
+        """
+        if device is None:
+            return False, 0.0, 0.0
+        if self._get_hand_input_kind(device) == "hand_tracking":
+            return False, 0.0, 0.0
+        try:
+            descriptor = device.get_pose_desc("grip")
+            if int(descriptor.validity_flags) & 0xF != 0xF:
+                return False, 0.0, 0.0
+            if not self._is_valid_rigid_pose(Gf.Matrix4d(descriptor.pose_matrix)):
+                return False, 0.0, 0.0
+            for name in self._xr_stick_input_candidates:
+                if not device.has_input(name) or not all(device.has_input_gesture(name, axis) for axis in ("x", "y")):
+                    continue
+                x = float(device.get_input_gesture_value(name, "x"))
+                y = float(device.get_input_gesture_value(name, "y"))
+                if all(math.isfinite(value) and -1.0 <= value <= 1.0 for value in (x, y)):
+                    return True, x, y
+                return False, 0.0, 0.0
+        except (AttributeError, TypeError, ValueError, RuntimeError, OverflowError):
+            pass
+        return False, 0.0, 0.0
+
+    def _update_joystick_locomotion(self) -> None:
+        """Give only the two VR sticks ownership of the physical walking command.
+
+        Optical hands remain independent. Triggers, grip, buttons, stick clicks,
+        keyboard movement and the blue pointing selector cannot command actions
+        in this mode. Returning to neutral or losing a controller stops all axes.
+        Existing balance, joint-health and unintended-motion guards still run.
+        """
+        left = self._read_tracked_controller_stick(self._get_xr_input_device("/user/hand/left"))
+        right = self._read_tracked_controller_stick(self._get_xr_input_device("/user/hand/right"))
+        command = self._controller_locomotion.update(
+            left_x=left[1],
+            left_y=left[2],
+            right_x=right[1],
+            left_valid=left[0],
+            right_valid=right[0],
+            now_s=time.perf_counter(),
+        )
+        self._controller_walking_status = command.detail
+        forward, lateral, yaw = command.velocity
+        forward_cap = self._max_forward_speed if forward >= 0.0 else self._max_backward_speed
+        for axis, value in enumerate(
+            (forward * forward_cap, lateral * self._max_lateral_speed, yaw * self._max_yaw_speed)
+        ):
+            self._controller_command[axis] = value
+        if self._keyboard_command is not None:
+            self._keyboard_command[:] = 0.0
+        if not any(command.velocity):
+            self._base_command[:] = 0.0
+        self._navigation_scene.hide()
+
     def _update_controller_command(self, dt: float) -> None:
         """Poll XR actions and recording inputs, optionally allowing locomotion.
 
@@ -5595,8 +7879,24 @@ class HumanoidExample(BaseSample):
 
         # Cleared before the inputs are polled; any of them may raise it this step.
         self._locomotion_brake = self._keyboard_brake
+        if self._controller_walking_enabled:
+            self._update_headset_gait_command(dt)  # Preserve the recording clock, never its walking intent.
+            self._update_joystick_locomotion()
+            return
         xr_forward, xr_yaw = self._read_xr_controller_axes()
         headset_gait_forward = self._update_headset_gait_command(dt)
+        if self._gesture_locomotion_enabled:
+            try:
+                self._update_gesture_locomotion()
+            except Exception as error:
+                self._reset_gesture_locomotion()
+                self._controller_command[:] = 0.0
+                self._keyboard_command[:] = 0.0
+                self._base_command[:] = 0.0
+                self._articulation_health_fault = f"walking gesture input failed: {error}"
+                self._log_physics_step_error("walking gesture input", error)
+                self._pause_faulted_articulation()
+            return
         if self._g1_locomotion == "stationary":
             self._controller_command[:] = 0.0
             self._latest_stick_lateral = 0.0
@@ -5634,14 +7934,27 @@ class HumanoidExample(BaseSample):
             bool: True to indicate the event was handled.
         """
         torch = import_module("torch")
+        key = self._keyboard_event_key(event)
+        if key == "C" and event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            self.request_webcam_calibration()
+            return True
+        if key == "B" and event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            # Bare-hand operators have no controller B button. Handle heading
+            # recenter before modes that intentionally disable keyboard walking.
+            self._request_xr_recenter()
+            return True
         if self._keyboard_command is None:
+            return True
+        if self._gesture_locomotion_enabled:
+            self._keyboard_command[:] = 0.0
+            self._pressed_keys.clear()
+            self._keyboard_brake = False
             return True
         if self._g1_locomotion == "stationary":
             self._keyboard_command[:] = 0.0
             self._pressed_keys.clear()
             self._keyboard_brake = False
             return True
-        key = self._keyboard_event_key(event)
         if key is None:
             return True
         # Rebuild from the pressed-key set. Increment/decrement accounting can leave a
@@ -5684,8 +7997,14 @@ class HumanoidExample(BaseSample):
 
     def physics_cleanup(self):
         """Clean up physics resources."""
+        self._restore_controller_xr_tools()
+        self._restore_robot_head_xr_orientation()
+        self._timeline_navigation_sub = None
+        self._timeline_stopped = True
+        self._navigation_scene.cleanup()
         self._head_camera_update_sub = None
         self._reset_teleoperation_state()
+        self._operator_head_visual.clear()
         # Deregister physics callback
         if self._physics_callback_id is not None:
             try:
@@ -5711,7 +8030,31 @@ class HumanoidExample(BaseSample):
         self._restore_physics_simulation_state()
 
     def _restore_physics_simulation_state(self) -> None:
-        """Restore the physics sim device and fabric state captured in ``setup_scene``."""
+        """Restore the device, Fabric, and exact USD outputs once per loaded scene."""
+        if (
+            self._prev_physics_sim_device is None
+            and self._prev_fabric_enabled is None
+            and self._prev_physics_usd_settings is None
+        ):
+            return
         restore_physics_simulation_state(self._prev_physics_sim_device, self._prev_fabric_enabled)
         self._prev_physics_sim_device = None
         self._prev_fabric_enabled = None
+        if self._prev_physics_usd_settings is not None:
+            import carb.settings
+
+            # Restore after the shared helper: changing Fabric there writes all
+            # four flags again. A failed setting remains available for the next
+            # cleanup attempt without repeating device/Fabric changes.
+            settings = carb.settings.get_settings()
+            remaining = {}
+            for path, value in self._prev_physics_usd_settings.items():
+                try:
+                    if value is None:
+                        settings.destroy_item(path)
+                    else:
+                        settings.set_bool(path, value)
+                except Exception as error:
+                    remaining[path] = value
+                    carb.log_warn(f"HumanoidExample: could not restore {path}: {error}")
+            self._prev_physics_usd_settings = remaining or None

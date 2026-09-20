@@ -47,16 +47,37 @@ class HumanoidExampleExtension(omni.ext.IExt):
         self.example_name = "Humanoid"
         self.category = "Policy"
 
-        overview = "The G1 stands anchored in place. Walking and turning inputs are disabled. "
+        sample = HumanoidExample()
+        if sample._controller_walking_enabled:
+            overview = "Controller walking: center both sticks once. Left stick moves forward/backward and sideways; "
+            overview += "right stick turns. Release the sticks to stop. The blue pointing ray is disabled. "
+            overview += "Controllers do not operate arms, fingers, grip, camera or drop actions. "
+        elif sample._gesture_locomotion_enabled:
+            overview = "Pointing walking is enabled. Open your left hand, then point with your index finger. "
+            overview += "Curl the other three fingers and hold the blue ray on clear floor for 0.6 seconds. "
+            overview += "Choose floor 0.5 to 12 meters ahead, or point at an object to approach its floor marker. Walls and blocked routes stop walking. "
+            overview += "Keep pointing to walk, and open your hand to stop. Gaze does not steer walking. "
+        else:
+            overview = "The G1 stands anchored in place. Walking and turning inputs are disabled. "
         overview += "Arms, fingers, gaze, and recording remain active."
         overview += " The camera stays fixed to the robot head when you move your real head."
         overview += "\n\nHand tracking: move individual fingers and thumb opposition. Reach with an open hand, "
         overview += "close your fingers around a nearby object to take it, "
         overview += "then open your hand to release."
-        overview += "\n\nControllers: hold the side GRIP to move/rotate that arm; pull TRIGGER to close and pick up. "
-        overview += "Keep grip held while carrying; release trigger to drop."
-        overview += "\nY: drop both objects (release/open before grabbing again). B: restore the fixed robot-head view."
-        overview += "\nStart with the tabletop objects directly in front-right of the robot."
+        if sample._optical_hands_only:
+            overview += "\n\nUse tracked hands to place both palms on opposite sides of a shelf carton, "
+            overview += "curl your fingers around its edges, then lift both hands together. Open and separate to release. "
+            overview += "Contact and friction support the package; it is never glued to the hands. "
+            overview += "If the headset switches between controllers and hands, center the sticks and stop, "
+            overview += "then put down the controllers and show your open hands to the headset. "
+            overview += "Arm and finger control resume when optical hand poses return."
+            overview += "\nKeyboard B: recenter forward heading while preserving head tilt."
+        else:
+            overview += "\n\nControllers: hold GRIP to move the arm; pull TRIGGER to close. "
+            overview += "Y drops objects; B recenters forward heading."
+        overview += "\nThe factory includes practice objects and, in controller walking, twelve handle-free shelf cartons."
+        overview += "\nIf the simulation pauses after a movement fault, the console shows why. "
+        overview += "Use this example's Reset to recover; Play alone does not clear a fault."
         overview += "\n\nPress the 'Open in IDE' button to view the source code."
 
         ui_kwargs = {
@@ -65,7 +86,7 @@ class HumanoidExampleExtension(omni.ext.IExt):
             "title": "Humanoid: Unitree G1",
             "doc_link": "https://docs.isaacsim.omniverse.nvidia.com/latest/isaac_lab_tutorials/tutorial_policy_deployment.html",
             "overview": overview,
-            "sample": HumanoidExample(),
+            "sample": sample,
         }
 
         ui_handle = BaseSampleUITemplate(**ui_kwargs)

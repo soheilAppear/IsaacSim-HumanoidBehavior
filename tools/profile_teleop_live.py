@@ -9,6 +9,8 @@ Enable Python Server, LOAD the Humanoid example, and press Play before running:
     python tools/profile_teleop_live.py --seconds 20 --timeout 45
 
 This command observes real input and temporarily times selected Python methods.
+It includes articulation/balance guards, deferred body motor efforts, and object
+state logging; nested timers are reported separately and must not be added together.
 It never changes gaze, camera, recording settings, input devices, or the timeline.
 Wrappers are restored in finally, including on cancellation or a server timeout.
 The JSON report measures instrumented app updates, not headset/compositor FPS.
@@ -56,6 +58,12 @@ async def _profile_teleop_live(ex, seconds):
             "do not sum them as disjoint frame costs. App-update FPS is not headset/compositor FPS. "
             "Gaze and camera methods are not instrumented."
         ),
+        "timing_relationships": {
+            "_collect_object_state_sample": "Included in _collect_all_behavioral_data.",
+            "g1.apply_body_efforts": (
+                "Separate from g1.forward when deferred; included in g1.forward when not deferred."
+            ),
+        },
     }
 
     def on_update(event):
@@ -109,9 +117,14 @@ async def _profile_teleop_live(ex, seconds):
             "_update_g1_fingers",
             "_update_g1_arms_from_hand_tracking",
             "_collect_all_behavioral_data",
+            "_check_articulation_health",
+            "_check_gesture_balance",
+            "_check_gesture_motion",
+            "_collect_object_state_sample",
         ):
             wrap_method(ex, method, method)
         wrap_method(robot, "forward", "g1.forward")
+        wrap_method(robot, "apply_body_efforts", "g1.apply_body_efforts")
         subscription = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
             on_update, name="G1 temporary teleoperation performance observation"
         )

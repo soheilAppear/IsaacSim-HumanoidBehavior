@@ -13,8 +13,19 @@ REM Pass --xr-verbose as the first argument to also turn on the OpenXR runtime d
 REM (which extensions the runtime advertised, which interaction profiles bound). Any other
 REM arguments are forwarded to Isaac Sim unchanged.
 REM Skeletal hand tracking must be requested before the OpenXR instance is created.
-REM If enabling it in an already-running app, restart the XR session to apply it.
+REM If enabling it in an already-running app, restart Isaac to apply it.
+REM Use D3D12 for this Windows VR process: native XR restart reproduced a Vulkan
+REM crash on this PC, while the same D3D12 lifecycle check passed. This local
+REM workaround does not change global renderer settings. For an explicit Vulkan
+REM diagnostic run, append --/app/vulkan=true; user arguments remain last.
+REM Isaac 6.1's Metrics Assembler edit listener can dereference a closed stage
+REM during Clear/Load. Disable that listener at startup; initial asset conversion
+REM remains enabled. In-place asset variant/reference edits require a fresh load.
 REM Set ISAAC_DIR before calling this script to use a different installation.
+REM Keep one complete extension version per session. Reloading partially edited
+REM Python files can crash the examples browser while a VR scene is running.
+REM Optional webcam fallback: set G1_WEBCAM_ENABLED=1 before launch, then run
+REM tools\launch_webcam_tracking.bat separately and explicitly calibrate with C.
 
 setlocal DisableDelayedExpansion
 
@@ -38,13 +49,17 @@ set "XR_FLAGS="
 set "ISAAC_ARGS=%*"
 if /i "%~1"=="--xr-verbose" (
     set "XR_FLAGS=--/xr/openxr/verbose/instanceCreation=true --/xr/openxr/verbose/runtimeRegistry=true --/xr/openxr/verbose/runtimeHealth=true"
-    REM Preserve the remaining raw text: SHIFT leaves %%* unchanged, and collecting
-    REM %%1 repeatedly splits Kit's key=value settings at the equals sign.
-    for /f "tokens=1,*" %%A in ("%*") do set "ISAAC_ARGS=%%B"
+    REM Remove only the first flag from the raw text. SHIFT leaves %%* unchanged;
+    REM reparsing with FOR /F corrupts quoted key=value arguments containing spaces.
+    if "%~2"=="" (
+        set "ISAAC_ARGS="
+    ) else (
+        set "ISAAC_ARGS=%ISAAC_ARGS:* =%"
+    )
 )
 
 echo Starting Isaac Sim XR VR from "%ISAAC_DIR%" ...
 echo Loading project extension from "%POLICY_EXT%".
 echo Python server: 127.0.0.1:8226
-call "%ISAAC_DIR%\isaac-sim.xr.vr.bat" --ext-path "%POLICY_EXT%" --enable isaacsim.robot.policy.examples-5.2.11 --enable isaacsim.code_editor.python_server --/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled=true %XR_FLAGS% %ISAAC_ARGS%
+call "%ISAAC_DIR%\isaac-sim.xr.vr.bat" --ext-path "%POLICY_EXT%" --enable isaacsim.robot.policy.examples-5.2.11 --enable isaacsim.code_editor.python_server --/app/extensions/fsWatcherEnabled=0 --/metricsAssembler/changeListenerEnabled=false --/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled=true --/app/vulkan=false %XR_FLAGS% %ISAAC_ARGS%
 exit /b %ERRORLEVEL%

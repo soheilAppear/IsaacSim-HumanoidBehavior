@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 from humanoid_test_support import HIGHLIGHTS, HUMANOID, POSE, USD, Array, Device, pose
-from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdShade
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 
 class TestTrackingControls(unittest.TestCase):
@@ -277,13 +277,159 @@ class TestHumanoidControls(unittest.TestCase):
 
 
 class TestMaterialControls(unittest.TestCase):
+    @staticmethod
+    def material(stage, path, color):
+        material = UsdShade.Material.Define(stage, path)
+        shader = UsdShade.Shader.Define(stage, path + "/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        for name in ("diffuseColor", "emissiveColor"):
+            shader.CreateInput(name, Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        return material
+
+    @staticmethod
+    def shell_shader(stage, highlights, target="/World/Box"):
+        return UsdShade.Shader(stage.GetPrimAtPath(highlights._shader_paths[target]))
+
+    def test_runtime_selection_only_changes_external_shader_inputs_and_preserves_physics(self):
+        from pxr import Tf
+
+        stage = Usd.Stage.CreateInMemory()
+        root = UsdGeom.Xform.Define(stage, "/World/Box").GetPrim()
+        child = UsdGeom.Cube.Define(stage, "/World/Box/Collider").GetPrim()
+        UsdPhysics.RigidBodyAPI.Apply(root)
+        UsdPhysics.CollisionAPI.Apply(child)
+        base = UsdShade.Material.Define(stage, "/World/Base")
+        render = UsdShade.Material.Define(stage, "/World/Render")
+        physics = UsdShade.Material.Define(stage, "/World/Physics")
+        UsdPhysics.MaterialAPI.Apply(physics.GetPrim())
+        highlight = self.material(stage, "/World/Highlight", (1.0, 0.85, 0.1))
+        root_binding = UsdShade.MaterialBindingAPI.Apply(root)
+        root_binding.Bind(base)
+        root_binding.Bind(render, materialPurpose=UsdShade.Tokens.full)
+        root_binding.Bind(physics, materialPurpose="physics")
+        highlights = HIGHLIGHTS.MaterialHighlights()
+        highlights.prepare(stage, [str(root.GetPath())])
+        before = stage.GetRootLayer().ExportToString()
+        notices = []
+
+        def record_notice(notice, sender):
+            notices.extend(str(path) for path in (*notice.GetResyncedPaths(), *notice.GetChangedInfoOnlyPaths()))
+
+        listener = Tf.Notice.Register(Usd.Notice.ObjectsChanged, record_notice, stage)
+        binding = UsdShade.MaterialBindingAPI(child)
+        shell_shader = self.shell_shader(stage, highlights)
+        try:
+            for _ in range(3):
+                highlights.set(stage, "gaze", str(root.GetPath()), highlight, 10)
+                self.assertEqual(
+                    binding.ComputeBoundMaterial(materialPurpose="physics")[0].GetPath(), physics.GetPath()
+                )
+                self.assertEqual(binding.ComputeBoundMaterial()[0].GetPath(), base.GetPath())
+                self.assertEqual(
+                    binding.ComputeBoundMaterial(materialPurpose=UsdShade.Tokens.full)[0].GetPath(), render.GetPath()
+                )
+                self.assertEqual(shell_shader.GetInput("opacity").Get(), 1.0)
+                highlights.clear()
+                self.assertEqual(shell_shader.GetInput("opacity").Get(), 0.0)
+                self.assertEqual(
+                    binding.ComputeBoundMaterial(materialPurpose=UsdShade.Tokens.full)[0].GetPath(), render.GetPath()
+                )
+        finally:
+            listener.Revoke()
+        self.assertTrue(notices)
+        allowed = {
+            str(shell_shader.GetInput(name).GetAttr().GetPath())
+            for name in ("opacity", "diffuseColor", "emissiveColor")
+        }
+        self.assertTrue(set(notices).issubset(allowed))
+        self.assertFalse(any(Sdf.Path(path).HasPrefix(root.GetPath()) for path in notices))
+        self.assertEqual(before, stage.GetRootLayer().ExportToString())
+
+    def test_geometry_copies_bake_offsets_without_importing_physics(self):
+        stage = Usd.Stage.CreateInMemory()
+        root = UsdGeom.Xform.Define(stage, "/World/Box")
+        root.AddTranslateOp().Set(Gf.Vec3d(3, 2, 1))
+        root.AddRotateZOp().Set(37)
+        UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
+        group = UsdGeom.Xform.Define(stage, "/World/Box/Nested")
+        group.AddTranslateOp().Set(Gf.Vec3d(0.4, -0.2, 0.1))
+        group.AddRotateXOp().Set(23)
+        cube = UsdGeom.Cube.Define(stage, "/World/Box/Nested/Carton")
+        cube.CreateSizeAttr(0.2)
+        cube.AddScaleOp().Set(Gf.Vec3d(1, 2, 3))
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+        mesh = UsdGeom.Mesh.Define(stage, "/World/Box/Nested/Label")
+        mesh.CreatePointsAttr([Gf.Vec3f(1, 2, 3), Gf.Vec3f(2, 2, 3), Gf.Vec3f(1, 3, 3)])
+        mesh.CreateFaceVertexCountsAttr([3])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+        mesh.CreateExtentAttr([Gf.Vec3f(1, 2, 3), Gf.Vec3f(2, 3, 3)])
+        hidden = UsdGeom.Sphere.Define(stage, "/World/Box/HiddenCollider")
+        hidden.MakeInvisible()
+        UsdPhysics.CollisionAPI.Apply(hidden.GetPrim())
+        before = stage.GetRootLayer().ExportToString()
+        highlights = HIGHLIGHTS.MaterialHighlights()
+        highlights.prepare(stage, [str(root.GetPath())])
+        shell_root = stage.GetPrimAtPath("/World/Box/G1_HighlightShells")
+        shells = list(shell_root.GetChildren())
+        self.assertEqual([shell.GetTypeName() for shell in shells], ["Cube", "Mesh"])
+        for shell in Usd.PrimRange(shell_root):
+            self.assertFalse(shell.HasAPI(UsdPhysics.CollisionAPI))
+            self.assertFalse(shell.HasAPI(UsdPhysics.RigidBodyAPI))
+            self.assertFalse(shell.HasAPI(UsdPhysics.MassAPI))
+            self.assertFalse(shell.HasAuthoredReferences())
+            self.assertFalse(any(name.startswith(("physics:", "physx")) for name in shell.GetPropertyNames()))
+        bounds = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+        for source, shell in zip((cube.GetPrim(), mesh.GetPrim()), shells):
+            original = bounds.ComputeWorldBound(source).ComputeAlignedRange()
+            copied = bounds.ComputeWorldBound(shell).ComputeAlignedRange()
+            np.testing.assert_allclose(copied.GetMidpoint(), original.GetMidpoint(), atol=1e-7)
+            np.testing.assert_allclose(copied.GetSize(), original.GetSize() * highlights.SHELL_SCALE, atol=1e-7)
+        self.assertEqual(
+            UsdGeom.Mesh(shells[1]).GetFaceVertexIndicesAttr().Get(), mesh.GetFaceVertexIndicesAttr().Get()
+        )
+        self.assertEqual(before, stage.GetRootLayer().ExportToString())
+        self.assertEqual(self.shell_shader(stage, highlights).GetInput("opacity").Get(), 0.0)
+        self.assertEqual(self.shell_shader(stage, highlights).GetInput("opacityThreshold").Get(), 0.5)
+
+    def test_owner_changes_with_same_visible_winner_emit_no_usd_notices(self):
+        from pxr import Tf
+
+        stage = Usd.Stage.CreateInMemory()
+        root = UsdGeom.Cube.Define(stage, "/World/Box").GetPrim()
+        green = self.material(stage, "/World/Green", (0.1, 0.9, 0.2))
+        yellow = self.material(stage, "/World/Yellow", (1.0, 0.85, 0.1))
+        highlights = HIGHLIGHTS.MaterialHighlights()
+        highlights.prepare(stage, [str(root.GetPath())])
+        highlights.set(stage, "grab:left", str(root.GetPath()), green, 20)
+        notices = []
+
+        def record_notice(notice, sender):
+            notices.append(notice)
+
+        listener = Tf.Notice.Register(Usd.Notice.ObjectsChanged, record_notice, stage)
+        try:
+            highlights.set(stage, "gaze", str(root.GetPath()), yellow, 10)
+            highlights.set(stage, "grab:right", str(root.GetPath()), green, 20)
+            highlights.set(stage, "grab:left", None, None)
+            highlights.set(stage, "gaze", None, None)
+            self.assertEqual(notices, [])
+            highlights.clear()
+            self.assertTrue(notices)
+            notices.clear()
+            highlights.clear()
+            highlights.set(stage, "grab:right", None, None)
+            self.assertEqual(notices, [])
+        finally:
+            listener.Revoke()
+
     def test_overlapping_owners_restore_inherited_material_exactly(self):
         stage = Usd.Stage.CreateInMemory()
         root = UsdGeom.Xform.Define(stage, "/World/Box").GetPrim()
         mesh = UsdGeom.Cube.Define(stage, "/World/Box/Mesh").GetPrim()
         original = UsdShade.Material.Define(stage, "/World/Original")
-        green = UsdShade.Material.Define(stage, "/World/Green")
-        yellow = UsdShade.Material.Define(stage, "/World/Yellow")
+        green = self.material(stage, "/World/Green", (0.1, 0.9, 0.2))
+        yellow = self.material(stage, "/World/Yellow", (1.0, 0.85, 0.1))
         UsdShade.MaterialBindingAPI.Apply(mesh).Bind(original)
         before = stage.GetRootLayer().ExportToString()
         highlights = HIGHLIGHTS.MaterialHighlights()
@@ -293,13 +439,18 @@ class TestMaterialControls(unittest.TestCase):
         highlights.set(stage, "grab:left", str(root.GetPath()), green, 20)
         highlights.set(stage, "grab:right", str(root.GetPath()), green, 20)
         binding = UsdShade.MaterialBindingAPI(mesh)
-        self.assertEqual(binding.ComputeBoundMaterial()[0].GetPath(), green.GetPath())
+        shader = self.shell_shader(stage, highlights)
+        self.assertEqual(shader.GetInput("diffuseColor").Get(), Gf.Vec3f(0.1, 0.9, 0.2))
+        self.assertEqual(shader.GetInput("opacity").Get(), 1.0)
         highlights.set(stage, "grab:left", None, None)
-        self.assertEqual(binding.ComputeBoundMaterial()[0].GetPath(), green.GetPath())
+        self.assertEqual(shader.GetInput("diffuseColor").Get(), Gf.Vec3f(0.1, 0.9, 0.2))
         highlights.set(stage, "grab:right", None, None)
-        self.assertEqual(binding.ComputeBoundMaterial()[0].GetPath(), yellow.GetPath())
+        self.assertEqual(shader.GetInput("diffuseColor").Get(), Gf.Vec3f(1.0, 0.85, 0.1))
         highlights.set(stage, "gaze", None, None)
-        self.assertEqual(binding.ComputeBoundMaterial()[0].GetPath(), original.GetPath())
+        self.assertEqual(shader.GetInput("opacity").Get(), 0.0)
+        self.assertEqual(
+            binding.ComputeBoundMaterial(materialPurpose=UsdShade.Tokens.full)[0].GetPath(), original.GetPath()
+        )
         self.assertEqual(before, stage.GetRootLayer().ExportToString())
         self.assertEqual(list(stage.GetSessionLayer().subLayerPaths), prepared_layers)
 
@@ -354,19 +505,72 @@ class TestMaterialControls(unittest.TestCase):
         self.assertEqual(highlights._layer.ExportToString(), before)
         self.assertEqual(highlights._owners, {})
 
-    def test_cleanup_discards_an_invalid_closed_stage_wrapper(self):
+    def test_cleanup_restores_owned_layer_without_accessing_closed_stage(self):
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.Cube.Define(stage, "/World/Box")
         material = UsdShade.Material.Define(stage, "/World/Highlight")
         highlights = HIGHLIGHTS.MaterialHighlights()
         highlights.prepare(stage, ["/World/Box"])
         highlights.set(stage, "gaze", "/World/Box", material, 10)
-        # A stage closed by Kit can retain its Python wrapper but fail Boost.Python
-        # argument conversion. An incompatible wrapper exercises that same failure.
+        layer = highlights._layer
+        # The wrapper can outlive its native stage. Cleanup must never pass it to
+        # USD again; the owned Sdf layer is independently valid and editable.
         highlights._stage = object()
-        highlights.clear()
+        with patch.object(HIGHLIGHTS.Usd, "EditContext", side_effect=AssertionError("Stale stage access")):
+            highlights.clear()
+            highlights.clear()  # Teardown callbacks may run more than once.
+        self.assertEqual(highlights._owners, {})
+        opacity = layer.GetAttributeAtPath(highlights._shader_paths["/World/Box"] + ".inputs:opacity")
+        self.assertEqual(opacity.default, 0.0)
+
+    def test_stage_replacement_discards_owners_before_touching_old_stage(self):
+        for replacement in (None, Usd.Stage.CreateInMemory()):
+            with self.subTest(replacement=replacement):
+                stage = Usd.Stage.CreateInMemory()
+                UsdGeom.Cube.Define(stage, "/World/Box")
+                material = UsdShade.Material.Define(stage, "/World/Highlight")
+                highlights = HIGHLIGHTS.MaterialHighlights()
+                highlights.prepare(stage, ["/World/Box"])
+                highlights.set(stage, "gaze", "/World/Box", material, 10)
+                layer = highlights._layer
+                before = layer.ExportToString()
+                highlights._stage = object()
+                with patch.object(HIGHLIGHTS.Usd, "EditContext", side_effect=AssertionError("Stale stage access")):
+                    highlights.set(replacement, "grab:left", None, None)
+                self.assertEqual(layer.ExportToString(), before)
+                self.assertIsNone(highlights._stage)
+                self.assertIsNone(highlights._layer)
+                self.assertEqual(highlights._owners, {})
+                self.assertEqual(highlights._prepared, set())
+
+    def test_prepare_new_stage_does_not_restore_old_stage_bindings(self):
+        previous = Usd.Stage.CreateInMemory()
+        UsdGeom.Cube.Define(previous, "/World/Box")
+        previous_material = UsdShade.Material.Define(previous, "/World/Highlight")
+        highlights = HIGHLIGHTS.MaterialHighlights()
+        highlights.prepare(previous, ["/World/Box"])
+        highlights.set(previous, "gaze", "/World/Box", previous_material, 10)
+        previous_layer = highlights._layer
+        previous_bindings = previous_layer.ExportToString()
+        highlights._stage = object()
+        current = Usd.Stage.CreateInMemory()
+        UsdGeom.Cube.Define(current, "/World/NewBox")
+        current_material = UsdShade.Material.Define(current, "/World/NewHighlight")
+        original_edit_context = HIGHLIGHTS.Usd.EditContext
+
+        def enter_current_stage(stage, layer):
+            self.assertIs(stage, current, "Preparation must not access the previous stage")
+            return original_edit_context(stage, layer)
+
+        with patch.object(HIGHLIGHTS.Usd, "EditContext", side_effect=enter_current_stage):
+            highlights.prepare(current, ["/World/NewBox"])
+            highlights.set(current, "gaze", "/World/NewBox", current_material, 10)
+        self.assertEqual(previous_layer.ExportToString(), previous_bindings)
+        self.assertIs(highlights._stage, current)
+        self.assertEqual(highlights._prepared, {"/World/NewBox"})
+        self.assertEqual(highlights._owners["gaze"][0], "/World/NewBox")
+        highlights.set(None, "gaze", None, None)
         self.assertIsNone(highlights._stage)
         self.assertIsNone(highlights._layer)
         self.assertEqual(highlights._owners, {})
         self.assertEqual(highlights._prepared, set())
-        highlights.clear()  # Teardown callbacks may run more than once.

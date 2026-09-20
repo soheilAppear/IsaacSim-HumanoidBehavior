@@ -195,6 +195,96 @@ class TestArmContactIntegration(unittest.TestCase):
         self.ex._grasp_mode = "assisted"
         self.assertEqual(self.ex._limit_arm_targets_at_contacts(targets, {}), targets)
 
+    def test_walking_downward_package_contact_yields_without_stopping_lift_or_slide(self):
+        self.ex.g1.walking_policy_name = "decoupled"
+        self.ex.g1.uses_explicit_body_efforts = True
+        self.ex._latest_hand_contacts = {"right": [self.contact(eligible=True)]}
+        for vertical, expected in ((-0.1, 0.0), (0.0, 0.0), (0.1, 0.1)):
+            with self.subTest(vertical=vertical):
+                targets = {1: vertical, 3: 0.05}
+                self.ex._smoothed_arm_targets = dict(targets)
+                result = self.ex._limit_arm_targets_at_contacts(targets, {})
+                np.testing.assert_allclose([result[1], result[3]], [expected, 0.05], atol=1e-10)
+                self.assertEqual(self.ex._smoothed_arm_targets, result)
+                self.assertEqual(self.ex._arm_contact_limited["right"], vertical < 0)
+        self.robot.set_dof_positions.assert_not_called()
+        self.robot.set_world_poses.assert_not_called()
+
+    def test_walking_package_contact_limits_rotation_at_contact_point(self):
+        self.ex.g1.walking_policy_name = "decoupled"
+        self.ex.g1.uses_explicit_body_efforts = True
+        self.jacobians[:] = 0.0
+        self.jacobians[0, 1, 0, 1] = 1.0
+        self.jacobians[0, 1, 4, 3] = 1.0
+        self.ex._latest_hand_contacts = {"right": [self.contact(point=(1.1, 2.0, 3.0), eligible=True)]}
+        # Pure wrist rotation would press an off-center palm/finger contact
+        # down into a carton even though the wrist origin has no Z motion.
+        for rotation, expected in ((0.1, 0.0), (-0.1, -0.1)):
+            with self.subTest(rotation=rotation):
+                result = self.ex._limit_arm_targets_at_contacts({1: 0.05, 3: rotation}, {})
+                np.testing.assert_allclose([result[1], result[3]], [0.05, expected], atol=1e-10)
+
+    def test_walking_side_squeeze_and_underside_contact_stay_free(self):
+        self.ex.g1.walking_policy_name = "decoupled"
+        self.ex.g1.uses_explicit_body_efforts = True
+        targets = {1: -0.1, 3: 0.05}
+        for normal in ((1, 0, 0), (-1, 0, 0), (0, 0, -1), (np.sqrt(1 - 0.49**2), 0, 0.49)):
+            with self.subTest(normal=normal):
+                self.ex._latest_hand_contacts = {"right": [self.contact(normal=normal, eligible=True)]}
+                self.assertEqual(self.ex._limit_arm_targets_at_contacts(targets, {}), targets)
+                self.assertFalse(self.ex._arm_contact_limited)
+        self.robot.get_jacobian_matrices.assert_not_called()
+
+    def test_package_contact_projection_requires_physical_walking_and_measured_load(self):
+        targets = {1: -0.1, 3: 0.05}
+        for policy, explicit, grasp, force, blocked in (
+            ("stationary", False, "physical", 1.0, False),
+            ("kinematic", False, "physical", 1.0, False),
+            ("decoupled", False, "physical", 1.0, False),
+            ("decoupled", True, "assisted", 1.0, False),
+            ("decoupled", True, "physical", 0.0, False),
+            ("decoupled", True, "physical", 0.019, False),
+            ("decoupled", True, "physical", 0.02, True),
+        ):
+            with self.subTest(policy=policy, explicit=explicit, grasp=grasp, force=force):
+                self.ex.g1.walking_policy_name = policy
+                self.ex.g1.uses_explicit_body_efforts = explicit
+                self.ex._grasp_mode = grasp
+                self.ex._latest_hand_contacts = {
+                    "right": [GRASP.ContactSample("/World/Box", "palm", (1, 2, 3), (0, 0, 1), force)]
+                }
+                result = self.ex._limit_arm_targets_at_contacts(targets, {})
+                np.testing.assert_allclose([result[1], result[3]], [0 if blocked else -0.1, 0.05], atol=1e-10)
+
+    def test_walking_oblique_package_contact_preserves_contact_tangent(self):
+        self.ex.g1.walking_policy_name = "decoupled"
+        self.ex.g1.uses_explicit_body_efforts = True
+        # At the +Z cutoff, retain the actual oblique contact normal rather
+        # than blocking every downward command or stopping the entire arm.
+        normal = (np.sqrt(0.75), 0, 0.5)
+        self.ex._latest_hand_contacts = {"right": [self.contact(normal=normal, eligible=True)]}
+        result = self.ex._limit_arm_targets_at_contacts({1: -0.1, 3: 0.0}, {})
+        np.testing.assert_allclose([result[1], result[3]], [-0.075, 0.05 * np.sqrt(0.75)], atol=1e-10)
+        self.assertGreaterEqual(normal[2] * result[1] + normal[0] * result[3], -1e-10)
+
+    def test_walking_package_contact_clears_blocked_filter_target_before_reacquisition(self):
+        self.ex.g1.walking_policy_name = "decoupled"
+        self.ex.g1.uses_explicit_body_efforts = True
+        self.ex._last_physics_dt = self.ex._teleop_input_dt = 0.01
+        self.ex._latest_hand_contacts = {"right": [self.contact(eligible=True)]}
+        self.ex._smoothed_arm_targets = {1: -0.15, 3: 0.05}
+        for _ in range(20):
+            targets = self.ex._smooth_and_clamp_arm_targets({1: -0.7, 3: 0.05})
+            result = self.ex._limit_arm_targets_at_contacts(targets, {})
+            self.assertAlmostEqual(result[1], 0.0)
+            self.assertAlmostEqual(self.ex._smoothed_arm_targets[1], 0.0)
+        self.ex._latest_hand_contacts = {"right": []}
+        targets = self.ex._smooth_and_clamp_arm_targets({1: -0.7, 3: 0.05})
+        result = self.ex._limit_arm_targets_at_contacts(targets, {})
+        self.assertLess(result[1], 0.0)
+        self.assertGreaterEqual(result[1], -self.ex._arm_max_joint_speed * 0.01)
+        self.assertFalse(self.ex._arm_contact_limited)
+
     def test_invalid_contact_jacobian_holds_measured_arm_instead_of_original_command(self):
         self.positions[0, 1] = 0.2
         self.positions[0, 3] = -0.2

@@ -12,7 +12,7 @@ from unittest.mock import Mock
 
 import numpy as np
 from humanoid_test_support import HUMANOID, USD, Array, pose
-from pxr import Gf, Usd
+from pxr import Gf, Tf, Usd, UsdGeom
 from test_arm_orientation_controls import PalmDevice
 
 
@@ -105,6 +105,45 @@ class TestArmResponseControls(unittest.TestCase):
             for missing in ("wrist", "middle_proximal"):
                 device.invalid = {missing}
                 self.assertIsNone(ex._get_optical_arm_pose(side, device))
+
+    def test_hidden_markers_do_not_author_usd_when_hand_targets_change_or_tracking_is_lost(self) -> None:
+        ex = self.example
+        ex._create_arm_control_rig()
+        ex._set_grab_candidate = Mock()
+        ex._release_grabbed_object = Mock()
+        edits = []
+        listener = Tf.Notice.Register(
+            Usd.Notice.ObjectsChanged, lambda notice, sender: edits.append(notice), self.stage
+        )
+        try:
+            for x in (0.1, 0.2, 0.3):
+                ex._update_arm_rig_target("right", Gf.Vec3d(x, 0, 0), Gf.Vec3d(1, 2, 3), 0.0)
+            np.testing.assert_allclose(ex._active_g1_hand_target_matrices["right"].ExtractTranslation(), [1.3, 2, 3])
+            for _ in range(5):
+                ex._deactivate_hand("right")
+            self.assertNotIn("right", ex._active_g1_hand_target_matrices)
+            self.assertEqual(edits, [])
+        finally:
+            listener.Revoke()
+
+    def test_debug_marker_toggle_publishes_current_pose_and_tracking_loss_hides_it(self) -> None:
+        ex = self.example
+        ex._create_arm_control_rig()
+        ex._set_grab_candidate = Mock()
+        ex._release_grabbed_object = Mock()
+        marker = UsdGeom.Imageable(self.stage.GetPrimAtPath(f"{ex._arm_rig_target_paths['right']}/TargetMarker"))
+        target_op = ex._arm_rig_target_ops["right"]
+        for enabled, x in ((True, 0.1), (False, 0.2), (True, 0.3)):
+            ex._arm_rig_markers_enabled = enabled
+            ex._update_arm_rig_target("right", Gf.Vec3d(x, 0, 0), Gf.Vec3d(1, 2, 3), 0.0)
+            np.testing.assert_allclose(ex._active_g1_hand_target_matrices["right"].ExtractTranslation(), [1 + x, 2, 3])
+            self.assertEqual(
+                marker.ComputeVisibility(), UsdGeom.Tokens.inherited if enabled else UsdGeom.Tokens.invisible
+            )
+            if enabled:
+                self.assertEqual(target_op.Get(), ex._active_g1_hand_target_matrices["right"])
+        ex._deactivate_hand("right")
+        self.assertEqual(marker.ComputeVisibility(), UsdGeom.Tokens.invisible)
 
 
 if __name__ == "__main__":

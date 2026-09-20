@@ -43,6 +43,7 @@ def main() -> int:
     for bundle in (
         install / "extsDeprecated/omni.isaac.ml_archive/pip_prebundle",
         install / "exts/omni.isaac.ml_archive/pip_prebundle",
+        install / "exts/isaacsim.pip.onnx/pip_prebundle",
     ):
         if bundle.is_dir():
             sys.path.append(str(bundle))

@@ -240,6 +240,57 @@ class TestContactReplayControls(unittest.TestCase):
                             for col in range(3):
                                 self.assertAlmostEqual(measured_frame[row][col], frame[row][col], places=8)
 
+    def test_bulk_optical_descriptors_match_each_existing_joint_pose_and_validity(self):
+        ex = HUMANOID.HumanoidExample()
+        for side in ("left", "right"):
+            namespace = dict(ex=ex, side=side, Gf=Gf, math=math, types=types)
+            exec(HAND_CODE, namespace)
+            hand = namespace["OpticalHand"](Gf.Vec3d(0), Gf.Matrix4d(1))
+            for angle in (0.0, 50.0, 130.0):
+                hand.center = Gf.Vec3d(0.4 + angle * 0.01, -0.2, 0.9 - angle * 0.001)
+                hand.frame = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1, 2, 3).GetNormalized(), angle))
+                for curl, thumb, opposition in ((0.0, None, 0.0), (0.2, 0.5, 0.8), (0.75, 0.15, 0.3), (1.0, 1.0, 1.0)):
+                    with self.subTest(side=side, angle=angle, curl=curl, thumb=thumb, opposition=opposition):
+                        hand.curl, hand.thumb_curl, hand.opposition = curl, thumb, opposition
+                        bulk = hand.get_all_virtual_world_poses()
+                        self.assertEqual(list(bulk), hand.get_pose_names())
+                        for name, descriptor in bulk.items():
+                            previous = hand.get_virtual_world_pose_desc(name)
+                            self.assertEqual(descriptor.validity_flags, previous.validity_flags)
+                            self.assertEqual(descriptor.validity_flags, 2)
+                            self.assertEqual(descriptor.pose_matrix, previous.pose_matrix)
+                        self.assertNotIn("missing_joint", bulk)
+                        self.assertEqual(hand.get_virtual_world_pose_desc("missing_joint").validity_flags, 0)
+
+    def test_physics_snapshot_reads_one_bulk_skeleton_and_refreshes_all_changed_inputs(self):
+        ex = HUMANOID.HumanoidExample()
+        for side in ("left", "right"):
+            namespace = dict(ex=ex, side=side, Gf=Gf, math=math, types=types)
+            exec(HAND_CODE, namespace)
+            hand = namespace["OpticalHand"](Gf.Vec3d(0.4, -0.2, 0.9), Gf.Matrix4d(1))
+            with mock.patch.object(hand, "get_all_virtual_world_poses", wraps=hand.get_all_virtual_world_poses) as bulk:
+                with mock.patch.object(
+                    hand, "get_virtual_world_pose_desc", side_effect=AssertionError("Per-joint replay rebuild used")
+                ):
+                    for index, (curl, thumb, opposition) in enumerate(((0.2, 0.1, 0.8), (0.75, 0.35, 0.3), (0, 0, 0))):
+                        hand.center = Gf.Vec3d(0.4 + index, -0.2 + index * 0.1, 0.9 + index * 0.2)
+                        hand.frame = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1, 2, 3).GetNormalized(), index * 50))
+                        hand.curl, hand.thumb_curl, hand.opposition = curl, thumb, opposition
+                        ex._teleop_step_hand_samples = {"devices": {}, "samples": {}}
+                        parsed = ex._get_hand_tracking_finger_curls(hand)
+                        palm = ex._get_optical_arm_pose(side, hand)
+                        frame = ex._get_optical_palm_frame(side, hand)
+                        self.assertEqual(bulk.call_count, index + 1)
+                        for role in ("index", "middle", "ring", "little"):
+                            self.assertAlmostEqual(parsed[role], curl, delta=1e-6)
+                        self.assertAlmostEqual(parsed["thumb"], thumb, delta=1e-6)
+                        self.assertAlmostEqual(parsed["thumb_yaw"], opposition, delta=1e-6)
+                        self.assertLess((palm.ExtractTranslation() - hand.center).GetLength(), 1e-8)
+                        for row in range(3):
+                            for column in range(3):
+                                self.assertAlmostEqual(frame[row][column], hand.frame[row][column], places=8)
+        ex._teleop_step_hand_samples = None
+
 
 class TestContactReplayMimicPreflight(unittest.IsolatedAsyncioTestCase):
     async def run_preflight(

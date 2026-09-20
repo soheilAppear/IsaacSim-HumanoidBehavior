@@ -148,6 +148,8 @@ async def _validate_contact_grasp(ex, config):
     provenance = None
     provenance_path = None
     side = config["side"]
+    locomotion_overrides = {}
+    gaze_before = getattr(ex, "_eye_gaze_tracker", None)
 
     def write_provenance(ended=False):
         nonlocal provenance, provenance_path
@@ -206,6 +208,43 @@ async def _validate_contact_grasp(ex, config):
             raise RuntimeError("Missing live object pose: " + path)
         return vector(pose[0])
 
+    def handle_position(path):
+        """Read a handle through its live rigid pose, never its stale USD pose."""
+        prim = stage.GetPrimAtPath(path)
+        attribute = prim.GetAttribute("g1:gripCenterLocal")
+        local = attribute.Get() if attribute else None
+        pose = ex._get_object_world_pose(path)
+        if local is None or pose is None or not all(math.isfinite(float(v)) for v in local):
+            raise RuntimeError("Package has no finite measured handle pose: " + path)
+        rotation = Gf.Matrix4d().SetRotate(pose[1])
+        return vector(pose[0]) + rotation.TransformDir(vector(local))
+
+    def check_handle_reach(targets, desired_frame):
+        """Reject wrist targets outside the measured shoulder/elbow/wrist span."""
+        points = []
+        for role in ("shoulder", "elbow", "wrist"):
+            entry = ex._get_webcam_robot_link(side, role)
+            if entry is None:
+                raise RuntimeError("Cannot measure live " + role + " for handle reach preflight")
+            point = vector(ex._first_pose_value(entry[1].get_world_poses()[0]))
+            if not all(math.isfinite(float(value)) for value in point):
+                raise RuntimeError("Nonfinite measured arm link")
+            points.append(point)
+        span = (points[1] - points[0]).GetLength() + (points[2] - points[1]).GetLength()
+        if not 0.2 <= span <= 0.7:
+            raise RuntimeError("Implausible measured robot arm span")
+        wrist_rotation = ex._get_robot_palm_local_frame(side).GetInverse() * desired_frame
+        palm_offset = wrist_rotation.TransformDir(ex._get_robot_palm_local_center(side))
+        measurements = []
+        for label, target in targets.items():
+            distance = float((target - palm_offset - points[0]).GetLength())
+            measurements.append({"phase": label, "wrist_distance_m": distance, "arm_span_m": float(span)})
+        report["reach_preflight"] = measurements
+        # A small tolerance covers the shoulder-roll/pitch pivot offset, not an
+        # invented extension of the G1 arm. Actual IK error is checked after reach.
+        if any(item["wrist_distance_m"] > span + 0.025 for item in measurements):
+            raise RuntimeError("Handle approach/lift is outside measured arm reach; walk closer first")
+
     def palm_pose():
         position, orientation = ex._get_hand_link_prim(side).get_world_poses()
         wrist = vector(ex._first_pose_value(position))
@@ -242,12 +281,34 @@ async def _validate_contact_grasp(ex, config):
             rotation = 2.0 * math.acos(min(1.0, abs(float(np.dot(orientation, root_start[1])))))
             report["max_root_translation_m"] = max(report["max_root_translation_m"], displacement)
             report["max_root_rotation_rad"] = max(report["max_root_rotation_rad"], rotation)
-            if displacement > 0.001 or rotation > 0.001:
+            if config.get("fixture") == "tall_package":
+                up_dot = float(1 - 2 * (orientation[1] ** 2 + orientation[2] ** 2))
+                linear, angular = ex.g1.robot.get_velocities()
+                velocity = vector(ex._first_pose_value(linear))
+                angular_velocity = vector(ex._first_pose_value(angular))
+                values = (*velocity, *angular_velocity, up_dot)
+                if not all(math.isfinite(float(value)) for value in values):
+                    raise RuntimeError("Nonfinite walking balance state")
+                if displacement > 0.25 or position[2] < 0.45 or up_dot < math.cos(math.radians(35)):
+                    raise RuntimeError("Walking grasp balance drift, height, or tilt guard failed")
+                if math.hypot(*velocity[:2]) > 0.8 or abs(angular_velocity[2]) > 1.2:
+                    raise RuntimeError("Walking grasp velocity guard failed")
+                if any(abs(float(value)) > 1e-6 for value in ex._base_command):
+                    raise RuntimeError("Walking command became nonzero during the balanced grasp test")
+                if ex._eye_gaze_tracker is not gaze_before:
+                    raise RuntimeError("Gaze tracker changed during grasp replay")
+                report["minimum_up_dot"] = min(report.get("minimum_up_dot", 1.0), up_dot)
+                report["minimum_pelvis_height_m"] = min(report.get("minimum_pelvis_height_m", math.inf), float(position[2]))
+            elif displacement > 0.001 or rotation > 0.001:
                 raise RuntimeError("Stationary robot root moved")
         if phase_stats is not None and active_path is not None:
             position = object_position(active_path)
             phase_stats["object_z_min"] = min(phase_stats["object_z_min"], float(position[2]))
             phase_stats["object_z_max"] = max(phase_stats["object_z_max"], float(position[2]))
+            if config.get("fixture") == "tall_package":
+                handle_z = float(handle_position(active_path)[2])
+                phase_stats["handle_z_min"] = min(phase_stats.get("handle_z_min", handle_z), handle_z)
+                phase_stats["handle_z_max"] = max(phase_stats.get("handle_z_max", handle_z), handle_z)
             result = ex._physical_grasp_results.get(side)
             phase_stats["sample_count"] += 1
             if result is not None and result.contact_supported and result.object_path == active_path:
@@ -366,6 +427,18 @@ async def _validate_contact_grasp(ex, config):
                 validity_flags=2 if point is not None else 0,
             )
 
+        def get_all_virtual_world_poses(self):
+            """Match native bulk input without rebuilding the skeleton per joint.
+
+            Production copies and shares this dictionary inside its current
+            callback. Every call here remains fresh: no synthetic pose or curl
+            survives a changed endpoint through an adapter-side cache.
+            """
+            return {
+                name: types.SimpleNamespace(pose_matrix=Gf.Matrix4d(1.0).SetTranslate(point), validity_flags=2)
+                for name, point in self.positions().items()
+            }
+
         def get_input_names(self):
             return []
 
@@ -412,6 +485,9 @@ async def _validate_contact_grasp(ex, config):
             "settled_force_samples": 0, "settled_force_sum_total_n": 0.0,
             "settled_force_sum_min_n": None, "settled_force_sum_mean_n": None,
         }
+        if config.get("fixture") == "tall_package":
+            handle_z = float(handle_position(active_path)[2])
+            phase_stats.update(handle_z_min=handle_z, handle_z_max=handle_z)
         case["phases"][name] = phase_stats
         report["phase"] = case["name"] + "/" + name
         await save()
@@ -470,8 +546,23 @@ async def _validate_contact_grasp(ex, config):
         if ex is None or ex.g1 is None or not ex.g1.robot.is_physics_tensor_entity_valid():
             raise RuntimeError("Load the Humanoid and initialize physics before running this test")
         report["actual_hand_mimic_parameters"] = snapshot_hand_mimics()
-        if ex._g1_locomotion != "stationary" or ex._grasp_mode != "physical":
-            raise RuntimeError("This test requires stationary mode with physical grasping")
+        expected_locomotion = "policy" if config.get("fixture") == "tall_package" else "stationary"
+        if ex._g1_locomotion != expected_locomotion or ex._grasp_mode != "physical":
+            raise RuntimeError("This test requires " + expected_locomotion + " mode with physical grasping")
+        if config.get("fixture") == "tall_package":
+            if ex.g1.walking_policy_name != "decoupled" or not ex._gesture_locomotion_enabled or side != "right":
+                raise RuntimeError("Tall package replay requires the decoupled walking policy and right hand")
+            if any(path not in ex._spawned_sample_box_paths for path in config["paths"]):
+                raise RuntimeError("Tall package must be a registered physical grasp object")
+            for path in config["paths"]:
+                handle_position(path)
+            locomotion_overrides["_read_navigation_hand"] = (
+                "_read_navigation_hand" in vars(ex), vars(ex).get("_read_navigation_hand")
+            )
+            ex._read_navigation_hand = lambda: (None, None, None, None)
+            ex._reset_gesture_locomotion()
+            for name in ("_base_command", "_keyboard_command", "_controller_command"):
+                getattr(ex, name)[:] = 0.0
         if ex._xr_core is None or ex._contact_reader is None:
             raise RuntimeError("XR input and the physical contact reader must be initialized")
         if not ex.g1.has_finger_control():
@@ -516,7 +607,8 @@ async def _validate_contact_grasp(ex, config):
         original_reader = ex._get_xr_input_device
         ex._get_xr_input_device = lambda handle: (
             input_hand if handle == "/user/hand/" + side else
-            None if handle in ("/user/hand/left", "/user/hand/right") else original_reader(handle)
+            None if config.get("fixture") != "tall_package" and handle in ("/user/hand/left", "/user/hand/right")
+            else original_reader(handle)
         )
         contact_reader = ex._contact_reader
         contact_had_override = "read" in vars(contact_reader)
@@ -531,7 +623,8 @@ async def _validate_contact_grasp(ex, config):
             requested_curls = {role: profile["curl"] for role in ex._finger_roles}
             requested_curls.update(thumb=profile["thumb_curl"], thumb_yaw=profile["opposition"])
             case = {
-                "name": "cube" if path.endswith("00") else "cylinder", "path": path, "phases": {},
+                "name": "tall_package" if config.get("fixture") == "tall_package" else
+                        "cube" if path.endswith("00") else "cylinder", "path": path, "phases": {},
                 "profile": profile, "requested_finger_curls": requested_curls,
             }
             report["cases"][path] = case
@@ -540,6 +633,8 @@ async def _validate_contact_grasp(ex, config):
                 raise RuntimeError("Open-hand precondition failed; measured fingers remain closed before reaching")
             start_position = object_position(path)
             case["start_position"] = list(start_position)
+            grasp_position = handle_position(path) if config.get("fixture") == "tall_package" else start_position
+            case["grasp_feature_start_position"] = list(grasp_position)
             current_center, current_frame = palm_pose()
             letter = "L" if side == "left" else "R"
             landmarks = {}
@@ -553,27 +648,42 @@ async def _validate_contact_grasp(ex, config):
             gap_local = current_frame.GetInverse().TransformDir(gap_offset)
             direction = Gf.Vec3d(*config["finger_direction"]).GetNormalized()
             normal = Gf.Vec3d(*config["palm_normal"])
+            if config.get("fixture") == "tall_package":
+                package_rotation = Gf.Matrix4d().SetRotate(ex._get_object_world_pose(path)[1])
+                direction = package_rotation.TransformDir(direction).GetNormalized()
+                normal = package_rotation.TransformDir(normal).GetNormalized()
             normal -= direction * Gf.Dot(normal, direction)
             normal.Normalize()
             transverse = Gf.Cross(normal, direction).GetNormalized()
             desired_frame = Gf.Matrix4d(
                 *direction, 0.0, *transverse, 0.0, *normal, 0.0, 0.0, 0.0, 0.0, 1.0
             )
-            grasp_target = start_position - desired_frame.TransformDir(gap_local) + Gf.Vec3d(*profile["offset"])
+            grasp_target = grasp_position - desired_frame.TransformDir(gap_local) + Gf.Vec3d(*profile["offset"])
             case["measured_gap_offset_local"] = list(gap_local)
             case["grasp_palm_target"] = list(grasp_target)
             case["palm_normal_world"] = list(normal)
             case["finger_direction_world"] = list(direction)
-            clearance = max(float(start_position[2]) + 0.20, 1.06)
+            clearance = max(float(grasp_position[2]) + 0.12, 0.95) if config.get("fixture") == "tall_package" else max(float(start_position[2]) + 0.20, 1.06)
+            if config.get("fixture") == "tall_package":
+                check_handle_reach({
+                    "above_handle": Gf.Vec3d(grasp_target[0], grasp_target[1], clearance),
+                    "approach": grasp_target,
+                    "lift": grasp_target + Gf.Vec3d(0, 0, config["lift"]),
+                }, desired_frame)
+                await save()
             await phase(case, "raise_clear", 1.7, Gf.Vec3d(current_center[0], current_center[1], clearance))
             input_hand.frame = desired_frame
             await phase(case, "align_above_object", 2.0, Gf.Vec3d(grasp_target[0], grasp_target[1], clearance))
             await phase(case, "approach", 2.0, grasp_target)
+            if config.get("fixture") == "tall_package" and case["phases"]["approach"]["palm_position_error_m"] > 0.08:
+                raise RuntimeError("Measured palm did not reach the handle target within 8 cm")
             await phase(case, "close", 1.5, curl=profile["curl"], opposition=profile["opposition"], thumb_curl=profile["thumb_curl"])
             await phase(case, "lift", 2.0, grasp_target + Gf.Vec3d(0, 0, config["lift"]))
             await phase(case, "hold", config["hold"])
             held_position = object_position(path)
             case["held_position"] = list(held_position)
+            if config.get("fixture") == "tall_package":
+                case["held_handle_position"] = list(handle_position(path))
             await phase(case, "release", 0.8, curl=0.0, opposition=0.0, thumb_curl=0.0)
             await phase(case, "drop_observation", 1.0)
             final_position = object_position(path)
@@ -586,9 +696,12 @@ async def _validate_contact_grasp(ex, config):
                 "actual_object_contact": case["phases"]["close"]["contact_samples"] > 0,
                 "opposing_contacts_during_hold": case["hold_supported_fraction"] >= 0.5,
                 "lifted_and_held": case["minimum_hold_lift_m"] >= config["min_lift"],
-                "fell_after_opening": case["release_drop_m"] >= 0.025,
+                "fell_after_opening": case["release_drop_m"] >= config.get("min_release_drop", 0.025),
                 "contact_released": case["phases"]["drop_observation"]["supported_samples"] == 0,
             }
+            if config.get("fixture") == "tall_package":
+                case["minimum_hold_handle_lift_m"] = hold_stats.get("handle_z_min", -math.inf) - float(grasp_position[2])
+                case["checks"]["handle_lifted_and_held"] = case["minimum_hold_handle_lift_m"] >= config["min_lift"]
             case["status"] = "passed" if all(case["checks"].values()) else "failed"
             await phase(case, "retract", 1.0, Gf.Vec3d(current_center[0], current_center[1], clearance))
             await save()
@@ -626,6 +739,18 @@ async def _validate_contact_grasp(ex, config):
                         delattr(contact_reader, "read")
                 except Exception as error:
                     restore_errors.append("Contact reader restore: " + str(error))
+            if config.get("fixture") == "tall_package":
+                try:
+                    ex._reset_gesture_locomotion()
+                    for name in ("_base_command", "_keyboard_command", "_controller_command"):
+                        getattr(ex, name)[:] = 0.0
+                    for name, (was_overridden, value) in locomotion_overrides.items():
+                        if was_overridden:
+                            setattr(ex, name, value)
+                        else:
+                            vars(ex).pop(name, None)
+                except Exception as error:
+                    restore_errors.append("Navigation input restore: " + str(error))
             report["restored"] = not restore_errors
             report["restore_errors"] = restore_errors
             # Timeline commands are queued. Bound this wait independently from

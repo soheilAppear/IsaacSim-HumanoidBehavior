@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from humanoid_test_support import GRASP, HUMANOID, USD
-from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics
 
 
 class TestPhysicalGraspIntegrationControls(unittest.TestCase):
@@ -311,8 +311,9 @@ class TestPhysicalGraspIntegrationControls(unittest.TestCase):
 
     def test_larger_practice_shapes_keep_correct_bounds_clearance_light_mass_and_colors(self):
         ex = self.ex
-        table_top = 0.812
-        ex._get_work_surface_tops = Mock(return_value=[(0.5, -0.28, 0.0, table_top, 1.0, 0.6)])
+        table_top = ex._front_work_surface_height
+        center_x, center_y, yaw = ex._work_surface_placements[0]
+        ex._get_work_surface_tops = Mock(return_value=[(center_x, center_y, yaw, table_top, 0.918, 0.422)])
         ex._create_sample_boxes()
         self.assertEqual(len(ex._spawned_sample_box_paths), 6)
         objects = (
@@ -353,10 +354,11 @@ class TestPhysicalGraspIntegrationControls(unittest.TestCase):
                 self.assertAlmostEqual(world_bounds.GetMin()[2] - table_top, 0.003)
                 # The measured extended palm reaches about X=0.49 at this base
                 # position; keep practice centers closer than that outer limit.
-                self.assertLessEqual(world_bounds.GetMidpoint()[0], 0.47)
-                # The live front table spans X=0.289..0.711, Y=-0.739..0.179.
+                self.assertLessEqual(world_bounds.GetMidpoint()[0], 0.441)
+                self.assertLessEqual(abs(world_bounds.GetMidpoint()[1]), 0.161)
+                # The centred table spans X=0.249..0.671, Y=-0.459..0.459.
                 # Retain a margin from its edges and room for fingers between props.
-                for axis, (minimum, maximum) in enumerate(((0.289, 0.711), (-0.739, 0.179))):
+                for axis, (minimum, maximum) in enumerate(((0.249, 0.671), (-0.459, 0.459))):
                     self.assertGreater(world_bounds.GetMin()[axis], minimum + 0.02)
                     self.assertLess(world_bounds.GetMax()[axis], maximum - 0.02)
                 self.assertAlmostEqual(prim.GetAttribute("g1:packageSize").Get(), max(dimensions))
@@ -378,6 +380,31 @@ class TestPhysicalGraspIntegrationControls(unittest.TestCase):
                     for axis in (0, 1)
                 )
                 self.assertGreaterEqual(gap + 1e-7, 0.045)
+
+    def test_front_table_height_keeps_feet_grounded_and_horizontal_dimensions(self):
+        wrapper = UsdGeom.Xform.Define(self.stage, "/World/Table")
+        wrapper.AddTranslateOp().Set(Gf.Vec3d(0.46, 0.0, 0.0))
+        wrapper.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 90.0))
+        asset = UsdGeom.Cube.Define(self.stage, "/World/Table/Asset")
+        asset.CreateSizeAttr(1.0)
+        # Deliberately offset the model origin: its bottom starts above zero.
+        asset.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.425))
+        asset.AddScaleOp().Set(Gf.Vec3f(0.92, 0.42, 0.82))
+        UsdPhysics.CollisionAPI.Apply(asset.GetPrim())
+        self.ex._fit_work_surface_height(wrapper, self.ex._front_work_surface_height)
+        bounds = (
+            UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default"])
+            .ComputeWorldBound(wrapper.GetPrim())
+            .ComputeAlignedRange()
+        )
+        self.assertAlmostEqual(bounds.GetMin()[2], 0.0, places=6)
+        self.assertAlmostEqual(bounds.GetMax()[2], 0.92, places=6)
+        self.assertAlmostEqual(bounds.GetSize()[0], 0.42, places=6)
+        self.assertAlmostEqual(bounds.GetSize()[1], 0.92, places=6)
+        self.assertAlmostEqual(bounds.GetMidpoint()[0], 0.46, places=6)
+        self.assertAlmostEqual(bounds.GetMidpoint()[1], 0.0, places=6)
+        self.assertTrue(asset.GetPrim().HasAPI(UsdPhysics.CollisionAPI))
+        self.assertFalse(asset.GetPrim().HasAPI(UsdPhysics.RigidBodyAPI))
 
 
 class TestPhysicalHandCouplingControls(unittest.TestCase):

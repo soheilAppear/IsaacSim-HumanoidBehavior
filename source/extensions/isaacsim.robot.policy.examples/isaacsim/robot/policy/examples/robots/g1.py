@@ -18,10 +18,15 @@
 Stationary mode anchors the pelvis to the world before physics starts. It holds
 the standing posture, ignores base commands, and leaves arms/fingers articulated.
 
-Policy mode runs the bundled Unitree recurrent actor at 50 Hz and controls only
-its twelve leg joints. The interactive example owns the arms and fingers. The
-existing station-hold and turn-hold options assist the root pose; this wrapper
-is not a whole-body manipulation or balance policy.
+Legacy policy mode runs the bundled recurrent actor for twelve leg joints.
+``physical_locomotion`` runs the pinned GR00T balance/walk pair at 50 Hz, with
+its own initial pose, observation history and actuator settings. The actors own
+only legs and waist and observe independently driven arms. Their 200 Hz explicit,
+torque-limited body PD matches the released deployment. This mode disables root
+assists and kinematic fallback; faults require the caller to pause physics.
+An optional project feature adds model gravity compensation only to the fourteen
+externally controlled arm joints; the learned leg/waist PD stays unchanged.
+Fingers remain independently controlled.
 
 Kinematic mode integrates the commanded base velocity with gravity disabled.
 Missing or incompatible walking assets select that mode before joint defaults
@@ -31,6 +36,7 @@ are created. See docs/humanoid-control.md for frames, validation, and limitation
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import carb
@@ -44,6 +50,9 @@ from isaacsim.core.experimental.utils.stage import define_prim
 from isaacsim.storage.native import get_assets_root_path
 from omni.physics.core import get_physics_simulation_interface
 from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics
+
+from .g1_decoupled_policy import G1DecoupledPolicy
+from .g1_foot_contacts import configure_decoupled_foot_contacts
 
 
 class G1TeleopRobot:
@@ -67,7 +76,16 @@ class G1TeleopRobot:
         sensor_variant: ``"None"`` skips the onboard RealSense/Livox prims.
         locomotion: ``"stationary"`` for anchored manipulation, ``"policy"`` for walking,
             or ``"kinematic"`` for a movable avatar.
-        walk_policy_path: Optional replacement TorchScript checkpoint with the same interface.
+        walk_policy_path: Optional legacy TorchScript path. Physical mode uses
+            its paired, hash-validated packaged ONNX checkpoints exclusively.
+        physical_locomotion: Require unassisted, gravity-driven policy locomotion.
+            Valid only with ``locomotion="policy"``. The caller must pause physics
+            when initialization or ``forward`` raises a locomotion fault.
+            ``G1_WALK_POLICY`` may be unset or ``decoupled``; other values fail.
+        arm_gravity_compensation: Add model-based holding torques to the fourteen
+            external arm joints in physical decoupled mode. This project option
+            preserves the policy's lower-body PD and all motor effort limits.
+            It compensates robot-link gravity, not contact or payload forces.
     """
 
     #: Joint angles (rad) that define the standing posture. Joints left out stay at 0,
@@ -287,7 +305,26 @@ class G1TeleopRobot:
         sensor_variant: str = "None",
         locomotion: str = "kinematic",
         walk_policy_path: str | None = None,
+        physical_locomotion: bool = False,
+        arm_gravity_compensation: bool = False,
     ):
+        if physical_locomotion and locomotion != "policy":
+            raise ValueError("physical_locomotion requires locomotion='policy'")
+        if arm_gravity_compensation and not physical_locomotion:
+            raise ValueError("arm_gravity_compensation requires physical_locomotion=True")
+        self._physical_locomotion = bool(physical_locomotion)
+        self._arm_gravity_compensation = bool(arm_gravity_compensation)
+        self._locomotion_fault = None
+        self._velocity_policy = None
+        self._walk_policy_kind = locomotion
+        if physical_locomotion:
+            selection = os.environ.get("G1_WALK_POLICY", "decoupled").strip().lower()
+            self._walk_policy_kind = selection
+            if selection != "decoupled":
+                raise ValueError(f"Unknown physical walking policy {selection!r}; expected decoupled")
+            if walk_policy_path is not None:
+                raise ValueError("Decoupled WBC requires its paired packaged checkpoints, not walk_policy_path")
+            self._velocity_policy = G1DecoupledPolicy()
         assets_root_path = get_assets_root_path()
         if usd_path is None:
             usd_path = assets_root_path + "/Isaac/Robots/Unitree/G1/g1.usd"
@@ -326,6 +363,10 @@ class G1TeleopRobot:
         # the referenced robot instead of onto the stage prim this example owns.
         self._set_spawn_transform(position, orientation)
         self._configure_stationary_anchor()
+        self._author_stationary_arm_pose()
+        self._author_physical_walk_pose()
+        if self.uses_explicit_body_efforts:
+            configure_decoupled_foot_contacts(omni.usd.get_context().get_stage(), prim_path)
         self.robot = Articulation(paths=prim_path)
 
         self.default_pos = None
@@ -513,6 +554,85 @@ class G1TeleopRobot:
             count += 1
         carb.log_info(f"G1TeleopRobot: gravity disabled={disabled} on {count} links of {self._prim_path}")
 
+    def _author_stationary_arm_pose(self) -> None:
+        """Place stationary arms in their ready pose before the first solver step.
+
+        The referenced G1 can contain an extended arm pose. Waiting until
+        ``initialize()`` sets tensor positions is too late: it runs after the
+        first physics step, when those hands can already strike tabletop props.
+        PhysX's articulation-only JointStateAPI supplies the initial state in
+        degrees; this agrees with the radian defaults used by ``initialize()``.
+
+        Author only the fourteen named arm joints in stationary mode. Finger
+        states and mimic constraints retain their asset configuration. Existing
+        arm drives receive the matching starting targets without changing gains,
+        limits, or drive types. Never call this as part of per-frame control.
+        """
+        if self._locomotion != "stationary":
+            return
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath(self._prim_path) if stage is not None else None
+        if not (root and root.IsValid()):
+            return
+        names = {f"{side}_{role}_joint" for side in ("left", "right") for role in self.WALK_ARM_JOINT_ORDER}
+        count = 0
+        for prim in Usd.PrimRange(root):
+            name = prim.GetName()
+            if name not in names or not prim.IsA(UsdPhysics.RevoluteJoint):
+                continue
+            position_deg = math.degrees(self.DEFAULT_STANDING_POSE.get(name, 0.0))
+            state = PhysxSchema.JointStateAPI.Apply(prim, "angular")
+            state.CreatePositionAttr().Set(position_deg)
+            state.CreateVelocityAttr().Set(0.0)
+            drive = UsdPhysics.DriveAPI(prim, "angular")
+            if drive:
+                drive.CreateTargetPositionAttr().Set(position_deg)
+                drive.CreateTargetVelocityAttr().Set(0.0)
+            count += 1
+        carb.log_info(f"G1TeleopRobot: authored the stationary starting pose for {count} arm joints before physics")
+
+    def _author_physical_walk_pose(self) -> None:
+        """Author the physical policy's initial joint state before the first solve.
+
+        All body joints use the checkpoint's initial pose and actuator settings
+        so loading cannot sweep an unrelated authored pose across nearby props.
+        Finger and mimic states remain the hand asset's authored configuration.
+        JointStateAPI uses degrees, while the policy and tensor API use radians.
+        """
+        if not getattr(self, "_physical_locomotion", False):
+            return
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath(self._prim_path) if stage is not None else None
+        if not (root and root.IsValid()):
+            raise ValueError("G1TeleopRobot: physical walking requires a valid robot prim")
+        policy = self._velocity_policy
+        defaults = dict(zip(policy.joint_names, getattr(policy, "initial_positions", policy.default_positions)))
+        for prim in Usd.PrimRange(root):
+            name = prim.GetName()
+            if name not in defaults or not prim.IsA(UsdPhysics.RevoluteJoint):
+                continue
+            position_deg = math.degrees(defaults[name])
+            state = PhysxSchema.JointStateAPI.Apply(prim, "angular")
+            state.CreatePositionAttr().Set(position_deg)
+            state.CreateVelocityAttr().Set(0.0)
+            drive = UsdPhysics.DriveAPI(prim, "angular")
+            if drive:
+                drive.CreateTargetPositionAttr().Set(position_deg)
+                drive.CreateTargetVelocityAttr().Set(0.0)
+                index = policy.joint_names.index(name)
+                # USD angular drive gains use degrees; tensor gains use radians.
+                drive.CreateStiffnessAttr().Set(float(policy.stiffness[index]) * math.pi / 180.0)
+                drive.CreateDampingAttr().Set(float(policy.damping[index]) * math.pi / 180.0)
+                if policy.effort_limits is not None:
+                    drive.CreateMaxForceAttr().Set(float(policy.effort_limits[index]))
+                drive.CreateTypeAttr().Set("force")
+            index = policy.joint_names.index(name)
+            joint_api = PhysxSchema.PhysxJointAPI.Apply(prim)
+            if policy.armature is not None:
+                joint_api.CreateArmatureAttr().Set(float(policy.armature[index]))
+            if policy.velocity_limits is not None:
+                joint_api.CreateMaxJointVelocityAttr().Set(math.degrees(float(policy.velocity_limits[index])))
+
     """
     Lifecycle.
     """
@@ -520,6 +640,10 @@ class G1TeleopRobot:
     def initialize(self) -> None:
         """Configure drives, gains and the standing posture. Call once physics is running."""
         self._initialized = False
+        # Stop destroys tensor views before Play recreates them. A callback that
+        # arrives during that transition must not access the preceding episode.
+        if not self.robot.is_physics_tensor_entity_valid():
+            return
         dof_names = list(self.robot.dof_names)
         if not dof_names:
             carb.log_warn("G1TeleopRobot: articulation reports no DOFs; initialization skipped.")
@@ -549,7 +673,12 @@ class G1TeleopRobot:
             default_positions = np.zeros(len(dof_names), dtype=np.float32)
         for index in self._body_dof_indices:
             default_positions[index] = 0.0
-        if self._locomotion == "policy":
+        if getattr(self, "_physical_locomotion", False):
+            policy = self._velocity_policy
+            initial_positions = getattr(policy, "initial_positions", policy.default_positions)
+            for name, angle in zip(policy.joint_names, initial_positions):
+                default_positions[dof_names.index(name)] = angle
+        elif self._locomotion == "policy":
             # Match the pose the policy was trained around: the crouched leg stance its
             # actions are offsets from, and waist/arms at zero as its deployment config
             # holds them. The teleoperation layer takes the arms over from there.
@@ -580,6 +709,12 @@ class G1TeleopRobot:
         self.default_vel = torch.tensor(default_velocities, device=device)
 
         self._apply_body_joint_gains(dof_names)
+        if self.uses_explicit_body_efforts:
+            # Position targets remain the shared command buffer: the actor owns
+            # legs/waist and teleoperation owns arms. Only explicit PD actuates it.
+            self.robot.set_dof_position_targets(
+                [default_positions[self._velocity_dof_indices]], dof_indices=self._velocity_dof_indices
+            )
         self._configure_finger_dofs(dof_names)
         self._apply_articulation_properties()
 
@@ -597,28 +732,59 @@ class G1TeleopRobot:
         self._initialized = True
         carb.log_info(f"G1TeleopRobot: initialized with {len(dof_names)} DOFs: {dof_names}")
 
+    def invalidate_physics_state(self) -> None:
+        """Discard episode control state after Stop without touching dead tensors.
+
+        The owning example calls this on timeline Stop and when a tensor view
+        becomes unavailable. A subsequent Play must initialize the new physics
+        episode before driving joints. Faults remain latched until explicit reset.
+        """
+        self._initialized = False
+        self._reset_walk_policy_state(clear_fault=False)
+
     def post_reset(self) -> None:
         """Restore the default articulation state, the spawn base pose and the policy state."""
+        if not self._initialized or not self.robot.is_physics_tensor_entity_valid():
+            self.invalidate_physics_state()
+            raise RuntimeError("G1 reset requires an initialized, valid physics articulation")
         self.robot.reset_to_default_state()
         self._base_position = list(self._spawn_position)
         self._base_yaw = self._spawn_yaw
         self._reset_walk_policy_state()
+        if self.uses_explicit_body_efforts:
+            self.robot.set_dof_efforts(np.zeros((1, 29), dtype=np.float32), dof_indices=self._velocity_dof_indices)
 
-    def forward(self, dt: float, command: object) -> None:
+    def forward(self, dt: float, command: object, *, defer_body_efforts: bool = False) -> None:
         """Advance the base and hold the posture the operator is not driving.
 
         Args:
             dt: Physics timestep in seconds.
             command: Base command velocities ``(v_x, v_y, w_z)`` in m/s and rad/s.
+            defer_body_efforts: Let an integrated teleoperator update arm targets
+                before calling ``apply_body_efforts()`` once in the same physics
+                callback. The caller must perform that final update before the
+                next simulation step. Standalone callers keep the default.
         """
+        physical = getattr(self, "_physical_locomotion", False)
+        if physical and self.locomotion_fault:
+            raise RuntimeError(self.locomotion_fault)
         if not self._initialized or not math.isfinite(dt) or dt <= 0.0:
             return
+        if not self.robot.is_physics_tensor_entity_valid():
+            self.invalidate_physics_state()
+            return
+        if physical and (self._locomotion != "policy" or self._walk_policy is None):
+            self._fail_physical_locomotion("Physical walking has no active policy")
         if self._locomotion == "stationary":
             # The solver owns the world anchor. Never integrate/teleport the base,
             # even if a caller accidentally supplies a nonzero velocity command.
             posture_indices = self._body_dof_indices
         elif self._locomotion == "policy" and self._walk_policy is not None:
-            if not self._update_idle_hold(dt, command):
+            if physical:
+                # Zero command still needs the balance actor. No root transforms,
+                # velocity overrides, or idle constraints are written in this mode.
+                self._step_velocity_policy(dt, command)
+            elif not self._update_idle_hold(dt, command):
                 self._step_walk_policy(dt, command)
                 self._update_turn_in_place(dt, command)
             posture_indices = self._posture_dof_indices
@@ -633,19 +799,210 @@ class G1TeleopRobot:
             self.robot.set_dof_position_targets(
                 [self._default_dof_positions[posture_indices]], dof_indices=posture_indices
             )
+        if not defer_body_efforts:
+            self.apply_body_efforts()
+
+    def apply_body_efforts(self) -> None:
+        """Refresh decoupled-WBC motor torques from the latest body targets.
+
+        Call once per 200 Hz physics step, after updating any arm targets. Forward
+        also calls this for standalone users unless ``defer_body_efforts=True``.
+        A later call simply replaces the same effort buffer and does not integrate
+        or apply an additional impulse.
+        Fingers retain their independent drives. No root force is ever written.
+        Optional arm gravity feedforward is added before the same motor clipping;
+        it never changes the fifteen actor-owned leg/waist efforts.
+        """
+        if not self.uses_explicit_body_efforts:
+            return
+        if self.locomotion_fault:
+            raise RuntimeError(self.locomotion_fault)
+        if not self._initialized:
+            return
+        if not self.robot.is_physics_tensor_entity_valid():
+            self.invalidate_physics_state()
+            return
+        indices = getattr(self, "_velocity_dof_indices", [])
+        try:
+            if len(indices) != 29 or len(set(indices)) != 29:
+                raise ValueError("Explicit body PD requires 29 uniquely mapped motor joints")
+            policy = self._velocity_policy
+            stiffness = np.asarray(policy.stiffness, dtype=np.float64)
+            damping = np.asarray(policy.damping, dtype=np.float64)
+            limits = np.asarray(policy.effort_limits, dtype=np.float64)
+            for label, values in (("stiffness", stiffness), ("damping", damping), ("effort limits", limits)):
+                if values.shape != (29,) or not np.isfinite(values).all() or np.any(values < 0):
+                    raise ValueError(f"Explicit body PD requires 29 finite nonnegative {label}")
+            measurements = (
+                self.robot.get_dof_position_targets(dof_indices=indices),
+                self.robot.get_dof_positions(dof_indices=indices),
+                self.robot.get_dof_velocities(dof_indices=indices),
+            )
+            targets, positions, velocities = (np.asarray(value.numpy(), dtype=np.float64) for value in measurements)
+            for values in (targets, positions, velocities):
+                if values.shape != (1, 29) or not np.isfinite(values).all():
+                    raise ValueError("Explicit body PD received invalid targets, positions, or velocities")
+            # Match the released MuJoCo motor loop: desired velocity is zero,
+            # with one combined position/damping effort clipped at each motor.
+            raw = stiffness * (targets - positions) - damping * velocities
+            if self.arm_gravity_compensation_enabled:
+                raw[:, 15:] += self._read_arm_gravity_compensation()
+            if not np.isfinite(raw).all():
+                raise ValueError("Explicit body PD produced nonfinite torques")
+            efforts = np.clip(raw, -limits, limits).astype(np.float32)
+            self.robot.set_dof_efforts(efforts, dof_indices=indices)
+        except Exception as error:
+            # Do not leave the preceding valid step's torque latched on a bad
+            # input. The caller must still pause physics until an explicit reset.
+            try:
+                self.robot.set_dof_efforts(np.zeros((1, len(indices)), dtype=np.float32), dof_indices=indices)
+            except Exception:
+                pass
+            self._fail_physical_locomotion(f"Physical walking body effort update failed: {error}")
+
+    def _read_arm_gravity_compensation(self) -> np.ndarray:
+        """Read fresh joint-space gravity torques for the fourteen external arms.
+
+        Native PhysX orders floating-base generalized forces as six root force/
+        torque entries followed by joint DOFs. The installed 6.1 experimental
+        DOF helper does not offset its slice, so read the complete native tensor
+        and validate its fixed/floating shape before selecting named arm joints.
+        See PhysX 5.6.1 Articulations, ``Gravity Compensation Force``.
+
+        Values already counter gravity and are in each revolute joint's positive
+        direction, in N*m. Do not negate them, rotate them, or multiply by gravity
+        again. Root and finger entries are never returned. Model gravity excludes
+        contacts/payload loads and is not force-sensor or pressure feedback.
+
+        Raises:
+            ValueError: The native layout, policy mapping, or forces are invalid.
+        """
+        policy = self._velocity_policy
+        native_names = tuple(self.robot.dof_names)
+        count = int(self.robot.num_dofs)
+        indices = tuple(self._velocity_dof_indices)
+        expected_arm_names = tuple(
+            f"{side}_{joint}_joint" for side in ("left", "right") for joint in self.WALK_ARM_JOINT_ORDER
+        )
+        if (
+            len(native_names) != count
+            or len(set(native_names)) != count
+            or len(indices) != 29
+            or len(set(indices)) != 29
+            or any(
+                isinstance(index, (bool, np.bool_))
+                or not isinstance(index, (int, np.integer))
+                or not 0 <= index < count
+                for index in indices
+            )
+            or tuple(policy.joint_names[15:]) != expected_arm_names
+            or tuple(policy.action_joint_names) != tuple(policy.joint_names[:15])
+            or tuple(native_names[index] for index in indices) != tuple(policy.joint_names)
+        ):
+            raise ValueError("Arm gravity compensation requires unique named native/policy DOF mappings")
+        view = self.robot._physics_articulation_view
+        fixed_base = view.shared_metatype.fixed_base
+        if not isinstance(fixed_base, (bool, np.bool_)):
+            raise ValueError("Arm gravity compensation requires a known fixed/floating base layout")
+        offset = 0 if fixed_base else 6
+        forces = np.asarray(view.get_gravity_compensation_forces().numpy(), dtype=np.float64)
+        if forces.shape != (1, count + offset) or not np.isfinite(forces).all():
+            raise ValueError("Arm gravity compensation received an invalid native gravity tensor")
+        return forces[:, [index + offset for index in indices[15:]]]
 
     """
     Walking policy (locomotion="policy").
     """
 
     def _configure_walk_policy(self, dof_names: list[str]) -> None:
-        """Load the Unitree walking policy and map its 12 leg joints onto this robot."""
+        """Load the selected actor and map its joints onto the live articulation."""
+        try:
+            if getattr(self, "_physical_locomotion", False):
+                self._configure_velocity_policy(dof_names)
+            else:
+                self._load_walk_policy(dof_names)
+        except Exception as error:
+            if getattr(self, "_physical_locomotion", False):
+                self._fail_physical_locomotion(f"Physical walking initialization failed: {error}")
+            raise
+
+    def _configure_velocity_policy(self, dof_names: list[str]) -> None:
+        """Map observed and driven joints separately; fingers never belong to an actor."""
+        policy = self._velocity_policy
+        self._velocity_dof_indices = policy.resolve_joint_indices(dof_names)
+        action_names = getattr(policy, "action_joint_names", policy.joint_names)
+        self._velocity_action_dof_indices = [dof_names.index(name) for name in action_names]
+        self._leg_dof_indices = [dof_names.index(name) for name in self.WALK_LEG_JOINT_ORDER]
+        self._posture_dof_indices = []  # The teleop layer independently owns any non-actor arms.
+        lower, upper = self.robot.get_dof_limits(dof_indices=self._velocity_action_dof_indices)
+        self._velocity_lower_limits = np.asarray(lower.numpy()[0], dtype=np.float32)
+        self._velocity_upper_limits = np.asarray(upper.numpy()[0], dtype=np.float32)
+        if (
+            self._velocity_lower_limits.shape != (len(action_names),)
+            or self._velocity_upper_limits.shape != (len(action_names),)
+            or not np.isfinite(self._velocity_lower_limits).all()
+            or not np.isfinite(self._velocity_upper_limits).all()
+            or np.any(self._velocity_lower_limits > self._velocity_upper_limits)
+        ):
+            raise ValueError("Physical walking requires finite ordered joint limits for every action")
+        policy.load()
+        self._walk_policy = policy
+        self._reset_walk_policy_state()
+        carb.log_info(
+            f"G1TeleopRobot: loaded {type(policy).__name__}, {len(action_names)} actions; CPU ONNX, no root assists"
+        )
+
+    def _step_velocity_policy(self, dt: float, command: object) -> None:
+        """Run the physical actor once per 20 ms using live articulation measurements."""
+        if self.locomotion_fault:
+            raise RuntimeError(self.locomotion_fault)
+        self._walk_time += dt
+        self._walk_step_counter += 1
+        period = self._velocity_policy.control_dt
+        if self._walk_next_control_time is not None and self._walk_time + 1e-9 < self._walk_next_control_time:
+            return
+        if self._walk_next_control_time is None:
+            self._walk_next_control_time = self._walk_time + period
+        else:
+            skipped = math.floor((self._walk_time - self._walk_next_control_time + 1e-9) / period) + 1
+            self._walk_next_control_time += skipped * period
+        try:
+            _, orientation = self.robot.get_world_poses()
+            quat = np.asarray(orientation.numpy()[0], dtype=np.float64)
+            if quat.shape != (4,) or not np.isfinite(quat).all() or np.linalg.norm(quat) < 1e-8:
+                raise ValueError("Physical walking base orientation is invalid")
+            qw, qx, qy, qz = quat / np.linalg.norm(quat)
+            rotation = np.array(
+                [
+                    [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                    [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                    [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+                ]
+            )
+            _, angular_world = self.robot.get_velocities()
+            angular_body = rotation.T @ np.asarray(angular_world.numpy()[0], dtype=np.float32)
+            gravity_body = rotation.T @ np.array([0.0, 0.0, -1.0])
+            positions = self.robot.get_dof_positions(dof_indices=self._velocity_dof_indices).numpy()[0]
+            velocities = self.robot.get_dof_velocities(dof_indices=self._velocity_dof_indices).numpy()[0]
+            targets = self._velocity_policy.infer(
+                positions, velocities, angular_body, gravity_body, self._command_to_floats(command)
+            )
+            targets = np.clip(targets, self._velocity_lower_limits, self._velocity_upper_limits)
+            self.robot.set_dof_position_targets(
+                [targets],
+                dof_indices=getattr(self, "_velocity_action_dof_indices", self._velocity_dof_indices),
+            )
+        except Exception as error:
+            self._fail_physical_locomotion(f"Physical walking policy step failed: {error}")
+
+    def _load_walk_policy(self, dof_names: list[str]) -> None:
+        """Resolve the checkpoint, joint map, and tensors for the policy adapter."""
         torch = import_module("torch")
 
         missing = [name for name in self.WALK_LEG_JOINT_ORDER if name not in dof_names]
         if missing:
             carb.log_error(f"G1TeleopRobot: leg joints missing from the articulation: {missing}")
-            self._activate_kinematic_fallback()
+            self._activate_kinematic_fallback(f"Required walking leg joints are missing: {missing}")
             return
         # The remap that makes the whole thing work: policy vector position -> PhysX DOF
         # index, resolved by joint name. PhysX orders DOFs by tree depth
@@ -657,14 +1014,19 @@ class G1TeleopRobot:
 
         policy_path = self._resolve_walk_policy_path()
         if policy_path is None:
+            next_step = (
+                "Physical walking cannot start."
+                if getattr(self, "_physical_locomotion", False)
+                else "Falling back to kinematic locomotion."
+            )
             carb.log_error(
                 "G1TeleopRobot: no walking policy found. Download Unitree's pretrained G1 policy "
                 "(BSD-3-Clause) with:\n"
                 "  curl -L -o <path>/g1_unitree_motion.pt https://raw.githubusercontent.com/"
                 "unitreerobotics/unitree_rl_gym/main/deploy/pre_train/g1/motion.pt\n"
-                "Falling back to kinematic locomotion."
+                f"{next_step}"
             )
-            self._activate_kinematic_fallback()
+            self._activate_kinematic_fallback("The walking checkpoint was not found")
             return
 
         try:
@@ -678,8 +1040,8 @@ class G1TeleopRobot:
             except Exception:
                 pass
         except Exception as e:
-            carb.log_error(f"G1TeleopRobot: could not load walking policy {policy_path}: {e}. Using kinematic mode.")
-            self._activate_kinematic_fallback()
+            carb.log_error(f"G1TeleopRobot: could not load walking policy {policy_path}: {e}")
+            self._activate_kinematic_fallback(f"The walking checkpoint could not load: {e}")
             return
 
         self._walk_leg_defaults_tensor = torch.tensor(self.WALK_LEG_DEFAULT_ANGLES, dtype=torch.float32, device=device)
@@ -687,14 +1049,61 @@ class G1TeleopRobot:
         lower, upper = self.robot.get_dof_limits(dof_indices=self._leg_dof_indices)
         self._walk_leg_lower_limits = torch.tensor(lower.numpy()[0], dtype=torch.float32, device=device)
         self._walk_leg_upper_limits = torch.tensor(upper.numpy()[0], dtype=torch.float32, device=device)
+        if getattr(self, "_physical_locomotion", False):
+            if (
+                self._walk_leg_lower_limits.numel() != self.WALK_NUM_ACTIONS
+                or self._walk_leg_upper_limits.numel() != self.WALK_NUM_ACTIONS
+                or not torch.isfinite(self._walk_leg_lower_limits).all()
+                or not torch.isfinite(self._walk_leg_upper_limits).all()
+                or not (self._walk_leg_lower_limits <= self._walk_leg_upper_limits).all()
+            ):
+                raise ValueError("Physical walking requires twelve finite, ordered leg joint limits")
         self._reset_walk_policy_state()
         carb.log_info(
             f"G1TeleopRobot: loaded Unitree G1 walking policy from {policy_path}; "
             f"leg DOF indices {self._leg_dof_indices}"
         )
 
-    def _activate_kinematic_fallback(self) -> None:
+    @property
+    def walking_policy_name(self) -> str:
+        """Identify the selected controller without implying physical validation."""
+        return getattr(self, "_walk_policy_kind", self._locomotion)
+
+    @property
+    def supports_arm_teleoperation(self) -> bool:
+        """Whether arm targets have an independent owner in this control mode."""
+        return not getattr(self, "_physical_locomotion", False) or isinstance(
+            getattr(self, "_velocity_policy", None), G1DecoupledPolicy
+        )
+
+    @property
+    def uses_explicit_body_efforts(self) -> bool:
+        """Whether this actor requires its own clipped motor PD each physics step."""
+        return getattr(self, "_physical_locomotion", False) and isinstance(
+            getattr(self, "_velocity_policy", None), G1DecoupledPolicy
+        )
+
+    @property
+    def arm_gravity_compensation_enabled(self) -> bool:
+        """Return whether the physical arm-only model-gravity option is enabled."""
+        return bool(getattr(self, "_arm_gravity_compensation", False)) and self.uses_explicit_body_efforts
+
+    @property
+    def locomotion_fault(self) -> str | None:
+        """Return the latched physical policy failure, cleared only by reset/load."""
+        return getattr(self, "_locomotion_fault", None)
+
+    def _fail_physical_locomotion(self, reason: str) -> None:
+        """Latch a fault without teleporting or disabling gravity; caller must pause."""
+        if self.locomotion_fault is None:
+            self._locomotion_fault = str(reason)
+            carb.log_error(f"G1TeleopRobot: {reason}; pause physics and Reset before resuming")
+        raise RuntimeError(self.locomotion_fault)
+
+    def _activate_kinematic_fallback(self, reason: str = "Walking policy is unavailable") -> None:
         """Select the complete avatar configuration after a checkpoint load failure."""
+        if getattr(self, "_physical_locomotion", False):
+            self._fail_physical_locomotion(reason)
         self._walk_policy = None
         self._locomotion = "kinematic"
         self._disable_gravity = True
@@ -721,22 +1130,31 @@ class G1TeleopRobot:
                 continue
         return None
 
-    def _reset_walk_policy_state(self) -> None:
-        """Zero the policy's LSTM memory.
+    def _reset_walk_policy_state(self, *, clear_fault: bool = True) -> None:
+        """Reset the selected actor's history or legacy LSTM memory.
 
         The exported actor is ``PolicyExporterLSTM`` and carries its hidden and cell
         state *inside* the scripted module — feeding it the same observation twice gives
         two different actions. Without this the robot resumes mid-stride from whatever
         the last episode left behind, which reliably topples it on the first step.
+
+        Args:
+            clear_fault: Clear the fault only for an explicit reset or initialization.
+                Timeline Stop invalidation discards history while retaining faults.
         """
         self._walk_step_counter = 0
         self._walk_time = 0.0
         self._walk_next_control_time = None
         self._walk_step_error_logged = False
+        if clear_fault:
+            self._locomotion_fault = None
         self._idle_time = 0.0
         self._hold_pose = None
         self._hold_leg_targets = None
         self._turn_anchor_xy = None
+        if getattr(self, "_velocity_policy", None) is not None:
+            self._velocity_policy.reset()
+            return
         if self._walk_previous_action is not None:
             self._walk_previous_action.zero_()
         if self._walk_policy is None:
@@ -948,7 +1366,7 @@ class G1TeleopRobot:
         if max(abs(forward_speed), abs(lateral_speed)) > self.STATION_KEEP_DEADBAND:
             return command
         turning = abs(yaw_rate) > self.STATION_KEEP_DEADBAND
-        if turning and not self.TURN_HOLD_ENABLED:
+        if turning and not (self.TURN_HOLD_ENABLED or getattr(self, "_physical_locomotion", False)):
             return command
 
         try:
@@ -997,6 +1415,8 @@ class G1TeleopRobot:
         torch = import_module("torch")
         import warp as wp
 
+        if getattr(self, "_physical_locomotion", False) and self.locomotion_fault:
+            raise RuntimeError(self.locomotion_fault)
         if not math.isfinite(dt) or dt <= 0.0:
             return
         self._walk_time += max(float(dt), 0.0)
@@ -1027,6 +1447,8 @@ class G1TeleopRobot:
                 targets = torch.clamp(targets, min=self._walk_leg_lower_limits, max=self._walk_leg_upper_limits)
                 self.robot.set_dof_position_targets(wp.from_torch(targets), dof_indices=self._leg_dof_indices)
             except Exception as e:
+                if getattr(self, "_physical_locomotion", False):
+                    self._fail_physical_locomotion(f"Physical walking policy step failed: {e}")
                 if not self._walk_step_error_logged:
                     carb.log_warn(f"G1TeleopRobot: walking policy step failed; retaining last leg targets: {e}")
                     self._walk_step_error_logged = True
@@ -1259,6 +1681,27 @@ class G1TeleopRobot:
 
     def _apply_body_joint_gains(self, dof_names: list[str]) -> None:
         """Apply per-group PD gains to the body joints, leaving hand drives untouched."""
+        if getattr(self, "_physical_locomotion", False):
+            policy = self._velocity_policy
+            indices = self._velocity_dof_indices
+            try:
+                self.robot.set_dof_gains(stiffnesses=[policy.stiffness], dampings=[policy.damping], dof_indices=indices)
+                if policy.armature is not None:
+                    self.robot.set_dof_armatures([policy.armature], dof_indices=indices)
+                if policy.effort_limits is not None:
+                    self.robot.set_dof_max_efforts([policy.effort_limits], dof_indices=indices)
+                if policy.velocity_limits is not None:
+                    self.robot.set_dof_max_velocities([policy.velocity_limits], dof_indices=indices)
+                if self.uses_explicit_body_efforts:
+                    if policy.effort_limits is None:
+                        raise ValueError("Explicit body PD requires the deployment motor effort limits")
+                    # Effort mode zeros implicit stiffness/damping, avoiding two
+                    # competing PD loops. Targets still feed apply_body_efforts.
+                    self.robot.switch_dof_control_mode("effort", dof_indices=indices)
+                    self.robot.set_dof_efforts(np.zeros((1, len(indices)), dtype=np.float32), dof_indices=indices)
+            except Exception as error:
+                self._fail_physical_locomotion(f"Could not configure physical policy actuators: {error}")
+            return
         if self._locomotion == "policy":
             self._apply_walk_policy_gains(dof_names)
             return

@@ -1,0 +1,4 @@
+# Separate webcam environment only. Never install these into Isaac Sim's Python.
+# MediaPipe includes opencv-contrib-python; do not install a second OpenCV wheel.
+mediapipe==1.0.1
+opencv-contrib-python==4.13.0.92

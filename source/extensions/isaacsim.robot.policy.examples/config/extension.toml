@@ -18,6 +18,7 @@ writeTarget.kit = true
 "isaacsim.examples.base" = {}
 "isaacsim.examples.browser" = {}
 "isaacsim.storage.native" = {}
+"isaacsim.pip.onnx" = {}
 
 [settings]
 # Request skeletal hand joints as well as controller input. The native OpenXR

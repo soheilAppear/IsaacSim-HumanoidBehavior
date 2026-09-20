@@ -1,6 +1,8 @@
 # all folders starting with _ are local
 _*/
 .ci-dashboard-venv/
+# Local webcam Python environment, pretrained models, and diagnostic output.
+/.webcam/
 !_impl/
 !docs/isaacsim/_extra/
 # exclude local website repo, used for publishing
