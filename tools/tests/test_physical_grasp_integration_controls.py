@@ -76,6 +76,32 @@ class TestPhysicalGraspIntegrationControls(unittest.TestCase):
         self.assertEqual(result.curls["middle"], 0.0)
         self.assertAlmostEqual(result.curls["index"], 0.3 + self.ex._finger_contact_lead_rad / 1.6)
 
+    def test_controller_triggers_can_establish_two_palm_support_and_loss_clears_it(self):
+        self.ex._get_hand_tracking_finger_curls.side_effect = None
+        self.ex._get_hand_tracking_finger_curls.return_value = None
+        self.requested = {role: 0.65 for role in self.roles}
+        self.ex._get_controller_finger_curls.side_effect = lambda device: self.requested.copy()
+        contacts = {
+            "left": [GRASP.ContactSample("/World/Cube", "palm", (-0.08, 0, 0), (-1, 0, 0), 2.0)],
+            "right": [GRASP.ContactSample("/World/Cube", "palm", (0.08, 0, 0), (1, 0, 0), 2.0)],
+        }
+        self.ex._contact_reader.read.side_effect = lambda dt: (contacts, "ok")
+        self.ex._physical_object_masses = {"/World/Cube": 0.15}
+        self.tick(10)
+        self.assertEqual(self.ex._finger_curl_source, {"left": "controller", "right": "controller"})
+        result = self.ex._bimanual_grasp_result
+        self.assertTrue(result.contact_supported)
+        self.assertTrue(result.capacity_exceeds_weight)
+        self.assertEqual(result.object_path, "/World/Cube")
+        self.assertFalse(self.ex._grasp_joints_by_side)
+        self.assertFalse(any(prim.IsA(UsdPhysics.FixedJoint) for prim in self.stage.Traverse()))
+        # Real input loss must invalidate support even if a contact frame is
+        # still present; enabling controllers must not latch a phantom grasp.
+        self.ex._get_controller_finger_curls.side_effect = None
+        self.ex._get_controller_finger_curls.return_value = None
+        self.tick()
+        self.assertFalse(self.ex._bimanual_grasp_result.contact_supported)
+
     def test_drop_opens_fingers_and_prevents_reclosing_until_valid_open_input(self):
         self.assertTrue(self.tick(10).contact_supported)
         self.ex._drop_everything()

@@ -236,9 +236,14 @@ class HumanoidExample(BaseSample):
         self._controller_walking_enabled = (
             self._gesture_locomotion_enabled and self._locomotion_input_mode == "controller"
         )
-        self._optical_hands_only = self._controller_walking_enabled or os.environ.get(
-            "G1_OPTICAL_HANDS_ONLY", "0"
-        ).strip().lower() in ("1", "true", "yes", "on")
+        # Sticks can walk while grip/trigger control manipulation. Optical input
+        # remains preferred; retain an explicit opt-in for optical-only hands.
+        self._optical_hands_only = os.environ.get("G1_OPTICAL_HANDS_ONLY", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self._pointing_navigation_enabled = not self._controller_walking_enabled and os.environ.get(
             "G1_POINTING_NAVIGATION", "1"
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -339,9 +344,12 @@ class HumanoidExample(BaseSample):
         self._head_camera_update_sub = None
         self._head_camera_operator_rotation_enabled = True
         self._robot_head_xr_orientation_setting = None
-        # A fixed 5 cm near plane clears residual render-head/body sway around
-        # the stabilized eye without moving it or clipping normal grasp reach.
+        # Keep the ordinary 5 cm near plane; extend it only when the live head
+        # overtakes the stabilized eye. Close geometry shares this clipping.
         self._head_camera_near_clip_m = 0.05
+        self._head_camera_active_near_clip_m = self._head_camera_near_clip_m
+        self._head_camera_required_near_clip_m = self._head_camera_near_clip_m
+        self._head_camera_clearance_exceeded = False
         self._head_camera_operator_neutral_rotation = None
         self._head_camera_operator_delta_rotation = None
         self._physics_step_error_logged = set()  # (subsystem, error) pairs already warned about
@@ -2560,6 +2568,7 @@ class HumanoidExample(BaseSample):
         """Create a USD camera used for robot-head first-person viewing."""
         stage = omni.usd.get_context().get_stage()
         camera = UsdGeom.Camera.Define(stage, self._head_camera_path)
+        self._head_camera_active_near_clip_m = self._head_camera_near_clip_m
         camera.CreateFocalLengthAttr().Set(16.0)
         camera.CreateClippingRangeAttr().Set(Gf.Vec2f(self._head_camera_near_clip_m, 1000.0))
 
@@ -3443,6 +3452,8 @@ class HumanoidExample(BaseSample):
 
     def _get_head_camera_pose(self, dt: float | None = None):
         """Compute a first-person camera pose from the G1 head/eye position."""
+        if not self._head_camera_comfort_enabled:
+            self._head_camera_active_near_clip_m = self._head_camera_near_clip_m
         if self._g1_locomotion == "stationary" or self._xr_camera_mode == "robot_head":
             mounted_pose = self._get_robot_head_camera_pose()
             if mounted_pose is None:
@@ -3458,7 +3469,10 @@ class HumanoidExample(BaseSample):
             comfort_mount = self._get_comfort_camera_mount(mounted_pose)
             if comfort_mount is None:
                 return None
-            return articulated_view * mounted_pose.GetInverse() * comfort_mount
+            camera_pose = articulated_view * mounted_pose.GetInverse() * comfort_mount
+            self._update_robot_head_clearance(camera_pose, mounted_pose)
+            return camera_pose
+        self._head_camera_active_near_clip_m = self._head_camera_near_clip_m
         if not self.g1 or not self.g1.robot.is_physics_tensor_entity_valid():
             return None
 
@@ -3503,6 +3517,48 @@ class HumanoidExample(BaseSample):
             - Gf.Vec3d(0.0, 0.0, self._first_person_head_target_drop)
         )
         return Gf.Matrix4d().SetLookAt(eye, target, Gf.Vec3d(0.0, 0.0, 1.0)).GetInverse()
+
+    def _update_robot_head_clearance(self, camera_pose: Gf.Matrix4d, mounted_pose: Gf.Matrix4d) -> None:
+        """Clip head intrusion without feeding torso sway back into the view.
+
+        Stabilization intentionally lags physical travel and rejects torso tilt.
+        The neck-attached head can therefore pass the steady eye even though its
+        HMD rotation is correct. Use its measured bounds to extend only this
+        view's near plane, leaving matrices, observer views and physics alone.
+        This also clips other geometry equally close to the eye. A 30 cm limit
+        prevents a bad pose from erasing the scene; exceeding it is reported
+        explicitly and is not considered a successful clearance correction.
+        """
+        baseline = self._head_camera_near_clip_m
+        self._head_camera_required_near_clip_m = baseline
+        if self._head_camera_mount_local is None:
+            self._head_camera_active_near_clip_m = baseline
+            return
+        torso_pose = self._head_camera_mount_local.GetInverse() * mounted_pose
+        extent = self._operator_head_visual.compute_camera_forward_extent(camera_pose, torso_pose)
+        if extent is None:
+            self._head_camera_active_near_clip_m = baseline
+            return
+        # 15 mm allows small pose/latch differences; it is not a guarantee for
+        # arbitrary render stalls or an unbounded physical body excursion.
+        required = max(baseline, extent + 0.015)
+        self._head_camera_required_near_clip_m = required
+        exceeded = required > max(baseline, 0.30)
+        if exceeded and not self._head_camera_clearance_exceeded:
+            carb.log_warn(
+                "HumanoidExample: head/camera separation exceeds the 30 cm clipping envelope; "
+                "self-occlusion may remain. Camera stabilization and physical geometry are unchanged."
+            )
+        self._head_camera_clearance_exceeded = exceeded
+        if exceeded:
+            self._head_camera_active_near_clip_m = max(baseline, 0.30)
+            return
+        # Increase immediately, rounded upward to 5 mm. A 10 mm release band
+        # avoids repeatedly reauthoring native XR settings for tiny balance sway.
+        desired = max(baseline, math.ceil((required - 1e-10) / 0.005) * 0.005)
+        active = self._head_camera_active_near_clip_m
+        if desired > active or desired < active - 0.01 or extent + 0.015 < baseline - 0.01:
+            self._head_camera_active_near_clip_m = desired
 
     def _get_comfort_camera_mount(self, mounted_pose: Gf.Matrix4d) -> Gf.Matrix4d | None:
         """Follow a level robot frame at a fixed optical height on this flat floor.
@@ -3663,6 +3719,8 @@ class HumanoidExample(BaseSample):
         key = prefix.rstrip("/") + "/overrideFloorAlignedAnchor"
         saved = self._robot_head_xr_orientation_setting
         if saved is not None and saved[1] == key:
+            if saved[0].get(saved[3]) != self._head_camera_active_near_clip_m:
+                saved[0].set(saved[3], self._head_camera_active_near_clip_m)
             return
         self._restore_robot_head_xr_orientation()
         import carb.settings
@@ -3671,7 +3729,7 @@ class HumanoidExample(BaseSample):
         near_key = prefix.rstrip("/") + "/render/nearPlane"
         self._robot_head_xr_orientation_setting = (settings, key, settings.get(key), near_key, settings.get(near_key))
         settings.set_bool(key, True)
-        settings.set(near_key, self._head_camera_near_clip_m)
+        settings.set(near_key, self._head_camera_active_near_clip_m)
 
     def _sync_controller_xr_tools(self) -> None:
         """Reserve controller actions without disabling any raw XR input source.
@@ -3823,6 +3881,10 @@ class HumanoidExample(BaseSample):
         # shadows retain the complete robot.
         self._operator_head_visual.set_first_person_hidden(False)
         self._head_camera_transform_op.Set(camera_pose)
+        camera = UsdGeom.Camera(self._head_camera_transform_op.GetAttr().GetPrim())
+        clipping = camera.GetClippingRangeAttr().Get()
+        if abs(float(clipping[0]) - self._head_camera_active_near_clip_m) > 1e-7:
+            camera.GetClippingRangeAttr().Set(Gf.Vec2f(self._head_camera_active_near_clip_m, clipping[1]))
         if self._g1_locomotion != "stationary" and self._xr_camera_mode != "robot_head":
             self._restore_robot_head_xr_orientation()
         if self._xr_camera_can_schedule():
@@ -7037,7 +7099,7 @@ class HumanoidExample(BaseSample):
             contacts_by_side=contacts,
             curls_by_side=self._latest_finger_curls,
             input_valid_by_side={
-                side: self._finger_curl_source.get(side) in ("hand_tracking", "webcam_hand")
+                side: self._finger_curl_source.get(side) in ("hand_tracking", "controller", "webcam_hand")
                 and not self._grab_requires_release.get(side, False)
                 for side in ("left", "right")
             },
@@ -7839,9 +7901,10 @@ class HumanoidExample(BaseSample):
     def _update_joystick_locomotion(self) -> None:
         """Give only the two VR sticks ownership of the physical walking command.
 
-        Optical hands remain independent. Triggers, grip, buttons, stick clicks,
-        keyboard movement and the blue pointing selector cannot command actions
-        in this mode. Returning to neutral or losing a controller stops all axes.
+        Arm grip and finger trigger input remain independent of walking; optical
+        hands take priority when available. Buttons, stick clicks, keyboard
+        movement and the blue pointing selector cannot command locomotion in
+        this mode. Returning to neutral or losing a controller stops all axes.
         Existing balance, joint-health and unintended-motion guards still run.
         """
         left = self._read_tracked_controller_stick(self._get_xr_input_device("/user/hand/left"))

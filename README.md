@@ -26,25 +26,26 @@ Robot-camera screenshots from the **7 September 2026** G1 recording, at their na
 The default is **stationary manipulation**. A world constraint anchors the robot's
 pelvis while its arms and fingers remain controllable. Walking, turning, keyboard
 locomotion, and step-in-place inputs cannot move the base in this mode.
-The separate walking launcher now uses **controller sticks for movement and
-optical hands for manipulation**. The old gesture launcher is an alias for it.
+The separate walking launcher uses **controller sticks for movement**, with
+controller grips/triggers or optical hands for manipulation. The old gesture
+launcher is an alias for it.
 
 | Capability | Current implementation |
 |---|---|
-| Arm control | Valid optical wrist/middle-knuckle positions drive an anatomical palm target without a grip button or fist; measured scenery contacts limit inward arm motion. Controller grip clutches apply only outside the optical-only walking profile |
-| Finger control | Five independent curl targets and separate thumb opposition from the optical skeleton; controller trigger closure applies only outside the optical-only walking profile |
+| Arm control | Valid optical wrist/middle-knuckle positions drive an anatomical palm target without a grip button or fist; controller grip holds enable arm movement, and release holds the arm pose. Measured contacts limit inward arm motion |
+| Finger control | Five independent curl targets and separate thumb opposition from the optical skeleton; each controller index trigger proportionally closes that hand's fingers |
 | Optional webcam | Quest remains primary for each arm and hand; calibrated webcam position, elbow guidance, and optional finger curls are used only for missing Quest input |
 | Pickup | Experimental physical contact grasping with bounded finger targets; objects must be held by fingers and friction, with no hand-to-object fixed joint |
 | Camera | Stabilized robot frame follows travel; HMD orientation rotates the view and its eye offset around the measured neck. Torso roll/pitch, gait bob, and real-world head translation are excluded |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
 | Physics | CPU: 100 Hz stationary / 200 Hz walking; rendering requests 90 Hz stationary / 60 Hz walking |
 | Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
-| Experimental walking | Left stick moves forward/backward/sideways; right stick turns. Controller grip/trigger/buttons do not control the arms or fingers in this profile; blue pointing navigation is disabled but retained |
+| Experimental walking | Left stick moves forward/backward/sideways; right stick turns. Grip/trigger manipulation and optical hands remain available; controller face buttons/stick clicks are unused, and blue pointing navigation is disabled but retained |
 
 Inspire has six independent hand actuators. Distal knuckles are coupled, so it cannot
 reproduce every human knuckle angle or finger-splay movement separately.
 
-The latest source passed **881 offline tests**. Earlier controller replays passed all
+The latest source passed **888 offline tests**. Earlier controller replays passed all
 six physical walking directions, release/loss/rearm checks, three Stop/Play cycles
 and two Pause/Play cycles. The neck-anchored head and eye-arc camera passed 25 native
 XR pose checks; ten desktop first-person views, including steep downward and
@@ -132,12 +133,16 @@ neck pivot in both camera modes. It does not translate the head to follow the
 stabilized eye. Earlier camera-following and reversible hiding helpers remain for
 legacy diagnostics. The fixed-eye camera contract is superseded: its downward view
 looked inside the visible head. The orientation-driven eye arc is paired with a
-fixed **5 cm near plane** in both the USD camera and native XR profile to clear
+baseline **5 cm near plane** in both the USD camera and native XR profile to clear
 residual self-occlusion. Geometry within 5 cm of the eye is clipped, including a
-hand or object brought that close. The prior XR setting is restored on exit.
-Fresh production checks passed 25 native XR poses and visual inspection of ten
-desktop first-person views. Native per-eye visibility and perceived comfort remain
-operator checks.
+hand or object brought that close. If measured head geometry intrudes during body
+sway or camera lag, only the robot first-person near clip increases beyond those
+bounds, with a 15 mm margin in 5 mm increments, returning toward 5 cm when clear.
+It caps at 30 cm and reports larger intrusion; arbitrary falls are not covered.
+Nearby hands/packages can temporarily clip. Camera/HMD/gaze matrices, head attachment
+and visibility, external cameras and physics are unchanged. The prior XR setting is
+restored on exit. Earlier fixed-5-cm checks passed 25 native poses and ten desktop
+views; the adaptive change has not yet completed live visual acceptance.
 
 | Restored visible head | Robot-eye shelf view |
 |:---:|:---:|
@@ -289,7 +294,15 @@ launches this same controller profile for compatibility. The base
 | Right stick left/right | Request turning |
 | Release sticks or lose a valid controller | Clear walking commands; the physical robot must still brake |
 | Optical wrist/palm and finger motion | Control the corresponding robot arm and individual fingers |
-| Controller grips, triggers, face buttons and stick clicks | Ignored in this profile; they do not close fingers, clutch arms, drop objects or change the camera |
+| Each controller side grip | Hold to move/rotate that arm; release holds its current pose |
+| Each index trigger | Squeeze proportionally to close that hand; release to open, independently of the grip |
+| Controller A/B/X/Y and stick clicks | Unused in this walking profile; keyboard B recenters the view |
+
+Stick deflection controls requested speed continuously after a **15% deadzone**.
+Full deflection requests up to **0.65 m/s forward, 0.35 m/s reverse, 0.30 m/s sideways
+or 0.40 rad/s turning**; half the usable travel requests half that speed. Diagonal
+translation is capped. Centering stops requests immediately; the physical robot
+still needs to brake. These are command caps, not guaranteed achieved speeds.
 
 The blue ray and pointing selector are disabled; their implementation is retained.
 Gaze and its red ray are unchanged. Keyboard **B** still recenters the view.
@@ -302,14 +315,15 @@ All six walking directions passed physical replays with synthetic stick input.
 Pickup and loaded transport require separate validation.
 
 **The current Quest/SteamVR setup switches between controllers and optical hands.**
-It does not presently supply both simultaneously. Walk with the sticks, center
-them and stop, then switch to bare-hand tracking to manipulate objects. Controller
-poses or inferred controller finger shapes are never substituted for optical
-fingers in this profile. Recognized optical hands also block retained stick values;
-returning to controllers requires centered sticks before movement resumes.
-An explicitly enabled, calibrated webcam with detailed hand tracking can provide
-a separate fallback while the controllers are active;
-this is optional and remains subject to webcam visibility and calibration.
+It does not presently supply both simultaneously. With controllers active, grip moves
+an arm and trigger closes its fingers. You can release grip to hold the arm pose while
+keeping trigger squeezed and using the sticks. When switching to bare hands, valid
+optical poses and individual fingers take over; stale stick values are cleared.
+Returning to controllers requires centered sticks before movement resumes. Controller
+trigger closure is not measured finger tracking. Calibrated webcam input remains an
+optional fallback when primary input is unavailable. To deliberately retain the former
+optical-only manipulation profile, set `G1_OPTICAL_HANDS_ONLY=1` before launching;
+otherwise the launcher defaults it to `0` without replacing an explicit override.
 
 Controller walking adds model-based gravity holding torque to the fourteen arm
 joints, within their existing motor limits. It supports the robot's own arm weight;
@@ -460,8 +474,9 @@ simultaneous reaching and walking remains unvalidated.
 These arm and pickup controls apply to the default **stationary** scene. The
 separate walking demo keeps legs and waist under policy control and accepts arm
 and finger input within the walking limits described above.
-In the current controller walking profile, use optical hands instead: the grip,
-trigger, face-button and stick-click actions in this stationary table are disabled.
+In the controller walking profile, grip/trigger manipulation and optical hands remain
+available. Face-button and stick-click actions in this stationary table are disabled;
+use keyboard B for heading recentering while walking.
 
 | Input | Action |
 |---|---|

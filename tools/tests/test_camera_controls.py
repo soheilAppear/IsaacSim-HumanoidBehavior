@@ -899,6 +899,97 @@ class TestComfortRobotHeadCamera(unittest.TestCase):
             self.assert_matrix_close(self.advance(), expected)
             self.assert_matrix_close(self.head_world(), expected_head)
 
+    def test_forward_body_lag_extends_only_first_person_clipping(self):
+        neutral = self.example._get_head_camera_pose()
+        body = self.example._read_camera_mount_body_pose()
+        observer = UsdGeom.Camera.Define(self.stage, "/World/Observer")
+        observer.CreateClippingRangeAttr().Set(Gf.Vec2f(0.01, 250))
+        camera = UsdGeom.Camera.Define(self.stage, self.example._head_camera_path)
+        camera.CreateClippingRangeAttr().Set(Gf.Vec2f(0.05, 1000))
+        self.example._head_camera_transform_op = camera.AddTransformOp()
+        self.example._xr_camera_can_schedule = Mock(return_value=False)
+        body.SetTranslateOnly(body.ExtractTranslation() + Gf.Vec3d(0.12, 0, 0))
+        with patch.object(self.example, "_read_camera_mount_body_pose", return_value=body):
+            # The camera stays steady while the actual torso is 12 cm ahead,
+            # as during normal filtered forward travel. USD remains stale.
+            self.example._update_head_camera_view(force=True, dt=0)
+            self.assert_matrix_close(self.example._head_camera_transform_op.Get(), neutral)
+            head = self.assert_visible_head_anchored_to_neck(body)
+            visual = self.example._operator_head_visual
+            corners = [
+                Gf.Vec3d(x, y, z)
+                for x in (visual.bounds_min[0], visual.bounds_max[0])
+                for y in (visual.bounds_min[1], visual.bounds_max[1])
+                for z in (visual.bounds_min[2], visual.bounds_max[2])
+            ]
+            forward = neutral.TransformDir(Gf.Vec3d(0, 0, -1))
+            depth = max(Gf.Dot(head.Transform(point) - neutral.ExtractTranslation(), forward) for point in corners)
+            self.assertGreater(depth, 0.05)  # The former fixed plane fails.
+            near = float(camera.GetClippingRangeAttr().Get()[0])
+            self.assertGreaterEqual(near, depth + 0.015 - 1e-7)
+            self.assertLess(near, depth + 0.020001)
+        self.assertEqual(observer.GetClippingRangeAttr().Get(), Gf.Vec2f(0.01, 250))
+        self.example._update_head_camera_view(force=True, dt=0)
+        self.assertAlmostEqual(camera.GetClippingRangeAttr().Get()[0], 0.05, places=7)
+        self.assertIs(self.example._eye_gaze_tracker, self.gaze)
+
+    def test_rotated_sway_and_hmd_turn_use_live_bounds_without_camera_motion(self):
+        neutral = self.example._get_head_camera_pose()
+        original_body = self.example._read_camera_mount_body_pose()
+        saw_extended_clip = False
+        for yaw, pitch, body_pitch, body_yaw in ((0, 0, 15, 12), (70, -55, -18, -12), (-110, 20, 16, 18)):
+            with self.subTest(yaw=yaw, pitch=pitch, body_pitch=body_pitch):
+                hmd = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), pitch)) * Gf.Matrix4d().SetRotate(
+                    Gf.Rotation(Gf.Vec3d(0, 1, 0), yaw)
+                )
+                self.example._read_physical_head_pose.return_value = hmd
+                body = (
+                    Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 1, 0), body_pitch))
+                    * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), body_yaw))
+                    * original_body
+                )
+                body.SetTranslateOnly(body.ExtractTranslation() + Gf.Vec3d(0.08, -0.03, 0.025))
+                with patch.object(self.example, "_read_camera_mount_body_pose", return_value=body):
+                    camera = self.example._get_head_camera_pose(dt=0)
+                    self.assert_matrix_close(camera, self.expected_hmd_view(neutral, hmd))
+                    head = self.assert_visible_head_anchored_to_neck(body)
+                visual = self.example._operator_head_visual
+                forward = camera.TransformDir(Gf.Vec3d(0, 0, -1))
+                depths = [
+                    Gf.Dot(head.Transform(Gf.Vec3d(x, y, z)) - camera.ExtractTranslation(), forward)
+                    for x in (visual.bounds_min[0], visual.bounds_max[0])
+                    for y in (visual.bounds_min[1], visual.bounds_max[1])
+                    for z in (visual.bounds_min[2], visual.bounds_max[2])
+                ]
+                self.assertGreaterEqual(self.example._head_camera_active_near_clip_m, max(depths) + 0.015 - 1e-10)
+                saw_extended_clip |= self.example._head_camera_active_near_clip_m > 0.05
+                self.assertFalse(self.example._head_camera_clearance_exceeded)
+        self.assertTrue(saw_extended_clip)
+        self.assertIs(self.example._eye_gaze_tracker, self.gaze)
+
+    def test_clearance_hysteresis_releases_and_out_of_envelope_is_explicit(self):
+        camera = self.example._get_head_camera_pose()
+        mounted = self.example._get_robot_head_camera_pose()
+        with patch.object(self.example._operator_head_visual, "compute_camera_forward_extent") as extent:
+            extent.return_value = 0.101
+            self.example._update_robot_head_clearance(camera, mounted)
+            self.assertAlmostEqual(self.example._head_camera_active_near_clip_m, 0.12)
+            extent.return_value = 0.098
+            self.example._update_robot_head_clearance(camera, mounted)
+            self.assertAlmostEqual(self.example._head_camera_active_near_clip_m, 0.12)
+            extent.return_value = -0.01
+            self.example._update_robot_head_clearance(camera, mounted)
+            self.assertAlmostEqual(self.example._head_camera_active_near_clip_m, 0.05)
+            extent.return_value = 0.8
+            self.example._update_robot_head_clearance(camera, mounted)
+            self.assertTrue(self.example._head_camera_clearance_exceeded)
+            self.assertAlmostEqual(self.example._head_camera_required_near_clip_m, 0.815)
+            self.assertAlmostEqual(self.example._head_camera_active_near_clip_m, 0.30)
+            extent.return_value = -0.01
+            self.example._update_robot_head_clearance(camera, mounted)
+            self.assertFalse(self.example._head_camera_clearance_exceeded)
+            self.assertAlmostEqual(self.example._head_camera_active_near_clip_m, 0.05)
+
     def test_application_zero_dt_does_not_restore_raw_robot_pose(self):
         self.example._get_head_camera_pose()
         self.example._base_command[:] = (0.4, 0, 0.2)

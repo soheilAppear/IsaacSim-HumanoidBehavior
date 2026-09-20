@@ -17,8 +17,9 @@ Gaze retains the working implementation.
 
 The current [walking profile](#controller-walking-and-optical-manipulation) uses
 the left controller stick for forward/backward and sideways movement, and the
-right stick for turning. Optical hands own the arms and fingers; controller
-grip/trigger/button actions are disabled in this profile. NVIDIA decoupled policies
+right stick for turning. Controller grips move the arms and index triggers close
+the fingers; optical tracking takes over when valid bare-hand input returns.
+Controller face buttons and stick clicks remain unused in this profile. NVIDIA decoupled policies
 control the legs and waist. Twelve handle-free shelf cartons join the six table
 objects and four floor cartons. Blue pointing navigation remains implemented but
 disabled. Earlier pointing and physical-walking results are historical evidence,
@@ -277,8 +278,17 @@ changing profiles; an already loaded articulation cannot switch anchors safely.
 | Release sticks | Clear movement requests; allow the physical robot to brake |
 | Controller loss | Stop and require centered sticks on reconnect |
 | Tracked optical palm/fingers | Move the corresponding arm and individual fingers without a clutch |
-| Grip, trigger, A/B/X/Y, stick clicks | Ignored; no arm clutch, finger closure, drop, or camera action |
+| Each controller grip | Hold to move/rotate that arm; release holds its measured pose |
+| Each controller index trigger | Proportionally close that hand's fingers; release opens, independently of grip |
+| A/B/X/Y and stick clicks | Unused in this walking profile |
 | Keyboard B | Recenter the horizontal view heading |
+
+Small stick movements request slower travel; larger movements request faster travel.
+The first **15%** is a noise deadzone, and the remaining travel scales linearly to
+**0.65 m/s forward, 0.35 m/s reverse, 0.30 m/s sideways and 0.40 rad/s turning**.
+At 57.5% total deflection the request is half the corresponding cap. Diagonal
+translation is bounded. Neutral clears the request immediately; physical braking
+still takes time. The learned actor's configured limits have not been increased.
 
 The blue ray and selector are disabled, not deleted. Gaze/red-ray behavior is
 unchanged. While this profile owns XR, Kit's built-in teleport/fly/rotate and
@@ -293,8 +303,9 @@ small stance corrections. After braking, matching root/support motion must also
 exceed 15 cm or 0.35 rad from a fixed stationary reference before this guard trips.
 Those are minimum excursions with speed/dwell prerequisites, not hard travel limits;
 slow or intermittent drift can remain below the prerequisites. Fast-runaway and fall
-guards remain active. The latest stance/contact source passed **881 offline tests**
-and a fresh physical approach plus carton press/withdrawal check without a fault.
+guards remain active. The current controller/camera revision passed **888 offline
+tests**. The preceding stance/contact revision also passed a fresh physical approach
+plus carton press/withdrawal check without a fault.
 The contact replay used synthetic optical input; complete real-hand package placement
 remains an operator acceptance test. See
 the [validation record](docs/validation/isaac-sim-6.1.md#balance-sway-and-remaining-pause-limitation).
@@ -312,15 +323,18 @@ unresolved. See the
 [renderer validation](docs/validation/isaac-sim-6.1.md#direct3d12-process-workaround).
 
 **The user's current Quest/SteamVR runtime switches between controllers and
-optical tracking instead of providing both together.** Walk first, center the
-sticks, wait for the robot to stop, then put down the controllers and switch to
-bare-hand tracking. The code does not turn controller poses or inferred finger
-shapes into optical hand data. Recognized optical hands invalidate retained stick
-values; center both sticks again when returning to controllers. For simultaneous
-stick movement and hand input, the optional external webcam can be enabled and
-calibrated with detailed hand
-landmarks; valid Quest optical data stays primary when available. Webcam visibility,
-latency and calibration still limit that fallback.
+optical tracking instead of providing both together.** Use controller grip for arm
+movement and trigger for closure while the controllers are active. Releasing grip
+holds the arm pose; a held trigger retains closure while the sticks remain available.
+Stop before switching to bare hands: valid optical palms and fingers then take over,
+and retained stick values are invalidated. Center both sticks again when returning
+to controllers. Trigger closure is a control command, not optical finger measurement.
+The optional calibrated webcam remains a fallback when primary input is unavailable.
+Its visibility, latency and calibration limits still apply.
+
+The walking launcher defaults `G1_OPTICAL_HANDS_ONLY=0`. An explicit environment
+override is preserved: set it to `1` before launch to disable controller manipulation
+and retain the former optical-only profile. This does not change stick locomotion.
 
 The fourteen arm joints receive a model-based gravity compensation term in this
 controller walking profile. It helps support the robot's arm weight while following
@@ -775,9 +789,9 @@ and [MediaPipe package notice](https://pypi.org/project/mediapipe/1.0.1/).
 
 ### Stationary controls at a glance
 
-These controller manipulation buttons apply to the stationary profile. In the
-controller walking profile, sticks own movement and optical hands own manipulation;
-the grip/trigger/face-button/stick-click actions below are disabled.
+Grip/trigger manipulation and optical hand input also apply in the controller walking
+profile. Its sticks control locomotion, while A/B/X/Y and stick clicks remain unused;
+use keyboard B to recenter there. The face-button actions below are stationary controls.
 
 | Input | Current behavior |
 |---|---|
@@ -827,19 +841,24 @@ rigid-mount validation does not establish comfort of the current implementation.
 The current helper keeps the render-only head visible and anchored to the torso
 in both camera modes. Earlier camera-following and reversible hiding helpers remain
 for legacy diagnostics; production teleoperation uses neither. Physical colliders
-are unchanged. The eye arc passed 25 native XR pose checks. A fixed **5 cm near plane**
-in both the USD camera and native XR profile clears residual self-occlusion without
-moving the camera or changing its matrices. Hands or objects brought within 5 cm
-of the eye are also clipped. Mode exit and cleanup restore the prior XR near-plane
-setting. Fresh production validation passed 25 native XR poses and ten rendered
+are unchanged. A **5 cm baseline near plane** applies to the robot first-person USD
+camera and native XR profile. Measured head intrusion during sway/travel increases
+only that clip to clear the visible head bounds plus **15 mm**, quantized in **5 mm**
+steps; it returns toward baseline when clear. The **30 cm maximum** has an explicit
+diagnostic for larger intrusion and is not protection against arbitrary falls.
+Very near hands or packages can disappear temporarily. Camera/HMD/gaze matrices,
+head attachment/visibility, external-camera clipping and physics are unchanged.
+Mode exit and cleanup restore the prior XR near-plane setting. The adaptive change
+awaits live visual acceptance. Earlier fixed-5-cm validation passed 25 native XR poses and ten rendered
 desktop first-person views, including 85° down and 180° yaw. The head stayed visible
 and attached, with gaze and collision opinions preserved. Native per-eye visibility
 and perceived headset comfort still require an operator check.
 
 ### Pickup with Touch controllers
 
-Use this only in the stationary/legacy manipulation profile. Controller walking
-deliberately ignores these grip and trigger actions.
+Grip/trigger pickup also applies in controller walking unless an explicit optical-only
+override is selected. In walking, controller face buttons remain unused: use keyboard
+B to recenter and release the trigger to open rather than using controller Y.
 
 1. Release trigger and **hold grip** to acquire the arm at its current position.
 2. Move and rotate the controller to place the **actual robot palm/fingers** around the

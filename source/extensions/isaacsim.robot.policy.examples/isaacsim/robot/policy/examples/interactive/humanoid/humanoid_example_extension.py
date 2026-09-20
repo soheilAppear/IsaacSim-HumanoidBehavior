@@ -50,8 +50,8 @@ class HumanoidExampleExtension(omni.ext.IExt):
         sample = HumanoidExample()
         if sample._controller_walking_enabled:
             overview = "Controller walking: center both sticks once. Left stick moves forward/backward and sideways; "
-            overview += "right stick turns. Release the sticks to stop. The blue pointing ray is disabled. "
-            overview += "Controllers do not operate arms, fingers, grip, camera or drop actions. "
+            overview += "right stick turns. Push farther for more speed; release the sticks to stop. "
+            overview += "The blue pointing ray and controller face buttons are disabled. "
         elif sample._gesture_locomotion_enabled:
             overview = "Pointing walking is enabled. Open your left hand, then point with your index finger. "
             overview += "Curl the other three fingers and hold the blue ray on clear floor for 0.6 seconds. "
@@ -74,7 +74,12 @@ class HumanoidExampleExtension(omni.ext.IExt):
             overview += "\nKeyboard B: recenter forward heading while preserving head tilt."
         else:
             overview += "\n\nControllers: hold GRIP to move the arm; pull TRIGGER to close. "
-            overview += "Y drops objects; B recenters forward heading."
+            overview += "Release GRIP to hold the arm pose; release TRIGGER to open the fingers. "
+            if sample._controller_walking_enabled:
+                overview += "Keep the triggers held while using the sticks to carry a package. "
+                overview += "Keyboard B recenters forward heading."
+            else:
+                overview += "Y drops objects; B recenters forward heading."
         overview += "\nThe factory includes practice objects and, in controller walking, twelve handle-free shelf cartons."
         overview += "\nIf the simulation pauses after a movement fault, the console shows why. "
         overview += "Use this example's Reset to recover; Play alone does not clear a fault."

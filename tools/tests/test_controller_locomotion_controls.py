@@ -68,6 +68,21 @@ class TestControllerLocomotionControls(unittest.TestCase):
         self.assertAlmostEqual(forward, -lateral)
         self.assertEqual(yaw, 1)
 
+    def test_partial_full_and_neutral_throw_scale_every_direction(self) -> None:
+        # Fractions describe the usable travel after the 15% noise deadzone.
+        # Exercise each signed axis, including turning, without diagonal mixing.
+        for axis, output_index, direction in (("left_y", 0, 1), ("left_x", 1, -1), ("right_x", 2, -1)):
+            for sign in (-1, 1):
+                self.update()
+                for throw, fraction in ((0.15, 0.0), (0.3625, 0.25), (0.575, 0.5), (0.7875, 0.75), (1.0, 1.0)):
+                    with self.subTest(axis=axis, sign=sign, throw=throw):
+                        command = self.update(**{axis: sign * throw})
+                        expected = [0.0, 0.0, 0.0]
+                        expected[output_index] = direction * sign * fraction
+                        for actual, target in zip(command.velocity, expected):
+                            self.assertAlmostEqual(actual, target)
+                self.assertEqual(self.update().velocity, (0.0, 0.0, 0.0))
+
     def test_stick_release_returns_exact_zero_without_a_filter_tail(self) -> None:
         self.update()
         self.update(left_y=1, right_x=1)

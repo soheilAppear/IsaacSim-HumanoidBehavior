@@ -455,6 +455,47 @@ class RobotHeadVisual:
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return False
 
+    def compute_camera_forward_extent(self, camera_world: Gf.Matrix4d, torso_world: Gf.Matrix4d) -> float | None:
+        """Measure the head's farthest forward depth in the current camera frame.
+
+        Positive depth is in front of the eye; negative depth is behind it.
+        Transform all eight cached head-bound corners using the current local
+        render transform and the caller's measured torso pose. Reading a USD
+        world transform here would miss live movement when Fabric owns physics.
+        This query never changes geometry, visibility, or collision opinions.
+
+        Args:
+            camera_world: Final stabilized camera, including HMD rotation.
+            torso_world: The same measured body pose used to compute that view.
+
+        Returns:
+            Maximum forward depth in stage units, or None for unavailable or
+            invalid geometry/poses. Bounds are conservative, not a ray test.
+        """
+        if not self.ready or self._parent_to_torso_transform is None:
+            return None
+        try:
+            for matrix in (camera_world, torso_world):
+                if (
+                    _rotation_matrix(matrix) is None
+                    or not all(math.isfinite(matrix[row][column]) for row in range(4) for column in range(4))
+                    or any(abs(matrix[row][3]) > 1e-8 for row in range(3))
+                    or abs(matrix[3][3] - 1.0) > 1e-8
+                ):
+                    return None
+            head = self._stage.GetPrimAtPath(self.head_path)
+            local = UsdGeom.Xformable(head).GetLocalTransformation()
+            head_to_camera = local * self._parent_to_torso_transform * torso_world * camera_world.GetInverse()
+            depths = [
+                -float(head_to_camera.Transform(Gf.Vec3d(x, y, z))[2])
+                for x in (self.bounds_min[0], self.bounds_max[0])
+                for y in (self.bounds_min[1], self.bounds_max[1])
+                for z in (self.bounds_min[2], self.bounds_max[2])
+            ]
+            return max(depths) if all(math.isfinite(value) for value in depths) else None
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+
     def reset(self) -> None:
         """Return the visual to its authored pose while retaining prepared geometry."""
         if self.ready:

@@ -94,6 +94,23 @@ class TestRobotCameraXRSettings(unittest.TestCase):
         self.assertIs(self.values[second_key], False)
         self.assertEqual(self.values[second_near_key], 0.012)
 
+    def test_adaptive_near_updates_preserve_original_profile_preference(self):
+        self.values[self.near_key] = 0.012
+        original = dict(self.values)
+        self.example._configure_robot_head_xr_orientation()
+        self.example._head_camera_active_near_clip_m = 0.125
+        self.example._configure_robot_head_xr_orientation()
+        self.assertEqual(self.values[self.near_key], 0.125)
+        self.settings.set.reset_mock()
+        for _ in range(20):
+            self.example._configure_robot_head_xr_orientation()
+        self.settings.set.assert_not_called()
+        self.example._head_camera_active_near_clip_m = 0.05
+        self.example._configure_robot_head_xr_orientation()
+        self.assertEqual(self.values[self.near_key], 0.05)
+        self.example._restore_robot_head_xr_orientation()
+        self.assertEqual(self.values, original)
+
     def test_no_profile_does_not_change_app_settings(self):
         self.profile = None
         original = dict(self.values)

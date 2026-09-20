@@ -201,8 +201,8 @@ async def _controller_walking_replay(ex, job, options):
                 "Load and initialize the controller walking scene first")
         require(ex._controller_walking_enabled and ex._gesture_locomotion_enabled, "Controller GR00T walking mode is required")
         require(ex._g1_locomotion != "stationary", "Robot must use the real physical walking actor")
-        require(ex._optical_hands_only and not ex._pointing_navigation_enabled,
-                "Optical-only hands and disabled pointing navigation are required")
+        require(not ex._pointing_navigation_enabled,
+                "Disabled pointing navigation is required")
         check_health()
         timeline.pause()
         modified = True

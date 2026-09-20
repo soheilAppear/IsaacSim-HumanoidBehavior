@@ -63,6 +63,11 @@ class ControllerLocomotion:
         return self.command
 
     def _axis(self, value: float) -> float:
+        """Map usable stick travel linearly to speed; full deflection stays 1.0.
+
+        With the default 0.15 deadzone, 0.575 deflection requests half the
+        configured directional speed. The caller applies physical speed caps.
+        """
         if abs(value) <= self.deadzone:
             return 0.0
         return math.copysign((abs(value) - self.deadzone) / (1.0 - self.deadzone), value)

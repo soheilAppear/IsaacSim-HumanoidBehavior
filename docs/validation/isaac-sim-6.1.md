@@ -1,6 +1,63 @@
 # Isaac Sim 6.1 validation — September 2026
 
+## Controller manipulation and adaptive camera clearance — 20 September 2026
+
+The current controller walking profile now accepts each controller's grip for arm
+movement and index trigger for proportional finger closure, in addition to valid
+optical hands. Releasing grip holds the measured arm pose while trigger input remains
+active. Controller-trigger inputs can also supply the existing bimanual contact
+diagnostic; this does not attach objects or establish pickup. Face buttons and stick
+clicks remain unused in walking; keyboard B still recenters heading. The launcher
+defaults `G1_OPTICAL_HANDS_ONLY=0` only when unset, preserving an explicit `1` override.
+Optical reacquisition, invalidation of stale sticks and neutral rearming remain active.
+
+Joystick speed was already proportional and its mapping/limits are unchanged: a 15%
+deadzone followed by linear travel up to 0.65 m/s forward, 0.35 m/s reverse, 0.30 m/s
+sideways and 0.40 rad/s yaw. Added checks exercise partial/full travel and neutral in
+all six directions, including half-cap scaling through production command generation.
+The pure joystick suite passed **13 tests**, and **12 stub-only launcher checks**
+passed default/explicit optical-mode selection, aliases, verbose arguments, quoted
+arguments and renderer override ordering (`.webcam/controller-mixed-launcher.json`).
+The stub checks do not start Kit or XR.
+
+Robot first-person clipping now starts at 5 cm and adapts to measured visible-head
+intrusion, adding 15 mm clearance in 5 mm increments before returning toward baseline
+when clear. It caps at 30 cm and diagnoses intrusion beyond that cap. Camera/HMD/gaze
+matrices, head attachment/visibility, external-camera clipping and physics are
+unchanged. Near hands or packages can clip during sway/travel, and arbitrary falls
+are not guaranteed clear. Earlier fixed-5-cm render results below do not validate
+this adaptive addition.
+
+The complete updated suite passed **888 offline tests in 10.540 seconds**
+(`.webcam/controller-camera-final-tests.log`). A fresh launch reported
+`controller_arms=True` and `optical_only=False`. Native controller and adaptive-camera
+checks then passed within the following bounded scopes.
+
+The controller smoke test passed **6.05 simulated / 11.796 wall seconds**
+(`.webcam/controller-manipulation-smoke.json`). Synthetic controller data went through
+the actual input parser, IK, finger PhysX drives, contacts and balance checks. Both
+palms rose, partial/full trigger values produced measured finger curls, releasing
+grip retained trigger-controlled closure, and releasing triggers opened the fingers.
+Source metadata, loss and reacquisition checks passed without health faults or
+callback errors; gaze was preserved and webcam/input overrides restored. The report's
+immediate `paused: false` precedes commitment of its pause request; the subsequent
+head-clearance report confirms the actual paused state.
+
+The head-clearance check used actual G1 render bounds with hypothetical camera lag
+(`.webcam/native-head-clip-smoke.json`). Lag values **0 / 0.06 / 0.12 / 0.18 / 0.24 m**
+produced near planes **0.05 / 0.08 / 0.14 / 0.20 / 0.26 m**. The head transform and
+gaze were unchanged, the near plane was restored to 0.05 m, and the timeline was
+confirmed paused. **This is a native geometry check, not stereo-render acceptance.**
+
+XR reported no devices during this final check. Real Quest controller carrying,
+controller/optical handoff latency, headset camera visibility/comfort and a complete
+real-hand lift/lower/place sequence remain operator acceptance tests. The smoke tests
+do not establish those hardware outcomes.
+
 ## Controller walking and visible head — 20 September 2026
+
+The following records the earlier optical-only controller profile and its successive
+fixes. The current mixed controller/optical controls are described above.
 
 The new `tools/launch_controller_walking.bat` profile maps left-stick Y to
 forward/reverse, left-stick X to sidesteps, and right-stick X to turning.

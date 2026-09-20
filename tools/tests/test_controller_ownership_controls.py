@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verify VR sticks own walking while optical hands retain manipulation."""
+"""Verify joystick walking coexists with controller and optical manipulation."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from humanoid_test_support import HUMANOID, pose
+from pxr import Gf
 
 
 class StickDevice:
@@ -23,6 +24,12 @@ class StickDevice:
     def get_pose_desc(self, name):
         assert name == "grip"
         return types.SimpleNamespace(validity_flags=self.flags, pose_matrix=pose((0.2, 1.0, 0.3)))
+
+    def get_virtual_world_pose_desc(self, name):
+        return self.get_pose_desc(name)
+
+    def get_pose_names(self):
+        return ["grip"]
 
     def has_input(self, name):
         return self.actions_present and name == "thumbstick"
@@ -37,7 +44,10 @@ class StickDevice:
 
 class TestControllerOwnership(unittest.TestCase):
     def setUp(self) -> None:
-        with patch.dict(os.environ, {"G1_GESTURE_WALKING": "1", "G1_LOCOMOTION_INPUT": "controller"}):
+        with patch.dict(
+            os.environ,
+            {"G1_GESTURE_WALKING": "1", "G1_LOCOMOTION_INPUT": "controller", "G1_OPTICAL_HANDS_ONLY": "0"},
+        ):
             self.ex = HUMANOID.HumanoidExample()
         self.ex._controller_command = np.zeros(3)
         self.ex._base_command = np.zeros(3)
@@ -54,7 +64,7 @@ class TestControllerOwnership(unittest.TestCase):
 
     def test_sticks_move_in_requested_directions_and_release_stops(self) -> None:
         self.assertFalse(self.ex._pointing_navigation_enabled)
-        self.assertFalse(self.ex._controller_arm_control_enabled)
+        self.assertTrue(self.ex._controller_arm_control_enabled)
         self.tick()
         for left_x, left_y, right_x, expected in (
             (0, 1, 0, (0.65, 0, 0)),
@@ -63,6 +73,12 @@ class TestControllerOwnership(unittest.TestCase):
             (-1, 0, 0, (0, 0.30, 0)),
             (0, 0, 1, (0, 0, -0.40)),
             (0, 0, -1, (0, 0, 0.40)),
+            (0, 0.575, 0, (0.325, 0, 0)),
+            (0, -0.575, 0, (-0.175, 0, 0)),
+            (0.575, 0, 0, (0, -0.15, 0)),
+            (-0.575, 0, 0, (0, 0.15, 0)),
+            (0, 0, 0.575, (0, 0, -0.20)),
+            (0, 0, -0.575, (0, 0, 0.20)),
         ):
             self.left.x, self.left.y, self.right.x = left_x, left_y, right_x
             np.testing.assert_allclose(self.tick(), expected)
@@ -122,15 +138,57 @@ class TestControllerOwnership(unittest.TestCase):
         self.left.actions_present = False
         self.assertFalse(self.ex._read_tracked_controller_stick(self.left)[0])
 
-    def test_controller_grip_trigger_and_buttons_cannot_move_hands_or_camera(self) -> None:
+    def test_optical_only_opt_in_still_disables_controller_manipulation(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"G1_GESTURE_WALKING": "1", "G1_LOCOMOTION_INPUT": "controller", "G1_OPTICAL_HANDS_ONLY": "1"},
+        ):
+            self.ex = HUMANOID.HumanoidExample()
+        self.assertTrue(self.ex._controller_walking_enabled)
+        self.assertFalse(self.ex._controller_arm_control_enabled)
         device = Mock()
         self.ex._get_hand_input_kind = Mock(return_value="controller")
         self.ex._get_xr_gesture_value = Mock(side_effect=AssertionError("Controller manipulation was read"))
         self.assertIsNone(self.ex._get_controller_arm_pose("left", device))
         self.assertIsNone(self.ex._get_controller_finger_curls(device))
         self.assertFalse(self.ex._is_hand_closed("left", device))
-        self.tick()
         self.ex._get_xr_gesture_value.assert_not_called()
+
+    def test_controller_clutch_and_trigger_remain_independent_while_sticks_walk(self) -> None:
+        self.ex._get_hand_input_kind = Mock(return_value="controller")
+        grip, trigger = 0.8, 0.0
+        self.ex._get_xr_gesture_value = lambda device, name, gesture: (
+            grip
+            if name == "squeeze" and gesture == "value"
+            else trigger if name == "trigger" and gesture == "value" else 0.0
+        )
+        self.ex._get_hand_link_prim = Mock(return_value=None)
+        self.tick()  # Neutral arms the sticks independently of the held clutch.
+        self.left.y, self.right.x = 0.7, 0.3
+        controller_pose = self.ex._get_controller_arm_pose("left", self.left)
+        self.assertIsNotNone(controller_pose)
+        self.assertTrue(all(value == 0.0 for value in self.ex._get_controller_finger_curls(self.left).values()))
+        base = Gf.Vec3d(0, 0, 0.8)
+        target = self.ex._compute_arm_target_body_position("left", controller_pose, base, 0.0, True)
+        neutral = self.ex._controller_arm_neutral_positions["left"]
+        trigger = 0.65
+        for _ in range(5):
+            walking = self.tick()
+            self.assertGreater(walking[0], 0.0)
+            self.assertLess(walking[2], 0.0)
+            self.assertEqual(self.ex._controller_arm_neutral_positions["left"], neutral)
+            self.assertEqual(self.ex._controller_arm_neutral_targets["left"], target)
+            self.assertTrue(all(value == trigger for value in self.ex._get_controller_finger_curls(self.left).values()))
+        # Releasing the arm clutch does not release fingers or zero the sticks.
+        grip = 0.0
+        self.assertIsNone(self.ex._get_controller_arm_pose("left", self.left))
+        self.assertTrue(all(value == trigger for value in self.ex._get_controller_finger_curls(self.left).values()))
+        self.assertGreater(self.tick()[0], 0.0)
+        # Switching to optical input rejects all retained controller actions.
+        self.ex._get_hand_input_kind.return_value = "hand_tracking"
+        self.assertIsNone(self.ex._get_controller_arm_pose("left", self.left))
+        self.assertIsNone(self.ex._get_controller_finger_curls(self.left))
+        np.testing.assert_array_equal(self.tick(), (0, 0, 0))
 
     def test_optical_closure_still_controls_manipulation(self) -> None:
         self.ex._finger_curl_source["left"] = "hand_tracking"

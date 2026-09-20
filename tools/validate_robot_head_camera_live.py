@@ -15,6 +15,8 @@ collision opinions. Both modes retain the visible head's fixed neck pivot;
 comfort mode follows the HMD-driven eye arc around the neck while rejecting
 body sway. Physical HMD translation remains ignored.
 Signed head bounds depths are reported as diagnostics, not an occlusion pass.
+The adaptive near plane must clear those bounds and agree in USD/native XR;
+this is a geometric/settings check, not verification of rendered stereo pixels.
 Comfort mode also injects torso-only shake into
 the camera reader and requires complete rejection; the real actor stays paused.
 Startup and recenter cases use production calibration while the synthetic headset
@@ -202,6 +204,19 @@ async def _run_robot_head_camera(ex, job, options):
             await app.next_update_async()
             check_health()
 
+    def check_near_clearance(minimum_depth):
+        near = float(UsdGeom.Camera.Get(stage, ex._head_camera_path).GetClippingRangeAttr().Get()[0])
+        native = XRSettings.get_singleton().get_setting("profile/persistent/render/nearPlane")
+        require(not ex._head_camera_clearance_exceeded, "Head clearance exceeded the 30 cm adaptive envelope")
+        require(abs(near - ex._head_camera_active_near_clip_m) < 1e-7,
+                "USD near plane did not follow adaptive head clearance")
+        require(isinstance(native, (int, float)) and math.isfinite(native) and abs(native-near) < 1e-7,
+                "Native XR near plane did not follow the USD camera")
+        if comfort:
+            require(near >= -float(minimum_depth) + 0.015 - 1e-7,
+                    "Visible head extends beyond the adaptive clipping plane")
+        return near
+
     def collision_opinions():
         # Compare authored specs, including weaker referenced layers, rather than
         # only current physics poses. The render-head op must not touch any of them.
@@ -287,6 +302,7 @@ async def _run_robot_head_camera(ex, job, options):
                             for x in (visual.bounds_min[0],visual.bounds_max[0])
                             for y in (visual.bounds_min[1],visual.bounds_max[1])
                             for z in (visual.bounds_min[2],visual.bounds_max[2]))
+        active_near = check_near_clearance(minimum_depth)
         require(body_error < 1e-5, "Robot body moved while physics was paused")
         require(pivot_error < 1e-5, "Visible render head moved away from the torso neck pivot")
         require(not visual.first_person_hidden, "Camera mode globally hid the render head")
@@ -336,6 +352,7 @@ async def _run_robot_head_camera(ex, job, options):
             "comfort_camera_matrix_error": comfort_matrix_error,
             "visible_head_minimum_camera_depth_m": float(minimum_depth),
             "visible_head_bounds_entirely_behind_eye": bool(minimum_depth >= 0.0),
+            "active_near_clip_m": active_near, "head_bounds_behind_near_plane": True,
             "head_depth_diagnostic_only": True, "first_person_occlusion_tested": False,
             "neck_pivot_fixed_required": True,
             "camera_input_rotation_error_degrees": local_rotation_error, "paused_body_matrix_error": body_error,
@@ -449,7 +466,7 @@ async def _run_robot_head_camera(ex, job, options):
         usd_clip = camera_schema.GetClippingRangeAttr().Get()
         meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage))
         usd_near_m = float(usd_clip[0]) * meters_per_unit
-        expected_near_m = float(ex._head_camera_near_clip_m)
+        expected_near_m = float(ex._head_camera_active_near_clip_m)
         require(isinstance(native_near, (int, float)) and math.isfinite(native_near),
                 "Native XR near clipping plane is unavailable or nonfinite")
         require(abs(float(native_near) - expected_near_m) < 1e-7,
@@ -458,6 +475,7 @@ async def _run_robot_head_camera(ex, job, options):
                 "Desktop USD and native XR near clipping planes disagree")
         report["near_clipping"] = {
             "configured_m": expected_near_m, "usd_m": usd_near_m,
+            "baseline_m": float(ex._head_camera_near_clip_m), "adaptive": comfort,
             "native_setting_m": float(native_near),
             "native_setting_path": xr_settings.get_setting_location(near_token),
             "native_default_m": xr_settings.get_default_setting(near_token),
@@ -505,13 +523,16 @@ async def _run_robot_head_camera(ex, job, options):
             worst_attachment = 0.0
             worst_pivot = 0.0
             minimum_head_depth = None
+            largest_near = 0.0
             for index in range(48):
                 angle = 2.0 * math.pi * index / 12.0
                 jitter_pose = (Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1,0,0), 8*math.sin(angle)))
                                * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0,1,0), 6*math.cos(angle)))
                                * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0,0,1), 7*math.sin(angle)))
                                * baseline_body)
-                jitter_pose.SetTranslateOnly(baseline_body.ExtractTranslation() + Gf.Vec3d(0,0,.04*math.sin(angle)))
+                travel_lag = baseline_body.TransformDir(Gf.Vec3d(.12 if index >= 24 else 0,0,0))
+                jitter_pose.SetTranslateOnly(baseline_body.ExtractTranslation() + travel_lag
+                                             + Gf.Vec3d(0,0,.04*math.sin(angle)))
                 ex._update_head_camera_view(force=True, dt=0.0)
                 await frames(1)
                 worst = max(worst, matrix_error(ex._head_camera_transform_op.Get(), reference))
@@ -527,10 +548,14 @@ async def _run_robot_head_camera(ex, job, options):
                             for y in (visual.bounds_min[1],visual.bounds_max[1])
                             for z in (visual.bounds_min[2],visual.bounds_max[2]))
                 minimum_head_depth = float(depth) if minimum_head_depth is None else min(minimum_head_depth, float(depth))
+                largest_near = max(largest_near, check_near_clearance(depth))
                 require(not visual.first_person_hidden and
                         UsdGeom.Imageable(stage.GetPrimAtPath(visual.head_path)).ComputeVisibility()
                         != UsdGeom.Tokens.invisible, "Torso motion hid the render head")
             report["injected_torso_jitter"] = {"roll_degrees":8,"pitch_degrees":6,"yaw_degrees":7,"height_m":.04,
+                                                "forward_translation_lag_m":.12,
+                                                "largest_adaptive_near_clip_m":largest_near,
+                                                "head_bounds_behind_near_plane":True,
                                                 "camera_matrix_max_error":worst,
                                                 "head_attachment_max_error":worst_attachment,
                                                 "head_attachment_error_diagnostic_only":True,

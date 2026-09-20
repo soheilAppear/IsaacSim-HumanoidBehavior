@@ -65,7 +65,7 @@ the camera, the base, or joints directly.
 | Webcam process | Unmirrored pose and optional hand landmarks; preview mirroring is display-only; C increments a calibration-request counter |
 | Receiver | Validate protocol version, session, sequence, timestamp, landmark count/range, visibility and presence; drain bounded pending input once per control tick |
 | Calibration | Require both fresh Quest optical palm targets and visible webcam arms; establish anatomical +X forward, +Y left, +Z up; scale and align shoulder-relative arm motion |
-| Input selection | Quest optical first; stationary/legacy profiles retain controller grip fallback; controller walking excludes it and can use calibrated webcam fallback |
+| Input selection | Quest optical first; valid controller grip/trigger fallback in stationary and controller walking profiles unless explicitly optical-only; calibrated webcam fallback when primary input is unavailable |
 | Arm controller | Quest controls its full arm while valid; only webcam arm fallback enables webcam elbow guidance in remaining IK freedom; existing joint/contact limits |
 | Fingers | Optical curls first; controller trigger mapping only outside optical-only profiles; optional complete webcam landmarks provide fallback curls |
 
@@ -92,11 +92,12 @@ such valid inferred poses outside its camera view, webcam takeover waits until
 the Quest input actually becomes unavailable. No source estimates indefinitely
 hidden hand motion after both inputs become unavailable.
 In controller walking, the user-confirmed Quest/SteamVR setup switches between
-controller and optical-hand input. Use sequential walking then bare-hand manipulation,
-or explicitly enable/calibrate webcam fallback for a separate simultaneous source.
-The webcam can be selected while the XR device is controller-classified because
-controller poses and grip/trigger values are excluded from arm/finger control in
-this profile. No optical skeleton is fabricated from controller input.
+controller and optical-hand input. Controller grips/triggers now control arms/fingers
+in the walking profile while controllers are active. Optical tracking takes over when
+it returns; no optical skeleton is fabricated from trigger closure. A released
+controller grip means hold, not automatic webcam takeover. The explicit
+`G1_OPTICAL_HANDS_ONLY=1` option disables controller manipulation and permits the
+existing calibrated webcam fallback while a device remains controller-classified.
 See [operator setup](../HUMANOID_VR_CONTROL.md#webcam-alongside-quest) and the
 [validation record](validation/isaac-sim-6.1.md) for tested scope.
 
@@ -117,10 +118,10 @@ use different clock origins across the sender and Isaac Python versions.
 
 ## Controls
 
-The table below describes the stationary/legacy manipulation profile. Controller
-walking instead uses left-stick forward/backward/strafe and right-stick turning;
-all VR grips, triggers, buttons and stick clicks are ignored. Optical hands own
-manipulation. Keyboard B remains available for heading recentering.
+The table below describes stationary/legacy controls. Grip/trigger manipulation and
+optical hands also work in controller walking, where left-stick forward/backward/strafe
+and right-stick turning replace stationary locomotion suppression. Face buttons and
+stick clicks remain unused in walking; keyboard B still recenters heading.
 
 | Input | Result |
 |---|---|
@@ -149,7 +150,9 @@ only affects hand target visualization, not the gaze ray or gaze hit marker.
 
 ### Pick up with VR controllers
 
-These instructions do not apply to the optical-only controller walking profile.
+These grip/trigger steps also apply in controller walking unless
+`G1_OPTICAL_HANDS_ONLY=1` is explicitly selected. In walking, use **keyboard B** for
+heading recentering and release the trigger to open; controller B/Y remain unused.
 
 1. Set your current head heading as forward with **B**. Keep the trigger
    released, then **hold the grip** on the hand you want to move.
@@ -437,7 +440,7 @@ unchanged. `apply_camera_attached()` and the reversible `set_first_person_hidden
 helper remain for legacy diagnostics; production teleoperation uses neither and
 keeps the head visible. The intermediate fixed-eye version passed native neck-pivot
 checks but looked inside the head when looking down. It is superseded by the eye
-arc. The final combination with a 5 cm near plane passed a fresh 25-pose native XR
+arc. The earlier fixed-5-cm combination passed a fresh 25-pose native XR
 replay and visual inspection of ten desktop first-person views, including 85° down
 and 180° yaw. The visible neck remained fixed, gaze and all 145 inspected collision
 opinions were preserved, and no callback or health fault occurred. Native per-eye
@@ -468,11 +471,17 @@ recreation discard the filter and calibration. This assumes the level factory fl
 ramps, stairs, and intentional squat-height changes are unsupported.
 `/World/G1_HeadCamera` remains the viewport and recording camera.
 
-`_head_camera_near_clip_m = 0.05` sets a fixed 5 cm near plane in the USD camera
-and the active native XR profile's `render/nearPlane` setting. Native XR does not
-inherit the USD clipping range, so both are configured. This removes residual
-self-occlusion without altering the camera transform; it is not a dynamic camera
-offset. Geometry closer than 5 cm, including a nearby hand or package, is clipped.
+`_head_camera_near_clip_m = 0.05` sets the baseline near plane for the robot first-person
+USD camera and the active native XR profile's `render/nearPlane` setting. Native XR
+does not inherit USD clipping, so both are configured. Measured visible-head intrusion
+increases only that near plane to the head bounds plus a 15 mm margin, quantized in
+5 mm steps, and it returns toward baseline when clear. The maximum is 0.30 m, with an
+explicit diagnostic if the required clearance exceeds it; arbitrary falls are not
+guaranteed clear. Very near hands/objects can clip during sway or travel. Camera/HMD/
+gaze matrices, head attachment and visibility, external-camera clipping and physics
+remain unchanged. This is adaptive clipping, not a camera-position adjustment.
+Live visual acceptance of this addition is pending; the earlier pose/render passes
+above concern fixed clipping.
 Mode exit and cleanup restore the exact prior XR setting, including an absent
 opinion, using the active profile's resolved persistent path.
 
@@ -705,7 +714,7 @@ and shifting the pelvis over planted feet does not produce support travel.
 
 The separate fast guard remains unconditional: root speed above 0.8 m/s or yaw above
 1.2 rad/s for 0.25 s pauses the simulation, even if the support reader fails. Fall and
-joint-state guards are unchanged. The latest stance/contact source passed **881 tests
+joint-state guards are unchanged. The preceding stance/contact source passed **881 tests
 in 12.301 seconds**. The earlier 871-test suite and physical backward/settle passes
 cover the intermediate foot-support guard. Fresh native acceptance of the final
 contact-yield change passed after a physical shelf approach: 1,024 actual inward
@@ -820,16 +829,26 @@ the free base. This is a supported manipulation setup, not a demonstration of ba
 `tools/launch_controller_walking.bat` is the current walking entry point.
 `tools/launch_gesture_walking.bat` delegates to it as a compatibility alias.
 Both set `G1_GESTURE_WALKING=1` to select the existing physical GR00T scene,
-`G1_LOCOMOTION_INPUT=controller`, `G1_OPTICAL_HANDS_ONLY=1`, and
-`G1_POINTING_NAVIGATION=0`. The base VR launcher remains stationary by default.
+`G1_LOCOMOTION_INPUT=controller` and `G1_POINTING_NAVIGATION=0`. The launcher defaults
+`G1_OPTICAL_HANDS_ONLY=0` only when unset, preserving an explicit `1` override for the
+former optical-only manipulation behavior. The base VR launcher remains stationary by default.
 These settings are read before scene construction; restart/reload to change them.
+
+The controller-manipulation and adaptive-clipping update passed **888 offline tests
+in 10.540 seconds** (`.webcam/controller-camera-final-tests.log`). This is application
+regression coverage, not live controller/hand transport or headset visual acceptance.
 
 `ControllerLocomotion` accepts only left X/Y and right X. Left Y becomes forward,
 left X is negated for body-left, and right X is negated for yaw-left. A 0.15 axis
 deadzone is removed and the remaining range rescaled; diagonal translation is
 normalized to magnitude at most one. The physical command branch then applies
-the actor's configured directional speed caps. No grip/trigger/face-button/click,
-keyboard movement, or pointing gesture can generate an action in this profile.
+the actor's configured directional speed caps: 0.65 m/s forward, 0.35 m/s reverse,
+0.30 m/s sideways and 0.40 rad/s yaw. At 0.575 axis deflection the corresponding
+request is half its cap; full deflection reaches the cap. The mapping and safe limits
+were already proportional and remain unchanged. Neutral returns exact zero requests;
+physical braking and achieved speed depend on the actor and contacts.
+Grips/triggers control arms/fingers independently; face buttons, stick clicks,
+keyboard movement and pointing gestures cannot generate walking commands.
 Keyboard B remains a separate camera-heading action. Blue visuals are hidden and
 the pointing planner remains implemented but inactive; eye gaze is unchanged.
 
@@ -853,13 +872,16 @@ controller actions. The installed XR
 wrapper exposes no per-action activity timestamp: pose/action checks and callback
 gap protection do not establish hardware freshness beyond what that runtime reports.
 
-Arm/finger selection independently requires real optical landmarks; controller
-grips/poses and trigger-generated finger shapes are excluded. The current user's
-runtime switches between controllers and optical hands, so simultaneous input is
-not currently available through that transport. Walk, stop, then switch to optical
-manipulation. Calibrated external webcam input is an optional separate fallback,
-including when the XR device remains controller-classified; it does not authorize
-walking. Hardware concurrency and loaded movement are unvalidated.
+Arm/finger selection now also accepts valid controller poses/grips and index triggers.
+Grip held moves the corresponding arm; release holds its measured posture. Trigger
+closure remains independent, so it can stay held while the arm holds and sticks move
+the robot. Valid optical input takes priority when the device returns to hand mode.
+The current runtime switches between controller and optical input rather than supplying
+both together. Trigger-derived curls remain identified as controller input, not measured
+optical fingers. Calibrated webcam input is a separate fallback; a released controller
+grip still means hold. Explicit optical-only mode retains its former source selection.
+Webcam input cannot authorize walking. Hardware concurrency and loaded movement remain
+unvalidated.
 
 XR hand devices, input classification and landmark snapshots are shared only within
 one synchronous physics callback, then read again on the next callback. Losing a
