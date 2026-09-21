@@ -67,6 +67,54 @@ For implementation details, coordinate frames, lifecycle behavior, and test cove
 
 ## Screenshots and videos
 
+### 20 September — webcam and robot demonstration
+
+The [current README gallery](README.md#20-september--robot-and-operator-views) uses
+selected excerpts from the operator's **20 September 2026** OBS recording,
+`2026-09-20 19-40-28.mp4`. The source is **2048×864 at 60 fps**, with a total duration
+of **743.667 seconds**. The original recording is not included in the repository.
+The [43.5-second highlights reel](docs/readme/g1-quest-webcam-highlights.mp4?raw=true)
+joins the four excerpts in the table's order. Each excerpt preserves **1× wall-clock
+playback**; the cuts do not depict one continuous carry-and-place task.
+
+All listed files are under `docs/readme/`. Each clip has a matching PNG poster basename.
+Times are offsets into the original recording, not simulation timestamps; clip end
+times are exclusive.
+
+| Clip | Source start → end | Duration | Poster source time |
+|---|---|---:|---:|
+| [`g1-carton-lift-webcam.mp4`](docs/readme/g1-carton-lift-webcam.mp4?raw=true) | 141.0 → 150.0 s (02:21 → 02:30) | 9 s | 147 s |
+| [`g1-hand-tracking-webcam.mp4`](docs/readme/g1-hand-tracking-webcam.mp4?raw=true) | 60.0 → 72.0 s (01:00 → 01:12) | 12 s | 68 s |
+| [`g1-factory-walking-webcam.mp4`](docs/readme/g1-factory-walking-webcam.mp4?raw=true) | 440.0 → 449.5 s (07:20 → 07:29.5) | 9.5 s | 445 s |
+| [`g1-small-object-webcam.mp4`](docs/readme/g1-small-object-webcam.mp4?raw=true) | 679.0 → 692.0 s (11:19 → 11:32) | 13 s | 686 s |
+
+Videos use **1600×900, silent H.264, 30 fps**. The composed layout takes the recorded
+right VR-eye crop at **x=734, y=68, width=464, height=454** and webcam crop at
+**x=1468, y=118, width=512, height=384**. Both views are scaled with their aspect ratios
+preserved and placed beside captions; the PNG posters use the same layout. These are
+cropped and composed views of recorded frames, not unmodified full-screen screenshots.
+No source audio, generated imagery or interpolated motion frames are included.
+The export changes neither the robot, camera controls nor gaze implementation.
+
+The timing recipe for each clip is `duration = end - start` and
+`output_time = source_time - start`. In FFmpeg terms, trim to the source interval,
+reset timestamps with `setpts=PTS-STARTPTS`, select recorded frames at `fps=30`, crop
+the two views, scale with aspect ratio preserved and composite the captions. There is
+no speed multiplier. The reel concatenates clips at offsets **0, 9, 21 and 30.5 s**,
+ending at **43.5 s**. `g1-quest-webcam-preview.gif` selects source **144–149 s**
+(carton-clip offsets **3–8 s**), resized to **640×360 at 8 fps** for a five-second,
+40-frame loop.
+
+The clips show selected visible actions, not a measured success rate or a complete
+successful placement. Webcam hand landmarks are visible, but footage alone does not
+identify which input source drove the robot at every moment or establish tracking
+accuracy, grip pressure or autonomous operation. The longer recording contains other
+attempts; these excerpts should not be presented as an uninterrupted pickup/carry/place
+run. Implementation and validation limits remain in the
+[validation record](docs/validation/isaac-sim-6.1.md).
+
+### 7 September — historical assisted grasping
+
 ![Both G1 Inspire hands with cyan and orange hand-target markers](docs/readme/g1-inspire-hands.png)
 
 Both Inspire hands in the historical robot-camera recording. The colored spheres
@@ -78,8 +126,8 @@ remain visible. This still does not demonstrate independent finger motion.
 | Bottle pickup, lift, hand transfer, and release | [Silent MP4, 4.1 s](docs/readme/g1-bottle-pickup.mp4?raw=true) | [Animated GIF](docs/readme/g1-bottle-preview.gif) |
 | Package pickup, lift, and release | [Silent MP4, 3.1 s](docs/readme/g1-package-pickup.mp4?raw=true) | [Animated GIF](docs/readme/g1-package-preview.gif) |
 
-The [README gallery](README.md#recorded-g1-demos) displays both animated previews and
-the bottle/package screenshots. All new media comes from local recording
+The [historical README gallery](README.md#7-september--historical-assisted-grasping)
+preserves both animated previews and the bottle/package screenshots. These older assets come from local recording
 `session_2026-09-07_02-40-23`, captured on **7 September 2026**. Its metadata identifies
 Isaac Sim 6.0.0, G1, Inspire hands, stationary locomotion, a world-fixed base, and
 `distance_gated_fixed_joint` grasp assistance. Raw session data is not included here.

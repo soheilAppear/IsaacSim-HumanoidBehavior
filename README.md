@@ -14,12 +14,11 @@ gaze, object states, and images for later analysis and learning experiments.
 [Performance](docs/humanoid-control.md#performance-and-cpu-physics) ·
 [Learning pipeline](learning/README.md)
 
-| G1 bottle lift | G1 package lift |
-|:---:|:---:|
-| ![White Inspire fingers lifting a yellow bottle](docs/readme/g1-bottle-lift.png) | ![Right Inspire hand lifting a highlighted package](docs/readme/g1-package-lift.png) |
+[![G1 carton lift beside the operator's webcam view](docs/readme/g1-carton-lift-webcam.png)](docs/readme/g1-quest-webcam-highlights.mp4?raw=true)
 
-Robot-camera screenshots from the **7 September 2026** G1 recording, at their native
-256×256 resolution. Colored targets and gaze highlights are part of the recorded scene.
+**[Watch the 43.5-second demonstration](docs/readme/g1-quest-webcam-highlights.mp4?raw=true)**
+— selected moments from **20 September 2026**, with the robot view and operator webcam
+side by side. Silent, **1× wall-clock speed**; cuts separate the four demonstrations.
 
 ## Current behavior
 
@@ -190,8 +189,8 @@ remains unresolved:** both tested approaches failed to establish an opposing pin
 although the robot remained stable. Earlier smaller-cube successes were also inconsistent.
 Real headset handling remains unverified for this fix. See the
 [validation record](docs/validation/isaac-sim-6.1.md).
-The earlier fixed-joint assisted mode remains selectable for comparison; the recorded
-demos below show that older assisted mode.
+The earlier fixed-joint assisted mode remains selectable for comparison; the historical
+7 September demos below show that older assisted mode.
 Each actuator retains its first-contact closing cap, with a **0.18 rad** lead,
 preventing further closure from following a finger as it rolls over the contacted
 body. A contact-report gap of up to **40 ms of simulation time** retains the command
@@ -210,8 +209,37 @@ are unchanged; head-view rotation is described above.
 
 ## Recorded G1 demos
 
-These excerpts show **assisted pickup, lifting, and release** in a recorded stationary
-G1 session. Click a preview to open its video file, or use the MP4 links below.
+### 20 September — robot and operator views
+
+Four curated excerpts show a carton lift, hand/finger movement, factory walking and
+small-object manipulation. Each combines recorded robot-eye and webcam views at
+**1× wall-clock speed**. Click a still to watch its clip, or
+[watch all four in the 43.5-second reel](docs/readme/g1-quest-webcam-highlights.mp4?raw=true).
+
+[![Five-second preview of the carton lift and operator webcam](docs/readme/g1-quest-webcam-preview.gif)](docs/readme/g1-quest-webcam-highlights.mp4?raw=true)
+
+| Carton lift · 9 s | Hand/finger movement · 12 s |
+|:---:|:---:|
+| [![Carton raised in the robot view alongside the operator webcam](docs/readme/g1-carton-lift-webcam.png)](docs/readme/g1-carton-lift-webcam.mp4?raw=true) | [![Robot hands and the operator's hand landmarks](docs/readme/g1-hand-tracking-webcam.png)](docs/readme/g1-hand-tracking-webcam.mp4?raw=true) |
+| [Watch / download MP4](docs/readme/g1-carton-lift-webcam.mp4?raw=true) | [Watch / download MP4](docs/readme/g1-hand-tracking-webcam.mp4?raw=true) |
+| **Factory walking · 9.5 s** | **Small-object manipulation · 13 s** |
+| [![Robot-eye factory view alongside the operator webcam](docs/readme/g1-factory-walking-webcam.png)](docs/readme/g1-factory-walking-webcam.mp4?raw=true) | [![Small-object interaction beside the operator webcam](docs/readme/g1-small-object-webcam.png)](docs/readme/g1-small-object-webcam.mp4?raw=true) |
+| [Watch / download MP4](docs/readme/g1-factory-walking-webcam.mp4?raw=true) | [Watch / download MP4](docs/readme/g1-small-object-webcam.mp4?raw=true) |
+
+The videos are silent H.264, **1600×900 at 30 fps**. The five-second GIF previews
+the carton lift. The reel contains four separate demonstrations; the webcam panel
+provides a synchronized view of the operator and detected landmarks.
+See [source timestamps and export details](HUMANOID_VR_CONTROL.md#20-september--webcam-and-robot-demonstration).
+
+### 7 September — historical assisted grasping
+
+These older excerpts show **assisted pickup, lifting, and release** in a recorded
+stationary G1 session. They use a fixed-joint grasp assist and do not validate the
+current physical-contact mode. Click a preview to open its video file.
+
+| Bottle lift screenshot | Package lift screenshot |
+|:---:|:---:|
+| ![Historical assisted bottle lift](docs/readme/g1-bottle-lift.png) | ![Historical assisted package lift](docs/readme/g1-package-lift.png) |
 
 | Bottle pickup and transfer | Package pickup and release |
 |:---:|:---:|
