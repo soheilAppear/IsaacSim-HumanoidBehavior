@@ -3,7 +3,10 @@
 
 """Run pretrained webcam body tracking in a process separate from Isaac Sim.
 
-Only landmark JSON travels over localhost UDP; camera images are never recorded.
+The recording launcher uses ``--preview-only``: landmarks are drawn locally,
+without a UDP socket, robot input, or calibration requests. Direct Python use
+without this flag retains the experimental localhost landmark sender. Camera
+images are never recorded by this tool.
 Inference uses MediaPipe Tasks VIDEO mode on the newest available camera frame.
 The capture thread overwrites its one-frame slot, so slow inference cannot build a
 queue of old poses. Optional detailed hand inference adds CPU cost.
@@ -279,7 +282,9 @@ class LatestFrameCapture:
             self._capture.release()
 
 
-def _draw_preview(cv2: Any, frame: Any, packet: dict, mirror: bool, elapsed_ms: float) -> Any:
+def _draw_preview(
+    cv2: Any, frame: Any, packet: dict, mirror: bool, elapsed_ms: float, *, preview_only: bool = False
+) -> Any:
     """Draw landmarks on a display copy without mirroring tracking coordinates."""
     height, width = frame.shape[:2]
     preview = frame.copy()
@@ -300,11 +305,15 @@ def _draw_preview(cv2: Any, frame: Any, packet: dict, mirror: bool, elapsed_ms: 
     if mirror:
         preview = cv2.flip(preview, 1)
     status = "Body visible" if packet["pose_world"] else "No body detected - step back into view"
-    lines = (
-        f"{status} | {elapsed_ms:.0f} ms | Hands: {len(packet['hand_world'])}",
-        "Quest remains primary. C: request calibration | Q/Esc: quit",
-        f"Calibration request: {packet['calibration_request']} (check Isaac status for result)",
+    mode_lines = (
+        ("DISPLAY ONLY - robot uses Quest/controllers", "Q/Esc: quit | Calibration disabled")
+        if preview_only
+        else (
+            "Experimental UDP sender. C: request calibration | Q/Esc: quit",
+            f"Calibration request: {packet['calibration_request']} (check Isaac status for result)",
+        )
     )
+    lines = (f"{status} | {elapsed_ms:.0f} ms | Hands: {len(packet['hand_world'])}", *mode_lines)
     for index, line in enumerate(lines):
         location = (12, 26 + index * 26)
         cv2.putText(preview, line, location, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
@@ -324,6 +333,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pose-model", choices=("lite", "full"), default="lite")
     parser.add_argument("--model-dir", type=Path, default=MODEL_DIR)
     parser.add_argument("--hands", action="store_true", help="Also estimate 21 landmarks per hand; increases CPU use")
+    parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Display landmarks only; no robot UDP socket or calibration requests",
+    )
     parser.add_argument("--headless", action="store_true", help="No preview; stop with Ctrl+C")
     parser.add_argument("--unmirrored-preview", action="store_true", help="Display camera view instead of a mirror")
     parser.add_argument("--download-models", action="store_true", help="Allow missing official model downloads")
@@ -333,7 +347,7 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    """Run camera inference and send landmarks, releasing resources on all exits."""
+    """Run local inference, optionally sending landmarks in experimental sender mode."""
     paths = prepare_models(args.model_dir, args.pose_model, args.hands, args.download_models or args.download_only)
     if args.download_only:
         LOG.info("Models ready: %s", ", ".join(str(path) for path in paths.values()))
@@ -392,21 +406,27 @@ def run(args: argparse.Namespace) -> int:
         frames = LatestFrameCapture(capture)
         cleanup.callback(frames.close)
         cleanup.callback(cv2.destroyAllWindows)
-        sender = cleanup.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
-        sender.setblocking(False)
+        sender = None
+        if not args.preview_only:
+            sender = cleanup.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+            sender.setblocking(False)
         session = str(uuid.uuid4())
         seq = frame_sequence = calibration_request = 0
         last_timestamp_ms = -1
         started = last_frame_time = last_status = time.monotonic()
         next_inference = started
-        LOG.info(
-            "Tracking webcam %s -> 127.0.0.1:%s, pose %s, detailed hands %s",
-            args.camera,
-            args.port,
-            args.pose_model,
-            args.hands,
-        )
-        LOG.info("No camera recording. Keep only the operator in view; C requests calibration, Q/Esc exits.")
+        if args.preview_only:
+            LOG.info("DISPLAY ONLY: webcam %s, pose %s, detailed hands %s", args.camera, args.pose_model, args.hands)
+            LOG.info("No robot control, UDP socket, calibration, or camera recording. Q/Esc exits.")
+        else:
+            LOG.info(
+                "Experimental webcam sender %s -> 127.0.0.1:%s, pose %s, detailed hands %s",
+                args.camera,
+                args.port,
+                args.pose_model,
+                args.hands,
+            )
+            LOG.info("No camera recording. C requests calibration; Q/Esc exits.")
         while not args.duration or time.monotonic() - started < args.duration:
             snapshot = frames.next_frame(frame_sequence)
             if snapshot is None:
@@ -434,30 +454,33 @@ def run(args: argparse.Namespace) -> int:
                 calibration_request=calibration_request,
             )
             seq += 1
-            try:
-                sender.sendto(encode_packet(packet), ("127.0.0.1", args.port))
-            except BlockingIOError:
-                # Losing one observation is preferable to delaying future poses.
-                pass
+            if sender is not None:
+                try:
+                    sender.sendto(encode_packet(packet), ("127.0.0.1", args.port))
+                except BlockingIOError:
+                    # Losing one observation is preferable to delaying future poses.
+                    pass
             latency_ms = (time.perf_counter_ns() - captured_ns) / 1_000_000
             if not args.headless:
                 cv2.imshow(
                     "Humanoid webcam tracking",
-                    _draw_preview(cv2, frame, packet, not args.unmirrored_preview, latency_ms),
+                    _draw_preview(
+                        cv2, frame, packet, not args.unmirrored_preview, latency_ms, preview_only=args.preview_only
+                    ),
                 )
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break
                 if cv2.getWindowProperty("Humanoid webcam tracking", cv2.WND_PROP_VISIBLE) < 1:
                     break
-                if key == ord("c"):
+                if key == ord("c") and sender is not None:
                     calibration_request += 1
                     LOG.info(
                         "Calibration requested; hold both wrists visible to Quest and webcam and check Isaac status"
                     )
             if time.monotonic() - last_status >= 5.0:
                 LOG.info(
-                    "Body %s, hands %s, frame age %.0f ms, sent %s frames",
+                    "Body %s, hands %s, frame age %.0f ms, processed %s frames",
                     bool(packet["pose_world"]),
                     len(packet["hand_world"]),
                     latency_ms,
@@ -472,6 +495,8 @@ def main(argv: list[str] | None = None) -> int:
     """Validate options and report actionable setup/camera errors without a traceback."""
     parser = create_parser()
     args = parser.parse_args(argv)
+    if args.preview_only and args.headless:
+        parser.error("Preview-only mode needs a display; remove --headless")
     if args.camera < 0 or not 1 <= args.port <= 65535 or not 1 <= args.fps <= 120:
         parser.error("Camera must be nonnegative, port 1..65535, and FPS 1..120")
     if not 160 <= args.width <= 4096 or not 120 <= args.height <= 2160 or not 0 <= args.duration < math.inf:

@@ -33,7 +33,7 @@ launcher is an alias for it.
 |---|---|
 | Arm control | Valid optical wrist/middle-knuckle positions drive an anatomical palm target without a grip button or fist; controller grip holds enable arm movement, and release holds the arm pose. Measured contacts limit inward arm motion |
 | Finger control | Five independent curl targets and separate thumb opposition from the optical skeleton; each controller index trigger proportionally closes that hand's fingers |
-| Optional webcam | Quest remains primary for each arm and hand; calibrated webcam position, elbow guidance, and optional finger curls are used only for missing Quest input |
+| Webcam preview | Display the operator and MediaPipe landmarks for observation/recording only; no robot arm, finger or body input |
 | Pickup | Experimental physical contact grasping with bounded finger targets; objects must be held by fingers and friction, with no hand-to-object fixed joint |
 | Camera | Stabilized robot frame follows travel; HMD orientation rotates the view and its eye offset around the measured neck. Torso roll/pitch, gait bob, and real-world head translation are excluded |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
@@ -294,12 +294,13 @@ the updated classes.
 
 ### Optional webcam alongside Quest
 
-The webcam tracker runs in its own Python environment. It sends landmarks over
-localhost; it does not install ML packages into Isaac. Enable it explicitly and
-calibrate with both hands visible to Quest and the webcam before using fallback.
-See [webcam setup and calibration](HUMANOID_VR_CONTROL.md#webcam-alongside-quest)
-for commands and tracking-loss behavior. This is an experimental single-camera
-input, not full-body locomotion or reliable tracking through occlusion.
+The webcam is **display-only**. Run `tools\launch_webcam_tracking.bat --hands` to show
+the operator with body/finger landmarks; capture its **Humanoid webcam tracking**
+window in OBS. The launcher always selects `--preview-only`: no UDP socket or robot
+input is sent, and C cannot request calibration. Standard Isaac launchers force
+`G1_WEBCAM_ENABLED=0`, including walking, overriding an old `1` environment value.
+Only Quest optical hands or VR controllers control robot arms/fingers. See
+[webcam preview setup](HUMANOID_VR_CONTROL.md#webcam-alongside-quest).
 
 ### Controller walking and optical manipulation
 
@@ -348,8 +349,8 @@ an arm and trigger closes its fingers. You can release grip to hold the arm pose
 keeping trigger squeezed and using the sticks. When switching to bare hands, valid
 optical poses and individual fingers take over; stale stick values are cleared.
 Returning to controllers requires centered sticks before movement resumes. Controller
-trigger closure is not measured finger tracking. Calibrated webcam input remains an
-optional fallback when primary input is unavailable. To deliberately retain the former
+trigger closure is not measured finger tracking. The webcam remains display-only and
+cannot replace missing Quest input. To deliberately retain the former
 optical-only manipulation profile, set `G1_OPTICAL_HANDS_ONLY=1` before launching;
 otherwise the launcher defaults it to `0` without replacing an explicit override.
 
@@ -486,8 +487,8 @@ while carrying a package.
 **Stop before precision pickup:**
 the tested extended right palm remained about 9–10 cm from its target while walking
 and stopped. The new tall-carton pickup, floor pickup, crouching, and payload
-carrying are not established by earlier replays. Gaze
-and the external webcam fallback pipeline are unchanged. See the
+carrying are not established by earlier replays. Gaze is unchanged;
+webcam robot input is disabled in standard launches. See the
 [walking controls and current limits](HUMANOID_VR_CONTROL.md#controller-walking-and-optical-manipulation)
 and [policy provenance](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/robots/data/README.md).
 
@@ -531,7 +532,7 @@ for the cube, bring the thumb pad across to face the index pad on opposite sides
 Making a fist nearby is insufficient. See the [full control guide](HUMANOID_VR_CONTROL.md#controls)
 for input mapping, tracking loss, and release behavior.
 
-If optical arm tracking disappears without a calibrated webcam alternative,
+If the active Quest/controller arm input disappears,
 physical mode holds the measured arm pose until tracking returns. Missing finger
 input still opens the fingers. This prevents an automatic return to rest from
 dragging a hand through the table.
@@ -757,9 +758,9 @@ for files and columns.
 
 The [learning directory](learning/README.md) contains the planned dataset and
 world-model workflow. A trained planner is not integrated into the current robot
-controller. Optional webcam arm and finger fallback is implemented; Quest remains
-the primary source. After live calibration and contact grasping pass operator
-checks, the [next research phase](HUMANOID_VR_CONTROL.md#next-research-phase) can
+controller. Webcam arm/finger fallback code is retained as a disabled experiment;
+the current webcam only displays the operator and landmarks. After contact grasping
+passes operator checks, the [next research phase](HUMANOID_VR_CONTROL.md#next-research-phase) can
 investigate gaze and hand/finger velocity as intent cues. Velocity is not measured
 finger pressure. A new intent-training pipeline is not implemented yet.
 

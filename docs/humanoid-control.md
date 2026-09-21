@@ -47,12 +47,29 @@ palm alignment and response changes still require a live hardware acceptance che
 
 ## Optional webcam input
 
+**Current mode is display-only.** `tools/launch_webcam_tracking.bat` always selects
+`--preview-only`: MediaPipe body/optional hand inference and the preview stay active,
+but no UDP socket is created, no packet is encoded/sent, and C cannot increment a
+calibration request. `--headless` is rejected with this mode. The overlay identifies
+it as **DISPLAY ONLY - robot uses Quest/controllers**. Standard Isaac launchers force
+`G1_WEBCAM_ENABLED=0`, including walking, overriding a stale `1` environment value.
+Quest optical tracking or controllers are the robot's arm/finger sources; the webcam
+is only an operator/landmark view suitable for OBS capture.
+
 `tools/webcam_tracking.py` runs MediaPipe Tasks on CPU in a separate environment
 and process. A capture thread retains only its newest frame. Pose inference uses
 VIDEO mode and shared `perf_counter_ns()` timestamps; optional `--hands` adds detailed hand
 inference. The default lite model targets 24 updates/s. Actual rate and frame age
 depend on the camera and PC load. Frame timestamps mark availability after
 OpenCV `read()`, so reported age excludes unknown exposure/driver buffering.
+
+### Retained sender/receiver experiment — disabled
+
+The architecture below describes the earlier robot-input experiment, not the current
+preview workflow. It remains for future manual development. Directly running
+`tools/webcam_tracking.py` without `--preview-only` retains sender behavior; the
+standard `.bat` preview launcher offers no sender override. Its historical validation
+does not imply that current previews influence the robot.
 
 The humanoid-side `webcam_tracking.py` has no OpenCV or MediaPipe dependency.
 It receives bounded JSON datagrams on loopback UDP port 8765, rejects malformed,
@@ -76,7 +93,8 @@ Quest palm target supplies alignment.
 This prototype assumes a single operator and requires visible shoulders and hips.
 No network training or full-body locomotion is introduced.
 
-`G1_WEBCAM_ENABLED=1` opts in for new humanoid instances. Runtime helpers are
+Outside the standard launchers, `G1_WEBCAM_ENABLED=1` can configure a manually created
+experimental instance; standard launches always override it to `0`. Retained helpers are
 `enable_webcam_tracking(port=8765)`, `disable_webcam_tracking()`,
 `request_webcam_calibration()`, and `webcam_tracking_status()`.
 Reset/reload, sender restart, and headset recenter invalidate calibration.
@@ -98,6 +116,8 @@ it returns; no optical skeleton is fabricated from trigger closure. A released
 controller grip means hold, not automatic webcam takeover. The explicit
 `G1_OPTICAL_HANDS_ONLY=1` option disables controller manipulation and permits the
 existing calibrated webcam fallback while a device remains controller-classified.
+These fallback capabilities require deliberate manual experimental activation; the
+current launchers disable webcam input even when optical-only manipulation is selected.
 See [operator setup](../HUMANOID_VR_CONTROL.md#webcam-alongside-quest) and the
 [validation record](validation/isaac-sim-6.1.md) for tested scope.
 
@@ -195,8 +215,8 @@ Move one finger at a time to control the corresponding robot finger; thumb oppos
 is independent of thumb flexion. Inspire has six actuators: each finger's distal joints
 are mechanically coupled, so individual human knuckles and finger splay cannot all be
 reproduced independently. Controllers retain whole-hand trigger closure; individual
-finger tracking uses the optical skeleton from the headset, or valid detailed
-webcam hand landmarks during the optional calibrated fallback.
+finger tracking uses the optical skeleton from the headset. Webcam landmarks are
+display-only in current launches; its old finger fallback is disabled.
 The stationary robot cannot walk to the distant side benches or lower its base to reach
 the floor. Experimental gesture walking adds floor cartons and tall lightweight cartons
 with handles at standing hand height. Stop before grasping a handle; oppose the thumb,
@@ -878,9 +898,10 @@ closure remains independent, so it can stay held while the arm holds and sticks 
 the robot. Valid optical input takes priority when the device returns to hand mode.
 The current runtime switches between controller and optical input rather than supplying
 both together. Trigger-derived curls remain identified as controller input, not measured
-optical fingers. Calibrated webcam input is a separate fallback; a released controller
-grip still means hold. Explicit optical-only mode retains its former source selection.
-Webcam input cannot authorize walking. Hardware concurrency and loaded movement remain
+optical fingers. The webcam is now display-only and cannot supply arm/finger fallback;
+a released controller grip still means hold. Explicit optical-only mode disables
+controller manipulation without enabling webcam input. Webcam input cannot authorize
+walking. Hardware concurrency and loaded movement remain
 unvalidated.
 
 XR hand devices, input classification and landmark snapshots are shared only within
@@ -986,7 +1007,7 @@ $env:G1_POINTING_NAVIGATION = '1'
 
 Run the command above from the repository root, then LOAD a fresh
 Humanoid scene. `G1_GESTURE_WALKING=1` is read before example construction
-and inherits the normal Quest, gaze, and optional webcam launch settings. It selects
+and inherits the normal Quest/gaze settings and disabled webcam receiver. It selects
 policy locomotion with strict physical behavior. Default launches remain stationary.
 Changing the environment variable after loading cannot safely change articulation
 anchoring; restart and rebuild the scene when changing modes.
@@ -1112,8 +1133,8 @@ reset/clear drops cached handles.
 The pretrained NVlabs GR00T-WholeBodyControl G1 Balance/Walk models output 15
 leg/waist targets and observe measured positions and velocities for all 29 body
 joints. Existing arm IK supplies the remaining body
-targets; Quest stays primary and the calibrated webcam retains its existing fallback
-role. The current G1 weights remain unchanged. Like the H1 sample, locomotion is
+targets from Quest optical tracking or controllers; webcam robot input is disabled
+in standard launches. The current G1 weights remain unchanged. Like the H1 sample, locomotion is
 learned joint actuation, but H1's network is not transplanted onto the G1 morphology.
 These are GR00T **Whole-Body Control** locomotion checkpoints, not the GR00T
 foundation/VLA model. The adapter loads `robots/data/g1_decoupled_walk.onnx` and
@@ -1351,8 +1372,8 @@ and arbitrary simultaneous reaching/walking are not validated by these replays.
 Real Quest stable pointing, destination acquisition, steering, release,
 arrival, obstacle rejection, and cached-valid occlusion tests remain required.
 Three Stop/Play and two Pause/Play cycles separately passed with real XR active
-and no fault. The old replays do not validate the new selector. Gaze and webcam
-arbitration are unchanged.
+and no fault. The old replays do not validate the new selector; they preserved their
+then-active gaze and webcam arbitration. Current launches disable webcam robot input.
 
 The historical controller replay CLI runs against an already-loaded walking scene:
 
@@ -2064,10 +2085,10 @@ Headset hardware tracking and optional walking modes require separate live check
 
 ## Later milestones
 
-The optional RGB-webcam helper is now implemented; see [its architecture](#optional-webcam-input).
-The next hardware checks are headset-worn recognition, real field-of-view handover,
-and end-to-end latency. Quest hand and eye inputs stay authoritative, with webcam
-arms and fingers used only for missing input. Hip-relative estimated 3D coordinates
+The RGB-webcam helper currently provides an operator/landmark preview only; its
+[earlier input architecture](#optional-webcam-input) is retained but disabled.
+If webcam control is deliberately revisited later, hardware checks would include
+headset-worn recognition, field-of-view handover and end-to-end latency. Hip-relative estimated 3D coordinates
 are not measured room depth, and the current calibration does not establish metric
 camera extrinsics. [MediaPipe Python guide](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker/python)
 

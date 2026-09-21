@@ -377,8 +377,8 @@ holds the arm pose; a held trigger retains closure while the sticks remain avail
 Stop before switching to bare hands: valid optical palms and fingers then take over,
 and retained stick values are invalidated. Center both sticks again when returning
 to controllers. Trigger closure is a control command, not optical finger measurement.
-The optional calibrated webcam remains a fallback when primary input is unavailable.
-Its visibility, latency and calibration limits still apply.
+The webcam is display-only and never replaces missing Quest/controller input in the
+current setup. Only Quest optical hands or controllers control robot arms and fingers.
 
 The walking launcher defaults `G1_OPTICAL_HANDS_ONLY=0`. An explicit environment
 override is preserved: set it to `1` before launch to disable controller manipulation
@@ -448,8 +448,8 @@ launch `tools\launch_isaac_vr.bat` normally, with `G1_GESTURE_WALKING` unset or 
 Navigation uses **Quest optical left-hand tracking**. Webcam fallback and controller
 poses cannot start or sustain walking. Eye tracking and the red ray keep their
 existing behavior independently: gaze direction, loss, and `hmd_forward` fallback
-do not gate selection or walking. The optional webcam retains its existing arm
-and finger fallback behavior.
+do not gate selection or walking. Webcam robot input is now disabled by the standard
+launchers; its former arm/finger fallback remains a separate, disabled experiment.
 
 | Action | Navigation result |
 |---|---|
@@ -734,43 +734,21 @@ workflow. Its commands are listed under [optional experiments](#optional-moving-
 
 ## Webcam alongside Quest
 
-The optional webcam process runs pretrained MediaPipe body tracking outside Isaac.
-It estimates shoulders, elbows, and wrists. Quest remains the primary arm and finger
-input independently for each side. Webcam arm targets and elbow guidance apply
-only when that Quest arm input is unavailable; webcam fingers apply only when
-Quest finger input is unavailable. Losing webcam visibility cannot stop valid
-Quest control. If neither camera sees a hand, the arm holds its pose and missing
-finger input opens the fingers. The robot base stays fixed. Eye gaze and the mounted head camera keep
-their existing implementation.
+The webcam now **only displays the operator and body/hand landmarks** for observation
+or recording. It does not control the robot, including when Quest tracking is lost.
+Robot arms/fingers use Quest optical tracking or VR controllers. Gaze and camera
+control are unchanged. This mode applies to current launches; it does not establish
+the input configuration used in earlier published recordings.
 
 1. Open PowerShell in the repository folder and prepare the separate environment
-   and pretrained models. These launchers belong to this repository, not the
-   downloaded Isaac installation:
+   and pretrained models once:
 
    ```powershell
    Set-Location "C:\Users\Soheil\Documents\GitHub\IsaacSim-HumanoidBehavior"
    python tools/webcam_setup.py
    ```
 
-2. Launch the updated Isaac checkout with webcam reception enabled:
-
-   ```powershell
-   Set-Location "C:\Users\Soheil\Documents\GitHub\IsaacSim-HumanoidBehavior"
-   $env:G1_WEBCAM_ENABLED = "1"
-   .\tools\launch_isaac_vr.bat
-   ```
-
-   Load **Policy → Humanoid**, then Play. In an already-running session that has
-   loaded this updated code, enable reception with:
-
-   ```powershell
-   python tools/kit_exec.py "EX.enable_webcam_tracking()"
-   ```
-
-   Set the environment variable in the terminal that launches Isaac. Setting it
-   in the webcam terminal does not enable reception in an already-running Isaac.
-
-3. In another terminal, enter the same repository folder and start the webcam preview:
+2. Start the display-only preview in its own terminal:
 
    ```powershell
    Set-Location "C:\Users\Soheil\Documents\GitHub\IsaacSim-HumanoidBehavior"
@@ -781,54 +759,29 @@ their existing implementation.
    folder with `Get-Location` and run the `Set-Location` command above. Both
    launchers resolve their own files after they start.
 
-   Omit `--hands` for body tracking only, which costs less CPU. Use `--camera 1`
+   Omit `--hands` for body landmarks only, which costs less CPU. Use `--camera 1`
    to select a second camera. Close other applications using that camera if it
    cannot be opened. No webcam image files are recorded by this tool.
 
-4. Position the webcam so it sees your shoulders, hips, elbows, and hands. Keep
-   one person in view, with good lighting. Face the webcam, wear the headset, and
-   hold both open hands in front of you where Quest can also track them. With
-   the webcam preview focused, press **C** to request calibration. Hold that pose
-   until the simulator confirms calibration. The preview's request message alone
-   does not mean calibration succeeded. If input is unavailable for ten seconds,
-   the request expires; get both hands into view and press C again.
+3. Position the camera to show your hands, with good lighting. In OBS, capture the
+   **Humanoid webcam tracking** window instead of opening the same webcam again.
+   The overlay reads **DISPLAY ONLY - robot uses Quest/controllers**. Press **Q** or
+   **Esc** to close it. **C is ignored; calibration is disabled.**
 
-5. Check simulator status:
+`launch_webcam_tracking.bat` always adds `--preview-only`. In that mode the process
+creates no UDP socket and never encodes or sends robot-input packets. It keeps local
+MediaPipe inference and visible landmarks; `--headless` is incompatible with this
+display-only launcher. Standard Isaac launchers force `G1_WEBCAM_ENABLED=0`, including
+the controller walking profile, even if an older terminal has it set to `1`.
 
-   ```powershell
-   python tools/kit_exec.py "print(EX.webcam_tracking_status())"
-   ```
+The old UDP sender/receiver and calibration code remain for a future manually enabled
+experiment, not the current workflow. Running `tools/webcam_tracking.py` directly
+without `--preview-only` retains that sender behavior; use the `.bat` preview launcher
+for recording. A camera image cannot control the robot through this preview mode.
 
-   Confirm calibration before moving a hand beyond the headset cameras. Move
-   slowly for the first test. Return it to Quest's view and confirm control
-   returns smoothly. Press **Q** or **Esc** in the webcam preview to stop it.
-
-Detailed fingers require `--hands`, a sufficiently large hand image, and complete
-visible landmarks. Body landmarks alone cannot recover individual finger bends.
-During webcam arm fallback, the robot holds the last wrist orientation; this first
-version maps arm positions and finger curls, not webcam-derived palm rotation.
-When neither source sees a hand reliably, the arm holds and the fingers open;
-a held object can therefore be released. A valid controller remains authoritative:
-releasing its grip holds that arm instead of activating webcam fallback.
-
-Calibration aligns the webcam's estimated body-relative arm positions to the
-current Quest targets and scales human arm length to the robot. Recalibrate after
-restarting the tracker, resetting/reloading the scene, or recentering with **B**.
-This camera does not measure precise room depth. Hands behind your body, crossing
-wrists, poor light, and motion blur can still cause tracking loss. It does not
-command the pelvis, legs, neck, or gaze.
-
-To disable webcam input while leaving Quest active:
-
-```powershell
-python tools/kit_exec.py "EX.disable_webcam_tracking()"
-```
-
-For later launches, remove the opt-in environment variable with
-`Remove-Item Env:G1_WEBCAM_ENABLED -ErrorAction SilentlyContinue`.
 The environment and model cache live in ignored `.webcam/`. Model setup downloads
-Google's pretrained task files. Inference is local and only landmark JSON is sent
-by our tracker to `127.0.0.1`; MediaPipe's own package privacy terms apply to its
+Google's pretrained task files. Inference is local; this preview sends no landmark
+JSON to Isaac. MediaPipe's own package privacy terms apply to its
 usage/performance metrics. See the official
 [Pose Landmarker guide](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker/python)
 and [MediaPipe package notice](https://pypi.org/project/mediapipe/1.0.1/).
@@ -1027,10 +980,10 @@ arm poses, tracking loss, repeated physical pinch/wrap/lift/release on the small
 and wall-clock latency. The following milestones are designs, not enabled features
 or a new training pipeline.
 
-**Validate webcam fallback.** The separate MediaPipe helper and calibrated arm/finger
-fallback are now implemented; see [Webcam alongside Quest](#webcam-alongside-quest).
-Quest remains primary. Webcam elbow guidance applies only while that arm is using
-webcam input. Next, measure field-of-view handover, tracking confidence, latency,
+**Possible later webcam-input study.** The sender and calibrated arm/finger fallback
+are retained but disabled; the current [webcam preview](#webcam-alongside-quest) is
+display-only. If webcam robot input is deliberately revisited, measure field-of-view
+handover, tracking confidence, latency,
 and calibration repeatability while wearing the actual headset. The hip-relative
 landmarks are estimates rather than measured room depth, and neither camera can
 recover a hand hidden from both views.

@@ -24,10 +24,12 @@ REM remains enabled. In-place asset variant/reference edits require a fresh load
 REM Set ISAAC_DIR before calling this script to use a different installation.
 REM Keep one complete extension version per session. Reloading partially edited
 REM Python files can crash the examples browser while a VR scene is running.
-REM Optional webcam fallback: set G1_WEBCAM_ENABLED=1 before launch, then run
-REM tools\launch_webcam_tracking.bat separately and explicitly calibrate with C.
+REM Webcam landmarks are display-only for the current demonstration profile.
+REM Quest hand tracking and VR controllers alone control robot arms and fingers.
 
 setlocal DisableDelayedExpansion
+REM Override stale opt-ins left in a terminal by the earlier fallback workflow.
+set "G1_WEBCAM_ENABLED=0"
 
 if not defined ISAAC_DIR set "ISAAC_DIR=C:\Users\Soheil\Downloads\isaac-sim-standalone-6.1.0-windows-x86_64"
 if not exist "%ISAAC_DIR%\isaac-sim.xr.vr.bat" (

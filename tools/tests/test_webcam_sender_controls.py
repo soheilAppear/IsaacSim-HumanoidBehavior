@@ -15,8 +15,9 @@ import time
 import types
 import unittest
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "webcam_tracking.py"
 SPEC = importlib.util.spec_from_file_location("webcam_tracking_under_test", MODULE_PATH)
@@ -62,8 +63,11 @@ class TestWebcamSenderControls(unittest.TestCase):
         self.assertEqual(json.loads(SENDER.encode_packet(packet)), packet)
 
     def test_sent_timestamp_uses_shared_qpc_clock_not_python_specific_monotonic_epoch(self) -> None:
-        with patch.object(SENDER.time, "perf_counter_ns", return_value=123456799), patch.object(
-            SENDER.time, "monotonic_ns", side_effect=AssertionError("Do not use Python-specific clock epoch")
+        with (
+            patch.object(SENDER.time, "perf_counter_ns", return_value=123456799),
+            patch.object(
+                SENDER.time, "monotonic_ns", side_effect=AssertionError("Do not use Python-specific clock epoch")
+            ),
         ):
             packet = self.packet(pose_fixture())
         self.assertEqual(packet["capture_monotonic_ns"], 123456789)
@@ -145,6 +149,7 @@ class TestWebcamSenderControls(unittest.TestCase):
         self.assertFalse(args.hands)
         self.assertFalse(args.download_models)
         self.assertFalse(args.download_only)
+        self.assertFalse(args.preview_only)  # Direct Python retains the experimental sender.
 
     def test_latest_capture_skips_buffered_frames_and_releases_camera(self) -> None:
         finished = threading.Event()
@@ -162,8 +167,11 @@ class TestWebcamSenderControls(unittest.TestCase):
                 return False, None
 
         capture.read.side_effect = read
-        with patch.object(SENDER.time, "perf_counter_ns", return_value=987654321), patch.object(
-            SENDER.time, "monotonic_ns", side_effect=AssertionError("Do not use Python-specific clock epoch")
+        with (
+            patch.object(SENDER.time, "perf_counter_ns", return_value=987654321),
+            patch.object(
+                SENDER.time, "monotonic_ns", side_effect=AssertionError("Do not use Python-specific clock epoch")
+            ),
         ):
             frames = SENDER.LatestFrameCapture(capture)
             try:
@@ -176,6 +184,90 @@ class TestWebcamSenderControls(unittest.TestCase):
             finally:
                 frames.close()
         capture.release.assert_called_once_with()
+
+
+class TestWebcamPreviewOnlyControls(unittest.TestCase):
+    def run_three_frames(self, *, preview_only):
+        """Exercise the real loop with camera/model boundaries replaced, including C presses."""
+        args = SENDER.create_parser().parse_args(["--hands", *(["--preview-only"] if preview_only else [])])
+        frame = Mock(shape=(540, 960, 3))
+        frame.copy.return_value = frame
+        cv2 = Mock()
+        cv2.flip.return_value = frame
+        cv2.VideoCapture.return_value.isOpened.return_value = True
+        cv2.waitKey.side_effect = [ord("c"), ord("c"), ord("q")]
+        cv2.getWindowProperty.return_value = 1.0
+        frames = Mock()
+        frames.next_frame.side_effect = [(seq, 1_000_000_000 + seq * 100_000_000, frame) for seq in (1, 2, 3)]
+        pose_model = Mock()
+        pose_model.detect_for_video.return_value = pose_fixture()
+        hand_model = Mock()
+        hand_model.detect_for_video.return_value = hand_fixture(0.8)
+        vision = types.SimpleNamespace(
+            PoseLandmarkerOptions=Mock(),
+            HandLandmarkerOptions=Mock(),
+            RunningMode=types.SimpleNamespace(VIDEO="VIDEO"),
+            PoseLandmarker=types.SimpleNamespace(create_from_options=lambda options: nullcontext(pose_model)),
+            HandLandmarker=types.SimpleNamespace(create_from_options=lambda options: nullcontext(hand_model)),
+        )
+        base_options = Mock()
+        base_options.Delegate = types.SimpleNamespace(CPU="CPU")
+        python_module = types.SimpleNamespace(BaseOptions=base_options, vision=vision)
+        modules = {
+            "cv2": cv2,
+            "mediapipe": Mock(),
+            "mediapipe.tasks": types.SimpleNamespace(python=python_module),
+            "mediapipe.tasks.python": python_module,
+        }
+        ticks = iter(index * 0.1 for index in range(100))
+        network = MagicMock()
+        if preview_only:
+            network.side_effect = AssertionError("Display-only mode must not even create a robot socket")
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(SENDER, "prepare_models", return_value={"lite": Path("pose.task"), "hand": Path("hand.task")}),
+            patch.object(SENDER, "LatestFrameCapture", return_value=frames),
+            patch.object(SENDER.socket, "socket", network),
+            patch.object(SENDER.time, "monotonic", side_effect=lambda: next(ticks)),
+            patch.object(SENDER.time, "perf_counter_ns", return_value=2_000_000_000),
+            patch.object(SENDER, "encode_packet", wraps=SENDER.encode_packet) as encode,
+            patch.object(SENDER, "build_packet", wraps=SENDER.build_packet) as build,
+        ):
+            self.assertEqual(SENDER.run(args), 0)
+        frames.close.assert_called_once_with()
+        cv2.destroyAllWindows.assert_called_once_with()
+        self.assertEqual(cv2.imshow.call_count, 3)
+        self.assertGreater(cv2.line.call_count, 0)  # The body/finger overlays still render.
+        self.assertEqual(pose_model.detect_for_video.call_count, 3)
+        self.assertEqual(hand_model.detect_for_video.call_count, 3)
+        return cv2, network, encode, build
+
+    def test_preview_keeps_overlays_but_c_cannot_open_socket_send_or_calibrate(self):
+        cv2, network, encode, build = self.run_three_frames(preview_only=True)
+        network.assert_not_called()
+        encode.assert_not_called()
+        self.assertEqual([call.kwargs["calibration_request"] for call in build.call_args_list], [0, 0, 0])
+        text = "\n".join(call.args[1] for call in cv2.putText.call_args_list)
+        self.assertIn("DISPLAY ONLY - robot uses Quest/controllers", text)
+        self.assertIn("Calibration disabled", text)
+        self.assertNotIn("C: request calibration", text)
+
+    def test_explicit_direct_python_sender_still_sends_and_calibrates(self):
+        cv2, network, encode, build = self.run_three_frames(preview_only=False)
+        network.assert_called_once_with(SENDER.socket.AF_INET, SENDER.socket.SOCK_DGRAM)
+        sender = network.return_value.__enter__.return_value
+        self.assertEqual(sender.sendto.call_count, 3)
+        self.assertEqual(encode.call_count, 3)
+        self.assertEqual([call.kwargs["calibration_request"] for call in build.call_args_list], [0, 1, 2])
+        for call in sender.sendto.call_args_list:
+            self.assertEqual(call.args[1], ("127.0.0.1", 8765))
+        text = "\n".join(call.args[1] for call in cv2.putText.call_args_list)
+        self.assertIn("Experimental UDP sender", text)
+
+    def test_preview_only_rejects_hidden_preview_before_loading_models_or_camera(self):
+        with patch.object(SENDER, "run") as run, self.assertRaises(SystemExit):
+            SENDER.main(["--preview-only", "--headless"])
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

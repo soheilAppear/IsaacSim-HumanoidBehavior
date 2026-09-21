@@ -1780,9 +1780,9 @@ class HumanoidExample(BaseSample):
     def enable_webcam_tracking(self, port: int = 8765) -> dict:
         """Enable optional loopback landmarks; binding waits for the next physics tick.
 
-        Run ``tools/launch_webcam_tracking.bat`` separately, then press C in its
-        preview while both hands are visible to Quest and the webcam. Enabling
-        reception alone cannot move the robot: explicit alignment is required.
+        Retained for future fallback experiments. The standard webcam launcher
+        is display-only and sends no landmarks. A deliberately started sender
+        and paired Quest/webcam calibration are also required for robot input.
         """
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("Webcam port must be an integer from 1 to 65535")
