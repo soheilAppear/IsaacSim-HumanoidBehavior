@@ -3,6 +3,10 @@ _*/
 .ci-dashboard-venv/
 # Local webcam Python environment, pretrained models, and diagnostic output.
 /.webcam/
+# Local EEG environment and recordings (raw brain signals stay out of Git).
+/.eeg/
+# NeuroSDK creates this diagnostic file in the process working directory.
+/logs/sdk_log.log
 !_impl/
 !docs/isaacsim/_extra/
 # exclude local website repo, used for publishing

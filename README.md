@@ -4,6 +4,87 @@ Control a **Unitree G1 with Inspire five-finger hands** in Isaac Sim using Quest
 controllers or optical hand tracking. The project records hand input, robot joints,
 gaze, object states, and images for later analysis and learning experiments.
 
+## EEG teleoperation development
+
+The `eeg-brainbit-teleoperation-dev` branch starts from `eeg-brainbit-teleop`
+(the `TeleopG1Sim` snapshot at `c5af61c3`). Its first milestone is a standalone
+**BrainBit / BrainBit 2 four-channel recorder and command-preview panel**. It does not send
+movement commands to Isaac Sim. The existing VR launchers remain the robot-control
+entry points.
+
+Set up an isolated environment using a normal 64-bit Python 3.10, 3.11, or 3.12
+installation, outside Isaac Sim's Python:
+
+```powershell
+py -3.11 tools/brainbit_setup.py
+tools\launch_brainbit_teleop.bat --source synthetic
+```
+
+The synthetic demo cycles through artificial rest/forward/left/right signals.
+It is labeled **SYNTHETIC** in both the panel and recording. To connect the real
+headband, close other applications using it and run:
+
+```powershell
+tools\launch_brainbit_teleop.bat --source brainbit
+```
+
+If several headbands are found, select one with `--address AA:BB:CC:DD:EE:FF`.
+Acquisition checks contact resistance before switching to EEG: these devices
+measure the two modes separately. BrainBit 2 channels are reordered using their
+reported channel identifiers and sample-array indices. The panel shows the age of the
+preflight resistance measurement. Live acquisition defaults to **no configured
+decoder**, so it displays signal quality while producing no command.
+
+Sessions are stored locally in Git-ignored `.eeg/sessions/` directories:
+
+- `eeg.csv`: raw O1/O2/T3/T4 values in volts, packet counters, host receipt clocks,
+  estimated sample times, detected gaps, and manual task labels.
+- `events.jsonl`: connection changes, contact snapshots, labels and preview decisions.
+- `metadata.json`: source, settings, clock anchor, counters, and completion/failure state.
+
+Sample timestamps are estimates from the nominal 250 Hz packet counter and callback
+receipt time. They are not hardware timestamps or verified synchronization with
+Isaac Sim; retain both clocks when aligning recordings. Packet loss is recorded
+without interpolation. A task label describes what the operator intended and
+never changes the prediction. Recordings are local and are not uploaded.
+The native counter is preserved: modulus 2048 for the original device and the
+SDK's unsigned 32-bit counter for BrainBit 2. Device details are saved in session
+metadata. NeuroSDK also creates a local, Git-ignored `logs/sdk_log.log` file.
+
+The optional `--target forward=12 --target left=15 --target right=20` mode previews
+an **experimental SSVEP frequency-template match** using O1/O2. It requires
+independently timed external stimuli; this tool supplies no flashing targets.
+The scores are spectral fits, not calibrated probabilities of movement intent.
+Natural rhythms and movement artifacts can resemble targets. No human decoding
+accuracy, motor-imagery control, or headset comfort has been established.
+
+Preview qualification requires a contiguous two-second window and additional
+fresh evidence. Stale, missing, duplicated, malformed, flat or gross-artifact
+input clears the candidate. Disconnection or a full callback queue ends acquisition;
+the tool does not reconnect automatically. These checks are prototype heuristics.
+
+For a finite console run and the standalone EEG regression tests:
+
+```powershell
+tools\launch_brainbit_teleop.bat --source synthetic --headless --duration 20
+.eeg\venv\Scripts\python.exe -m unittest discover -s tools/tests -p "test_eeg*.py" -v
+```
+
+The initial milestone passed **76 standalone EEG tests**, a full synthetic command
+cycle, and desktop-panel inspection. A live BrainBit 2 check on 2 November 2026
+recorded **11,320 samples per channel at 250 Hz**, with no detected packet gaps,
+duplicates, or restarts. It exercised native channel reordering and counters beyond
+2048. O1/O2 contact readings were unavailable and the signal triggered artifact
+checks; this validates acquisition, not usable EEG quality or command decoding.
+Raw signals, device identifiers, and diagnostic sessions remain outside Git.
+
+The next milestone is personal calibration and labeled evaluation, followed by
+an explicitly armed movement-input adapter with manual override and short-lived
+commands. Neither the preview nor a high match score currently enables robot motion.
+SDK references: [BrainBit acquisition](https://sdk.brainbit.com/sdk2_bb/) and
+[BrainBit 2 acquisition](https://sdk.brainbit.com/brainbit-2-devices/), plus
+[Python NeuroSDK](https://pypi.org/project/pyneurosdk2/).
+
 [![Isaac Sim 6.1 default](https://img.shields.io/badge/Isaac%20Sim-6.1.0%20default-76b900.svg)](https://github.com/isaac-sim/IsaacSim)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](tools/run_humanoid_tests.py)
 [![License](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](LICENSE)
