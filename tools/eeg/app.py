@@ -28,9 +28,14 @@ class PreviewApp:
     def __init__(self, source: str, output: Path, targets: dict | None, config: dict) -> None:
         self.events: queue.Queue = queue.Queue(maxsize=1024)
         self.stop = threading.Event()
-        self.engine = PreviewEngine(targets=targets)
+        self.line_frequency_hz = config.get("line_frequency_hz", 60.0)
+        self.engine = PreviewEngine(targets=targets, line_frequency_hz=self.line_frequency_hz)
         self.targets = targets
-        self.recorder = SessionRecorder(output, source, {**config, "targets_hz": targets})
+        self.recorder = SessionRecorder(
+            output,
+            source,
+            {**config, "targets_hz": targets, "line_frequency_hz": self.line_frequency_hz},
+        )
         self.source = source
         self.state = "starting"
         self.message = "Starting acquisition"
@@ -82,7 +87,11 @@ class PreviewApp:
                 self.recorder.write_event(event)
                 if event["type"] == "device":
                     self.recorder.configure_device(event["info"])
-                    self.engine = PreviewEngine(targets=self.targets, packet_modulus=event["info"]["packet_modulus"])
+                    self.engine = PreviewEngine(
+                        targets=self.targets,
+                        packet_modulus=event["info"]["packet_modulus"],
+                        line_frequency_hz=self.line_frequency_hz,
+                    )
                 elif event["type"] == "status":
                     self.state, self.message = event["state"], event["message"]
                     if self.state in ("error", "disconnected"):

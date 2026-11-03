@@ -53,7 +53,22 @@ class TestEegPreview(unittest.TestCase):
         self.assertEqual(result["candidate"], "none")
         self.assertIn("Unconfigured", result["reason"])
         self.assertEqual(
-            set(result), {"command", "candidate", "reason", "quality", "score", "channel_rms_uv", "sample_count"}
+            set(result),
+            {
+                "command",
+                "candidate",
+                "reason",
+                "quality",
+                "score",
+                "channel_rms_uv",
+                "sample_count",
+                "channel_offset_mv",
+                "channel_detrended_rms_uv",
+                "channel_trend_rms_uv",
+                "channel_line_rms_uv",
+                "channel_conditioned_rms_uv",
+                "line_frequency_hz",
+            },
         )
 
     def test_each_synthetic_frequency_selects_its_target(self) -> None:
@@ -313,9 +328,212 @@ class TestEegPreview(unittest.TestCase):
                     PREVIEW.PreviewEngine(window_seconds=duration)
 
     def test_nyquist_limit_rejects_invalid_target_at_lower_sample_rate(self) -> None:
-        PREVIEW.PreviewEngine(sample_rate=50, targets={"forward": 12, "left": 15})
+        engine = PREVIEW.PreviewEngine(sample_rate=50, targets={"forward": 12, "left": 15})
+        self.assertIsNone(engine.line_frequency_hz)
+        self.assertIsNone(engine.evaluate(1.0)["line_frequency_hz"])
         with self.assertRaises(ValueError):
             PREVIEW.PreviewEngine(sample_rate=50, targets={"forward": 12, "left": 25})
+
+
+class TestPreviewConditioning(unittest.TestCase):
+    """Separate DC and line interference from meaningful residual-signal quality."""
+
+    TARGETS = {"forward": 12.0, "left": 15.0}
+    OFFSETS_V = np.array([0.020, 0.075, -0.125, 0.200])
+    DIAGNOSTIC_LISTS = (
+        "channel_rms_uv",
+        "channel_offset_mv",
+        "channel_detrended_rms_uv",
+        "channel_trend_rms_uv",
+        "channel_line_rms_uv",
+        "channel_conditioned_rms_uv",
+    )
+
+    def signal(self, count: int = 750, *, frequency: float = 12.0) -> np.ndarray:
+        times = np.arange(count) / 250.0
+        random = np.random.default_rng(908)
+        return random.normal(0.0, 1e-6, (count, 4)) + np.sin(2 * np.pi * frequency * times)[:, None] * np.array(
+            [25e-6, 22e-6, 8e-6, 7e-6]
+        )
+
+    def line(self, count: int, amplitude_uv: float, *, frequency: float = 60.0) -> np.ndarray:
+        times = np.arange(count) / 250.0
+        return (amplitude_uv * 1e-6 * np.sin(2 * np.pi * frequency * times))[:, None]
+
+    def stream(self, engine: object, samples: np.ndarray) -> list[dict]:
+        results = []
+        for start in range(0, len(samples), 25):
+            end = min(start + 25, len(samples))
+            now = 1.0 + end / 250.0
+            engine.add_samples(samples[start:end], [index % 2048 for index in range(start, end)], now)
+            results.append(engine.evaluate(now))
+        return results
+
+    def test_realistic_channel_offsets_preserve_quality_and_target_match(self) -> None:
+        samples = self.signal()
+        clean = self.stream(PREVIEW.PreviewEngine(targets=self.TARGETS), samples)[-1]
+        shifted = self.stream(PREVIEW.PreviewEngine(targets=self.TARGETS), samples + self.OFFSETS_V)[-1]
+        self.assertEqual(clean["command"], "forward")
+        self.assertEqual(shifted["quality"], "good")
+        self.assertEqual(shifted["command"], clean["command"])
+        self.assertAlmostEqual(shifted["score"], clean["score"], places=9)
+        np.testing.assert_allclose(
+            np.array(shifted["channel_offset_mv"]) - clean["channel_offset_mv"], self.OFFSETS_V * 1000, atol=1e-8
+        )
+        for key in ("channel_rms_uv", "channel_detrended_rms_uv", "channel_conditioned_rms_uv"):
+            np.testing.assert_allclose(shifted[key], clean[key], atol=1e-7)
+
+    def test_diagnostics_distinguish_drift_line_and_residual(self) -> None:
+        samples = self.signal(500)
+        drift = (40e-6 * np.arange(500) / 250.0)[:, None]
+        engine = PREVIEW.PreviewEngine()
+        result = self.stream(engine, samples + drift + self.line(500, 3.0) + self.OFFSETS_V)[-1]
+        self.assertEqual(result["quality"], "good")
+        self.assertEqual(result["line_frequency_hz"], 60.0)
+        self.assertTrue(np.all(np.array(result["channel_rms_uv"]) > result["channel_detrended_rms_uv"]))
+        self.assertTrue(np.all(np.array(result["channel_trend_rms_uv"]) > 10.0))
+        self.assertTrue(np.all(np.array(result["channel_trend_rms_uv"]) < 100.0))
+        np.testing.assert_allclose(result["channel_line_rms_uv"], [3 / np.sqrt(2)] * 4, atol=0.15)
+        self.assertTrue(np.all(np.array(result["channel_detrended_rms_uv"]) > result["channel_conditioned_rms_uv"]))
+
+    def test_strong_sixty_hz_blocks_even_a_real_twelve_hz_template(self) -> None:
+        engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+        results = self.stream(engine, self.signal() + self.line(750, 200.0) + self.OFFSETS_V)
+        self.assertTrue(all(result["command"] == "none" for result in results))
+        interference = [result for result in results if result["quality"] == "interference"]
+        self.assertTrue(interference)
+        self.assertGreater(max(interference[-1]["channel_line_rms_uv"]), 100.0)
+        self.assertEqual(interference[-1]["candidate"], "none")
+
+    def test_line_only_input_never_qualifies_a_command(self) -> None:
+        for amplitude_uv in (10.0, 200.0):
+            with self.subTest(amplitude_uv=amplitude_uv):
+                engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+                results = self.stream(engine, np.repeat(self.line(750, amplitude_uv), 4, axis=1) + self.OFFSETS_V)
+                self.assertTrue(all(result["command"] == "none" for result in results))
+                self.assertEqual(results[-1]["quality"], "interference")
+
+    def test_small_sixty_hz_component_is_removed_without_changing_match(self) -> None:
+        samples = self.signal()
+        clean = self.stream(PREVIEW.PreviewEngine(targets=self.TARGETS), samples)[-1]
+        mixed = self.stream(PREVIEW.PreviewEngine(targets=self.TARGETS), samples + self.line(750, 3.0))[-1]
+        self.assertEqual(mixed["quality"], "good")
+        self.assertEqual(mixed["command"], "forward")
+        self.assertAlmostEqual(mixed["score"], clean["score"], places=9)
+        np.testing.assert_allclose(mixed["channel_conditioned_rms_uv"], clean["channel_conditioned_rms_uv"], atol=1e-7)
+
+    def test_large_off_frequency_and_modulated_line_cannot_look_clean(self) -> None:
+        times = np.arange(750) / 250.0
+        interference_signals = (
+            self.line(750, 200.0, frequency=59.0),
+            self.line(750, 300.0) * np.sin(2 * np.pi * 0.7 * times)[:, None],
+        )
+        for interference in interference_signals:
+            with self.subTest(peak=float(np.max(interference))):
+                engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+                results = self.stream(engine, self.signal() + interference + self.OFFSETS_V)
+                self.assertTrue(all(result["command"] == "none" for result in results))
+                self.assertFalse(any(result["quality"] == "good" for result in results))
+                self.assertTrue(any(result["quality"] in ("artifact", "interference") for result in results))
+
+    def test_spikes_and_steps_remain_artifacts_under_large_dc_offsets(self) -> None:
+        for shape in ("spike", "step"):
+            with self.subTest(shape=shape):
+                samples = self.signal(500) + self.OFFSETS_V
+                if shape == "spike":
+                    samples[250, 2] += 300e-6
+                else:
+                    samples[250:, 2] += 300e-6
+                engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+                engine.add_samples(samples, list(range(500)), 3.0)
+                result = engine.evaluate(3.0)
+                self.assertEqual(result["quality"], "artifact")
+                self.assertEqual(result["command"], "none")
+
+    def test_five_identical_samples_on_one_channel_flag_flat_topped_artifact(self) -> None:
+        samples = self.signal(500) + self.OFFSETS_V
+        samples[200:205, 0] = samples[200, 0]
+        engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+        engine.add_samples(samples, list(range(500)), 3.0)
+        result = engine.evaluate(3.0)
+        self.assertEqual(result["quality"], "artifact")
+        self.assertEqual(result["command"], "none")
+
+    def test_conditioning_does_not_modify_input_or_share_its_storage(self) -> None:
+        samples = self.signal(500) + self.OFFSETS_V
+        original = samples.copy()
+        engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+        engine.add_samples(samples, list(range(500)), 3.0)
+        np.testing.assert_array_equal(samples, original)
+        samples[:] = 0.0
+        result = engine.evaluate(3.0)
+        self.assertEqual(result["quality"], "good")
+        self.assertEqual(result["candidate"], "forward")
+        np.testing.assert_allclose(result["channel_offset_mv"], np.mean(original, axis=0) * 1000, atol=1e-8)
+
+    def test_all_diagnostic_lists_are_copied_from_cached_results(self) -> None:
+        engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+        result = self.stream(engine, self.signal() + self.OFFSETS_V)[-1]
+        expected = {key: list(result[key]) for key in self.DIAGNOSTIC_LISTS}
+        for key in self.DIAGNOSTIC_LISTS:
+            result[key][:] = [-123456.0]
+        cached = engine.evaluate(4.0)
+        for key in self.DIAGNOSTIC_LISTS:
+            self.assertEqual(cached[key], expected[key])
+
+    def test_fifty_hz_and_disabled_options_use_the_requested_conditioning(self) -> None:
+        samples = self.signal() + self.line(750, 3.0, frequency=50.0)
+        enabled = self.stream(PREVIEW.PreviewEngine(targets=self.TARGETS, line_frequency_hz=50.0), samples)[-1]
+        disabled = self.stream(PREVIEW.PreviewEngine(targets=self.TARGETS, line_frequency_hz=None), samples)[-1]
+        self.assertEqual(enabled["command"], "forward")
+        self.assertEqual(enabled["line_frequency_hz"], 50.0)
+        np.testing.assert_allclose(enabled["channel_line_rms_uv"], [3 / np.sqrt(2)] * 4, atol=0.15)
+        self.assertIsNone(disabled["line_frequency_hz"])
+        np.testing.assert_allclose(
+            disabled["channel_conditioned_rms_uv"], disabled["channel_detrended_rms_uv"], atol=1e-8
+        )
+        np.testing.assert_allclose(disabled["channel_line_rms_uv"], [0.0] * 4, atol=1e-8)
+
+    def test_invalid_line_options_fail_explicitly(self) -> None:
+        for frequency in (0, -50, 12, 59.0, 61, True, np.bool_(False), float("nan"), float("inf"), "60"):
+            with self.subTest(frequency=frequency), self.assertRaises(ValueError):
+                PREVIEW.PreviewEngine(line_frequency_hz=frequency)
+
+    def test_large_numeric_input_is_still_rejected_above_one_volt(self) -> None:
+        engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+        engine.add_samples([[1.01, 0.020, 0.125, 0.200]], [0], 1.0)
+        result = engine.evaluate(1.0)
+        self.assertEqual(result["quality"], "artifact")
+        self.assertEqual(result["command"], "none")
+        self.assertEqual(result["sample_count"], 0)
+
+    def test_ten_millivolt_ramp_cannot_be_hidden_by_detrending(self) -> None:
+        samples = self.signal(500) + self.OFFSETS_V
+        samples += np.linspace(0.0, 0.010, 500)[:, None]
+        engine = PREVIEW.PreviewEngine(targets=self.TARGETS)
+        engine.add_samples(samples, list(range(500)), 3.0)
+        result = engine.evaluate(3.0)
+        self.assertEqual(result["quality"], "artifact")
+        self.assertEqual(result["command"], "none")
+        self.assertTrue(np.all(np.array(result["channel_trend_rms_uv"]) > 100.0))
+        expected = list(result["channel_trend_rms_uv"])
+        result["channel_trend_rms_uv"][0] = -1.0
+        repeated = engine.evaluate(3.1)
+        self.assertEqual(repeated["quality"], "artifact")
+        self.assertEqual(repeated["channel_trend_rms_uv"], expected)
+
+    def test_removed_second_harmonic_cannot_vote_for_its_target(self) -> None:
+        for line_frequency, target_frequency in ((60.0, 30.0), (50.0, 25.0)):
+            targets = {"forward": target_frequency, "left": 12.0}
+            with self.subTest(line=line_frequency):
+                engine = PREVIEW.PreviewEngine(targets=targets, line_frequency_hz=line_frequency)
+                clean = self.stream(engine, self.signal(frequency=target_frequency))[-1]
+                self.assertEqual(clean["command"], "forward")
+                line_only = np.repeat(self.line(750, 30.0, frequency=line_frequency), 4, axis=1)
+                engine = PREVIEW.PreviewEngine(targets=targets, line_frequency_hz=line_frequency)
+                results = self.stream(engine, line_only + self.OFFSETS_V)
+                self.assertTrue(all(result["command"] == "none" for result in results))
+                self.assertEqual(results[-1]["quality"], "interference")
 
 
 if __name__ == "__main__":

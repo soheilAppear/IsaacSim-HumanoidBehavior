@@ -51,6 +51,35 @@ The native counter is preserved: modulus 2048 for the original device and the
 SDK's unsigned 32-bit counter for BrainBit 2. Device details are saved in session
 metadata. NeuroSDK also creates a local, Git-ignored `logs/sdk_log.log` file.
 
+To follow instructions while wearing VR, use the offline Windows speech helper.
+Keep the existing EEG recorder running; this helper reads its files without
+connecting to the headband or changing Isaac. First list outputs and play a test:
+
+```powershell
+.eeg\venv\Scripts\python.exe tools\brainbit_audio.py devices
+.eeg\venv\Scripts\python.exe tools\brainbit_audio.py --device "Speakers (Steam Streaming Speakers)" test
+```
+
+Use the exact output name shown on this PC (for example, the Oculus output instead
+of Steam when appropriate). Confirm the test is audible inside the headset before
+starting the spoken resting sequence:
+
+```powershell
+.eeg\venv\Scripts\python.exe tools\brainbit_audio.py --device "Speakers (Steam Streaming Speakers)" rest --seconds 30 --settle 10
+```
+
+The sequence speaks preparation/start/end cues and stays silent during the timed
+rest interval. `say "Your message"` speaks an individual instruction. Output
+selection and speech volume apply only to the helper; Windows defaults are not
+changed. This is instruction playback, not a microphone or voice-command listener.
+Separate timestamped markers are saved under `.eeg/guidance/`; raw CSV labels are
+unchanged. A marker records requested rest, not verified stillness or EEG quality.
+Timestamps are host software times, not measured audio onset or hardware synchronization.
+The helper requires a fresh real-device recording, pins that session, and aborts
+if it ends or becomes stale. Use `--session PATH` after `rest` when multiple
+recorders are active. Ctrl+C or creating an empty `cancel` file in the printed
+guidance directory cancels the sequence. This helper never commands robot motion.
+
 The optional `--target forward=12 --target left=15 --target right=20` mode previews
 an **experimental SSVEP frequency-template match** using O1/O2. It requires
 independently timed external stimuli; this tool supplies no flashing targets.
@@ -62,6 +91,24 @@ Preview qualification requires a contiguous two-second window and additional
 fresh evidence. Stale, missing, duplicated, malformed, flat or gross-artifact
 input clears the candidate. Disconnection or a full callback queue ends acquisition;
 the tool does not reconnect automatically. These checks are prototype heuristics.
+
+Preview diagnostics now separate each channel's constant voltage offset, changing
+linear baseline, fitted mains component, and remaining fluctuations. A constant
+offset alone no longer triggers the former ±500 µV raw-voltage rejection. The
+full-window calculation jointly fits a linear trend and a 60 Hz sine/cosine pair;
+use `--line-frequency 50` or `--line-frequency off` when appropriate. This is a
+fixed-frequency least-squares fit, not a general band-pass filter. Raw CSV values
+and the centered raw waveform display remain unchanged.
+
+Large changing baselines, abrupt residual changes, and flat/repeated samples still
+block previews. A strong fitted mains component is reported as `interference`
+and prevents command qualification even when the remaining waveform is small.
+The display shows these measurements separately; passing prototype limits does
+not establish clean brain activity or reliable intent detection. The broad 1 V
+input sanity bound is not a validated hardware clipping limit. Target templates
+use the same conditioning and omit harmonics overlapping the removed mains
+frequency. Settings and measurements are retained with session events. Restart
+the EEG app to load these changes; editing the files does not update a running app.
 
 For a finite console run and the standalone EEG regression tests:
 
@@ -77,6 +124,12 @@ duplicates, or restarts. It exercised native channel reordering and counters bey
 2048. O1/O2 contact readings were unavailable and the signal triggered artifact
 checks; this validates acquisition, not usable EEG quality or command decoding.
 Raw signals, device identifiers, and diagnostic sessions remain outside Git.
+
+The audio-guidance and conditioning update passes **117 standalone EEG tests**.
+An offline replay of the 7,504-sample spoken VR baseline produced no commands;
+its complete windows exceeded the changing-baseline heuristic, and fitted mains
+interference remained visible. The updated panel was checked with synthetic
+input. These checks validate software behavior, not human command accuracy.
 
 The next milestone is personal calibration and labeled evaluation, followed by
 an explicitly armed movement-input adapter with manual override and short-lived

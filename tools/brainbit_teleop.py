@@ -50,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--headless", action="store_true", help="Record with console status and no desktop window")
     parser.add_argument("--output", type=Path, default=ROOT / ".eeg" / "sessions")
     parser.add_argument(
+        "--line-frequency",
+        choices=("50", "60", "off"),
+        default="60",
+        help="Mains-frequency fit for preview diagnostics; raw EEG is always recorded unchanged",
+    )
+    parser.add_argument(
         "--target",
         action="append",
         default=[],
@@ -76,7 +82,11 @@ def main(argv: list[str] | None = None) -> int:
             args.source,
             args.output,
             targets,
-            {"scan_seconds": args.scan_seconds, "resistance_seconds": args.resistance_seconds},
+            {
+                "scan_seconds": args.scan_seconds,
+                "resistance_seconds": args.resistance_seconds,
+                "line_frequency_hz": None if args.line_frequency == "off" else float(args.line_frequency),
+            },
         )
     except ImportError as error:
         parser.exit(2, f"Missing dependency: {error}. Run py -3.11 tools/brainbit_setup.py first.\n")

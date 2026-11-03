@@ -22,8 +22,8 @@ def run_panel(app: PreviewApp, duration: float) -> None:
     except tk.TclError as error:
         raise RuntimeError(f"Cannot open the desktop panel; use --headless: {error}") from error
     root.title("BrainBit · EEG teleoperation lab")
-    root.geometry("1040x790")
-    root.minsize(850, 720)
+    root.geometry("1040x900")
+    root.minsize(850, 850)
     root.configure(bg="#111923")
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -49,6 +49,8 @@ def run_panel(app: PreviewApp, duration: float) -> None:
     command.pack(anchor="w")
     reason = ttk.Label(body, text="Waiting for samples", wraplength=930)
     reason.pack(anchor="w", pady=(5, 5))
+    signal_metrics = ttk.Label(body, text="Signal metrics: waiting for a full window", wraplength=930)
+    signal_metrics.pack(anchor="w", pady=(0, 7))
     ttk.Label(body, text="Experimental frequency matching. Scores are not probabilities of intent.").pack(anchor="w")
     ttk.Label(body, text="Robot output: disconnected · This panel cannot move the robot.", style="Accent.TLabel").pack(
         anchor="w", pady=(5, 15)
@@ -100,6 +102,27 @@ def run_panel(app: PreviewApp, duration: float) -> None:
             )
             command.configure(text=state["command"].upper() if state["command"] != "none" else "NO COMMAND")
             reason.configure(text=f"{state['reason']}  ·  Match score: {state['score']:.3f}")
+            residual = state.get("channel_conditioned_rms_uv", [])
+            offsets = state.get("channel_offset_mv", [])
+            line = state.get("channel_line_rms_uv", [])
+            trend = state.get("channel_trend_rms_uv", [])
+            if len(residual) == len(offsets) == len(line) == len(trend) == 4:
+                residual_text = " / ".join(f"{value:.1f}" for value in residual)
+                offset_text = " / ".join(f"{value:+.1f}" for value in offsets)
+                line_text = " / ".join(f"{value:.1f}" for value in line)
+                trend_text = " / ".join(f"{value:.1f}" for value in trend)
+                line_label = (
+                    f"{state['line_frequency_hz']:g} Hz fit RMS"
+                    if state.get("line_frequency_hz") is not None
+                    else "Line fit off"
+                )
+                signal_metrics.configure(
+                    text=f"O1 / O2 / T3 / T4 · Offset (mV): {offset_text}\n"
+                    f"Changing baseline RMS (µV): {trend_text}\n"
+                    f"After trend/line removal RMS (µV): {residual_text} · {line_label} (µV): {line_text}"
+                )
+            else:
+                signal_metrics.configure(text="Signal metrics: waiting for a full contiguous window")
             if app.resistance is not None:
                 values = "   ".join(
                     f"{ch}: {value / 1000:.0f} kΩ" if value is not None else f"{ch}: unavailable"

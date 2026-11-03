@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eeg.app import PreviewApp
@@ -282,6 +284,45 @@ class TestPreviewAppLifecycle(unittest.TestCase):
         rows = read_rows(self.app.recorder.path)
         self.assertEqual(len(rows), 650)
         self.assertTrue(all(row["label"] == "right" for row in rows))
+
+    def test_device_configuration_preserves_line_setting_and_records_it(self) -> None:
+        for line_frequency in (50.0, None):
+            with self.subTest(line_frequency=line_frequency):
+                with patch("eeg.app.time.monotonic", return_value=100.0):
+                    app = PreviewApp("brainbit", Path(self.directory.name), None, {"line_frequency_hz": line_frequency})
+                    try:
+                        app.events.put(
+                            {
+                                "type": "device",
+                                "info": {
+                                    "sample_rate_hz": 250,
+                                    "packet_modulus": 2**32,
+                                    "channels": list(CHANNELS),
+                                },
+                            }
+                        )
+                        app.pump()
+                        self.assertEqual(app.engine.line_frequency_hz, line_frequency)
+                        self.assertEqual(app.recorder.metadata["config"]["line_frequency_hz"], line_frequency)
+                    finally:
+                        app.finish()
+
+    def test_conditioning_preserves_raw_recorded_voltages(self) -> None:
+        event = sample_event(list(range(500)), 100.0)
+        for index, sample in enumerate(event["samples"]):
+            for channel in range(4):
+                sample["values_v"][channel] += 0.02 + 0.001 * np.sin(2 * np.pi * 60 * index / 250)
+        expected = [list(sample["values_v"]) for sample in event["samples"]]
+        self.app.events.put({"type": "status", "state": "streaming", "message": "Conditioning fixture"})
+        self.app.events.put(event)
+        with patch("eeg.app.time.monotonic", return_value=100.0):
+            self.app.pump()
+            self.assertEqual(self.app.snapshot["quality"], "interference")
+            self.assertEqual(self.app.snapshot["command"], "none")
+            self.app.finish()
+        rows = read_rows(self.app.recorder.path)
+        actual = [[float(row[f"{channel}_v"]) for channel in CHANNELS] for row in rows]
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-12)
 
     def test_stale_input_clears_previously_qualified_command(self) -> None:
         self.qualify_forward()
