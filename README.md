@@ -131,6 +131,17 @@ its complete windows exceeded the changing-baseline heuristic, and fitted mains
 interference remained visible. The updated panel was checked with synthetic
 input. These checks validate software behavior, not human command accuracy.
 
+EEG work was paused on **3 November 2026** after additional spoken VR checks.
+The completed guided intervals and raw recordings are preserved locally; resume
+details are in Git-ignored `.eeg/pause_checkpoint_20261103.json`. The last long
+recording ended with a logged `[Errno 22] Invalid argument`; its 258,336 CSV rows
+match the saved count, with no detected counter gaps or malformed rows. Its
+failure status remains intact. Inspect that error before the next unattended run.
+Some live windows passed the prototype checks, but reliable intent decoding has
+not been demonstrated. The 100 microvolt baseline-trend cutoff is a prototype
+heuristic, not a manufacturer contact-quality threshold. No EEG recorder remains
+running at this checkpoint, and EEG robot actuation remains disabled.
+
 The next milestone is personal calibration and labeled evaluation, followed by
 an explicitly armed movement-input adapter with manual override and short-lived
 commands. Neither the preview nor a high match score currently enables robot motion.
