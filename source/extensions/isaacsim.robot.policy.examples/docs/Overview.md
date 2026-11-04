@@ -1,45 +1,88 @@
 # Overview
 
 The isaacsim.robot.policy.examples extension provides interactive robot demonstrations
-and reusable policy controllers for Isaac Sim. This fork adds stationary Unitree G1
-VR teleoperation to the Humanoid example while retaining the Franka, quadruped, and
-standalone locomotion policy examples.
+and reusable policy controllers for Isaac Sim. This fork extends the Humanoid example
+with Unitree G1 VR teleoperation, physical manipulation, optional walking, and local
+behavioral recording. The Franka, quadruped, and standalone policy examples remain
+available as separate demonstrations.
 
 ## Key Components
 
 ### Humanoid Teleoperation
 
 **{class}`HumanoidExample <isaacsim.robot.policy.examples.interactive.humanoid.HumanoidExample>`
-provides stationary arm and hand teleoperation for a Unitree G1 with Inspire hands.**
-The pelvis is fixed to the world, and walking and turning inputs are suppressed.
-The current configuration uses CPU physics with a 100 Hz simulation step and a
-requested 90 Hz rendering cadence. These configured rates do not guarantee real-time
-performance; rendering, recording, and control work also consume frame time.
+coordinates the G1 scene, input ownership, arm/hand control, view, and recording.**
+Launch configuration selects the control profile before the scene is built:
 
-The example supports Quest Pro controller poses and OpenXR optical hand landmarks.
-Controller grip acts as an arm clutch, and trigger controls finger closure and
-assisted pickup. Valid optical hand poses drive the arm without requiring a fist;
-individual finger curls and thumb opposition drive the six Inspire actuators per
-hand. Closing and opening the hand requests pickup and release. Pickup attaches a
-nearby object with a fixed joint rather than relying solely on finger contact.
+- Stationary teleoperation anchors the pelvis and suppresses base movement inputs.
+- Controller walking uses physical balance/walking policies, with stick input for
+  translation and turning and controller or optical input for manipulation.
+- Experimental pointing navigation uses an optical left-index ray to select a
+  checked destination and requires the pointing gesture to remain active.
 
-The camera maintains a fixed transform relative to the robot body at head height,
-including while paused. Physical headset translation and rotation do not move the
-camera in stationary mode. Existing gaze tracking and its recording remain active.
-The session recorder writes robot, hand, gaze, object, and camera data for later
-analysis.
+These profiles share the arm, finger, contact, and recording pipeline; switching
+between anchored and walking configurations requires rebuilding the scene. They
+use different physics configurations, so a requested sensor or render rate is not
+a promise of real-time performance.
+
+The example accepts Quest Pro controller poses and OpenXR optical hand landmarks.
+Controller grip acts as an arm clutch and trigger controls finger closure. Valid
+optical landmarks drive the corresponding arm without a clutch; finger curls and
+thumb opposition drive the six Inspire actuators per hand. Current physical
+grasping uses opposing contacts and friction, with contact-limited finger targets
+and arm obstruction guards. The retained assisted fixed-joint pickup path is not
+the current default and is not evidence that a physical grasp succeeds.
+
+The robot-mounted view follows tracked head orientation through a neck/eye arc
+and comfort stabilization. Room-scale headset translation does not reposition
+the robot-head view. The visible operator-head proxy and near-camera visibility
+handling are visual features, not extra physical robot joints. Eye-gaze tracking
+and its source-labelled fallback remain independent of locomotion.
+
+The recorder writes robot state/commands, hand inputs, gaze, object states, and
+RGB images. CSV output uses an asynchronous writer with bounded queues; RGB image
+capture/saving remains in the sample's collection path. Simulation timestamps
+support alignment but do not establish hardware-synchronized sensor capture or
+the original rendering time of the latest image. Source validity, requested
+controls, applied finger targets, and contact evidence must be interpreted using
+their recorded fields rather than treating every row as a successful action.
 
 The OpenXR component setting
 `/xr/openxr/components/omni.kit.xr.openxr.ext.hand_tracking/enabled` requests skeletal
 hand tracking when the XR instance starts. The headset and active runtime must also
 provide valid landmarks. A connected headset or controller poses alone do not prove
-that optical tracking is available. Real Quest landmark delivery remains an active
-validation issue; generated-input replay checks do not verify headset tracking quality.
+that optical tracking is available. Generated-input replay checks do not verify
+headset tracking quality, occlusion recovery, or walking with a carried payload.
 
 **{class}`G1TeleopRobot <isaacsim.robot.policy.examples.robots.G1TeleopRobot>`
 provides the robot articulation and joint-control interface used by the example.**
-It configures the standing posture, arm and hand drives, joint limits, and stationary
-base. The Humanoid example does not run a walking policy in its default mode.
+It owns articulation initialization, joint-name mappings, drives, limits, and
+profile-specific body control. The default stationary mode does not run a walking
+policy. Physical walking uses the pinned decoupled balance/walk actors through
+`G1DecoupledPolicy`: those actors command the legs and waist while the teleoperator
+retains arm targets. Strict physical walking fails on unavailable policy/physics
+requirements instead of substituting the retained legacy kinematic motion path.
+
+The sample applies input validity checks and command limits before robot output.
+An articulation fault clears motion requests and pauses the timeline; resuming
+Play alone does not clear a latched fault. Scene reset is the recovery boundary.
+
+### Custom Humanoid Modules
+
+The `interactive.humanoid` package contains this fork's implementation boundaries:
+
+- Input and view helpers normalize XR poses, interpret controller/pointing inputs,
+  and compute the robot-head camera and visual head transforms.
+- Contact and grasp helpers interpret PhysX evidence and constrain requested
+  movement; they do not replace physical contact with a successful-grasp label.
+- Scene helpers author practice objects, shelf cartons, navigation queries, and
+  preauthored highlight visuals.
+- Recording helpers write local CSV streams without controlling the robot.
+
+The main sample integrates these helpers with Kit lifecycle callbacks. Retained
+gesture and assisted-control experiments are documented separately from the
+profiles selected by the current launchers. The standalone EEG experiment under
+`tools/eeg` does not send movement commands to this extension.
 
 ### Other Interactive Examples
 

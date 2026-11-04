@@ -15,7 +15,7 @@
 
 # NOTE: Import here your extension examples to be propagated to ISAAC SIM Extensions startup
 
-"""Interactive humanoid robot policy example demonstrating a Unitree H1 robot with flat terrain locomotion using Isaac Lab."""
+"""Expose the Unitree G1 example with XR teleoperation and stationary or physical walking modes."""
 
 from .humanoid_example import HumanoidExample
 from .humanoid_example_extension import HumanoidExampleExtension

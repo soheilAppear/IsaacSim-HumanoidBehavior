@@ -13,11 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run the Unitree G1 with dexterous hands from the command line, no UI clicks needed.
+"""Run the retained keyboard/scripted G1 demonstration in a separate Kit process.
 
-Walks the robot on Unitree's pretrained locomotion policy and cycles its hands open and
-closed, which is enough to see that both halves work. Keyboard control is available in
-the window: arrow keys / numpad drive the base, SPACE toggles the fists.
+This entry point exercises the legacy assisted policy or kinematic modes of
+`G1TeleopRobot`. It does not enable the strict physical GR00T walking profile used
+by the current VR controller launcher, and it does not collect VR demonstrations.
+Policy mode can use its documented kinematic fallback if legacy weights are absent.
+
+With a window, arrow keys/numpad request base movement and SPACE toggles the hands.
+Headless mode supplies a scripted movement/hand sequence instead. These paths are
+demonstrations, not validation of dynamic balance, physical pickup, or Quest input.
+The `--seconds` budget uses a nominal 60 update-iterations-per-second counter; it
+is not a measured wall-clock or simulation duration. Importing this file starts
+SimulationApp and runs the demonstration, so use it as an executable entry point.
 
 Examples:
     # walk, with a window
@@ -129,7 +137,12 @@ if not args.headless:
 
 
 def on_physics_step(step_size, context) -> None:
-    """Initialize on the first step, then drive the robot every step."""
+    """Initialize/reinitialize the articulation before applying demonstration input.
+
+    Args:
+        step_size: Physics-step duration in seconds, forwarded to robot control.
+        context: Event context supplied by the simulation callback; unused here.
+    """
     global first_step, reset_needed
     if first_step:
         g1.initialize()
@@ -167,6 +180,7 @@ while simulation_app.is_running():
 
     if args.test and step > 10:
         break
+    # Preserve the original nominal update-loop budget; this is not a clock reading.
     elapsed = step / 60.0
     if args.seconds > 0.0 and elapsed > args.seconds:
         break

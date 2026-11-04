@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Replay stationary humanoid controls inside an already-running Isaac Sim.
+"""Replay legacy assisted stationary controls inside an already-running Isaac Sim.
 
 Run this host CLI with ordinary Python, after loading the Humanoid example and
 enabling isaacsim.code_editor.python_server (tools/launch_isaac_vr.bat does this).
+Select assisted grasping before LOAD and use stationary locomotion. For the
+default physical grasping mode, use tools/validate_contact_grasp_live.py instead.
 The test moves the simulated right arm, picks up Box_00, and releases it. It leaves
 the timeline paused. --reload-example explicitly clears/rebuilds the example for
 fresh package positions; save any stage edits first. It does not hot-reload modules.

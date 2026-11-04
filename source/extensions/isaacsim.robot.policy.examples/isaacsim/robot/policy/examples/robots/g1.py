@@ -29,8 +29,15 @@ externally controlled arm joints; the learned leg/waist PD stays unchanged.
 Fingers remain independently controlled.
 
 Kinematic mode integrates the commanded base velocity with gravity disabled.
-Missing or incompatible walking assets select that mode before joint defaults
-are created. See docs/humanoid-control.md for frames, validation, and limitations.
+Only the legacy policy path can fall back to it when walking assets are missing
+or incompatible, before joint defaults are created. Physical locomotion faults
+instead remain latched until reset or initialization.
+
+Construction authors USD variants, root topology and initial joint state before
+creating an articulation view. ``initialize`` requires running physics;
+``invalidate_physics_state`` discards episode state without reading destroyed
+views. ``post_reset`` restores the registered spawn state and controller history.
+See ``docs/humanoid-control.md`` for frames, validation, and limitations.
 """
 
 from __future__ import annotations
@@ -58,9 +65,17 @@ from .g1_foot_contacts import configure_decoupled_foot_contacts
 class G1TeleopRobot:
     """Unitree G1 29-DOF humanoid with dexterous hands, posed by teleoperation.
 
-    Commands use body-frame forward/lateral velocity and yaw rate: (v_x, v_y, w_z).
-    Policy mode drives the legs through PhysX; kinematic mode integrates the root
-    pose while holding a standing joint posture. Upper-body targets are separate.
+    Commands use body-frame forward/lateral velocity in m/s and yaw rate in
+    rad/s as ``(v_x, v_y, w_z)``. Stage positions are in meters, joint angles
+    are radians, and public base orientations use scalar-first ``wxyz`` quaternions.
+    DOF arrays follow live articulation order unless explicitly mapped by name.
+
+    Stationary mode leaves the fixed root to the solver. Legacy policy mode owns
+    twelve leg targets and supplies default upper-body targets for teleoperation
+    to override. Physical decoupled mode owns fifteen leg/waist targets, observes
+    fourteen independently controlled arm joints, and applies explicit PD to all
+    twenty-nine body motors. Fingers retain separate drives in every mode.
+    Kinematic mode writes the root pose and reported velocity directly.
 
     The interface mirrors the policy robots in this package (``robot``, ``default_pos``,
     ``initialize()``, ``post_reset()``, ``forward(dt, command)``) so the interactive
@@ -68,8 +83,8 @@ class G1TeleopRobot:
 
     Args:
         prim_path: The prim path of the robot on the stage.
-        usd_path: The robot USD filepath. Defaults to the Isaac Sim G1 asset.
-        position: The initial position of the robot.
+        usd_path: Robot USD filepath, or None to resolve the packaged Isaac Sim asset.
+        position: Initial stage position in meters, or None for the mode's spawn height.
         orientation: The initial orientation of the robot as a ``wxyz`` quaternion.
         hand_variant: ``"Inspire"`` (five-finger), ``"ThreeFinger"`` (Dex3) or ``"None"``.
         physics_variant: Physics variant to select on the asset.
@@ -86,11 +101,14 @@ class G1TeleopRobot:
             external arm joints in physical decoupled mode. This project option
             preserves the policy's lower-body PD and all motor effort limits.
             It compensates robot-link gravity, not contact or payload forces.
+
+    Raises:
+        ValueError: If physical locomotion, checkpoint selection, or arm gravity
+            compensation is requested with an incompatible mode.
     """
 
-    #: Joint angles (rad) that define the standing posture. Joints left out stay at 0,
-    #: which for the G1 is a straight-legged upright stance. The arms are parked slightly
-    #: forward and out so teleoperation starts from a natural ready pose.
+    #: Stationary/avatar body posture in radians. Unlisted body joints use zero;
+    #: finger defaults remain separate so mimic couplings retain their authored pose.
     DEFAULT_STANDING_POSE = {
         "left_shoulder_pitch_joint": 0.20,
         "right_shoulder_pitch_joint": 0.20,
@@ -100,16 +118,12 @@ class G1TeleopRobot:
         "right_elbow_joint": 0.60,
     }
 
-    #: Pelvis height (m) of the standing posture. The ankle-roll link sits 0.757 m below
-    #: the pelvis in the asset's zero pose; 0.80 is the lowest height at which the foot
-    #: colliders rest *on* the ground rather than inside it. That margin matters more than
-    #: it looks: spawned 1-2 cm lower the feet penetrate, and because the root is pinned
-    #: the contact forces have nowhere to go but up the legs, bending the robot's roll
-    #: joints by ~0.2 rad. At 0.80 the standing posture holds to 0.0000 rad.
+    #: Stationary/avatar pelvis height in metres for this asset and standing pose.
+    #: Initial foot clearance avoids ground penetration pushing against a fixed root.
     STANDING_BASE_HEIGHT = 0.80
 
-    #: Implicit PD gains applied per joint group, matched to the Isaac Lab G1 actuator
-    #: configuration.
+    #: Stationary/avatar implicit PD gains by joint group. Walking modes use
+    #: their own controller gains; physical decoupled mode disables implicit body PD.
     JOINT_GAINS = (
         (("hip_yaw", "hip_roll", "hip_pitch", "knee"), 150.0, 5.0),
         (("ankle",), 40.0, 2.0),
@@ -117,23 +131,17 @@ class G1TeleopRobot:
         (("shoulder", "elbow", "wrist"), 150.0, 10.0),
     )
 
-    #: Gains and effort limit for the *driven* finger joints. The hand asset ships drives
-    #: around 0.05-0.19 stiffness with a 1 N·m effort cap, which models the real hand's
-    #: weak actuators: commanded to close, the fingers stall around a fifth of their
-    #: travel while the mimic couplings resist. Teleoperation needs the pose the operator
-    #: asked for, so the drives are stiffened here. This drive setup leaves passive
-    #: mimic joints undriven. The physical-grasp scene separately tunes their existing
-    #: compliant coupling before Play; adding drives would fight that coupling.
+    #: Simulation finger-drive stiffness in N*m/rad, damping in N*m*s/rad,
+    #: and effort limit in N*m.
+    #: Only existing driven joints receive these gains. Passive mimic joints
+    #: retain their coupling; adding drives would introduce competing constraints.
+    #: The physical-grasp scene configures that coupling separately before Play.
     FINGER_STIFFNESS = 20.0
     FINGER_DAMPING = 0.6
     FINGER_MAX_EFFORT = 10.0
 
-    #: Maximum finger joint speed, rad/s. The asset authors 28.6 deg/s — 0.5 rad/s, the
-    #: real Inspire hand's actuator speed — which made a commanded fist crawl closed over
-    #: 3.2 seconds at a dead-constant rate, lagging hopelessly behind the operator's hand.
-    #: (It presents as a tracking error that no amount of stiffness fixes, because the
-    #: joint is speed-limited, not torque-limited.) 8 rad/s closes the hand in ~0.2 s,
-    #: about as fast as a human closes theirs.
+    #: Simulation finger speed cap in rad/s. This override reduces actuator lag
+    #: during teleoperation; it is not a measured physical-hand speed specification.
     FINGER_MAX_VELOCITY = 8.0
 
     #: Inspire hand: the joints that carry a drive. Their ``intermediate``/``distal``
@@ -176,15 +184,12 @@ class G1TeleopRobot:
     }
 
     # ------------------------------------------------------------------------------
-    # Unitree walking policy (locomotion="policy")
+    # Legacy Unitree walking policy (`locomotion="policy"`, nonphysical profile).
     #
-    # Isaac Sim ships no G1 locomotion policy, but Unitree does: unitree_rl_gym's
-    # `deploy/pre_train/g1/motion.pt` (BSD-3-Clause). It is an LSTM actor —
-    # LSTM(47 -> 64) into an MLP(64 -> 32 -> 12) — trained in Isaac Gym on the 12-DOF
-    # G1, and it actuates the **legs only**, which suits teleoperation: the waist and
-    # both arms stay free for the operator instead of being owned by the balance
-    # controller. Every constant below is taken from that repo's deployment config, so
-    # the observation the policy sees here matches the one it was trained on.
+    # The bundled `unitree_rl_gym` recurrent actor consumes 47 observations and
+    # produces twelve leg actions. Its observation/action scales and joint order
+    # below form a checkpoint contract; they do not configure the GR00T actors.
+    # Waist and arms receive posture targets that the teleoperator can override.
     # ------------------------------------------------------------------------------
 
     #: The 12 leg joints in the order the policy expects (the training URDF's joint
@@ -231,26 +236,18 @@ class G1TeleopRobot:
     WALK_GAIT_PERIOD = 0.8
     WALK_OBS_DIM = 47
     WALK_NUM_ACTIONS = 12
-    #: Command limits the policy was trained within; commands are clamped to these
-    #: because asking for more than it ever saw is a reliable way to make it fall.
+    #: Legacy command caps in m/s, m/s, and rad/s, applied before observation scaling.
     WALK_MAX_COMMAND = (0.8, 0.5, 1.57)
-    #: The policy was trained at 50 Hz and must be stepped at 50 Hz. The decimation is
-    #: derived from the actual physics dt rather than hard-coded, so changing physics_dt
-    #: (200 Hz -> 100 Hz for real-time performance, say) does not silently change the
-    #: control rate and break the gait.
+    #: Legacy actor rate in simulation Hz. The scheduler accumulates `dt` so
+    #: noninteger physics/control ratios preserve phase without replaying one
+    #: observation through the stateful actor multiple times after a long step.
     WALK_CONTROL_HZ = 50.0
     #: Pelvis spawn height used for policy mode — the training config's `init_state.pos`.
     WALK_BASE_HEIGHT = 0.80
 
-    # --- Station keeping -----------------------------------------------------------
-    # Commanded to stop, the policy does not actually hold position: measured, it walks
-    # away at 0.62 m/s and yaws at 5 deg/s with a zero command (0.2 m/s even at the
-    # 200 Hz it was trained for). It is a velocity-tracking policy with a steady-state
-    # error, and to an operator that reads as "the robot never stops" and "it drifts".
-    #
-    # The fix is a closed loop around it: when the operator asks for zero, measure what
-    # the robot is actually doing and command the opposite. The policy is left untouched
-    # -- this only chooses what to ask of it.
+    # Legacy station keeping corrects measured drift when translation is idle.
+    # These assists are bypassed entirely by physical decoupled locomotion, where
+    # zero command still runs the balance actor and never pins or teleports the root.
     STATION_KEEP_ENABLED = True
     STATION_KEEP_DEADBAND = 0.05  # command magnitude below which the operator counts as idle
     STATION_KEEP_GAIN = 1.2  # how hard to cancel measured linear drift
@@ -258,26 +255,14 @@ class G1TeleopRobot:
     STATION_KEEP_MAX_LINEAR = 0.35  # m/s: cap, so a correction never becomes a lurch
     STATION_KEEP_MAX_YAW = 0.5  # rad/s
 
-    # Velocity feedback alone only got 0.62 -> 0.50 m/s, because cancelling drift means
-    # commanding reverse and this policy tracks reverse at about 40%. So after a short
-    # idle the base is simply pinned: "stop" then means stopped, exactly, which is what
-    # an operator expects when they let go of the stick. The legs hold the pose they had
-    # rather than marching on the spot against a fixed base.
+    # Legacy idle hold captures and rewrites the base pose and leg targets after
+    # the delay. This is explicit assistance, not learned balance or a contact hold.
     STATION_HOLD_ENABLED = True
     STATION_HOLD_DELAY = 0.4  # s of idle before the hold engages
 
-    # --- Turn in place -------------------------------------------------------------
-    # The same steady-state error shows up as a curve rather than a drift the moment a
-    # yaw-only command is given: the operator asks to look left, the robot walks a wide
-    # arc forward while doing it. In a VR rig that is worse than the idle drift, because
-    # turning is how you aim before you reach for something, and every turn moves the
-    # thing you were aiming at.
-    #
-    # Two layers, because neither is enough alone. The policy is asked to cancel its own
-    # measured translation (it tries, and tracking reverse at ~40% means it only partly
-    # succeeds), and the base is then pulled back to where the turn started, with its
-    # horizontal velocity zeroed so the residual cannot accumulate. Yaw and height are
-    # left completely alone -- the turn itself, and the gait bob under it, are real.
+    # Legacy turn assistance cancels horizontal drift and corrects root XY toward
+    # the turn's starting point. It preserves the current root yaw and height in
+    # those writes, but remains an assisted trajectory rather than free locomotion.
     TURN_HOLD_ENABLED = True
     TURN_HOLD_DEADBAND = 0.05  # translation command below this = 'I only asked to turn'
     TURN_HOLD_SETTLE_TIME = 0.20  # s: time constant pulling the base back to the anchor
@@ -638,7 +623,18 @@ class G1TeleopRobot:
     """
 
     def initialize(self) -> None:
-        """Configure drives, gains and the standing posture. Call once physics is running."""
+        """Configure the selected controller and register a complete spawn/reset state.
+
+        Call only after physics has created a valid articulation view. Missing
+        views or DOF names leave the robot uninitialized without accessing drives.
+        Policy selection precedes joint defaults so legacy fallback receives the
+        correct avatar posture and gravity. Finger poses remain asset-derived.
+        Physical mode finally switches body motors to explicit effort control;
+        its position targets are a command buffer for that motor loop.
+
+        Raises:
+            RuntimeError: If physical controller loading or actuator setup fails.
+        """
         self._initialized = False
         # Stop destroys tensor views before Play recreates them. A callback that
         # arrives during that transition must not access the preceding episode.
@@ -656,9 +652,9 @@ class G1TeleopRobot:
         if self._locomotion == "policy":
             self._configure_walk_policy(dof_names)
 
-        # Body joints run as position-controlled force drives; the hand joints keep the
-        # drive configuration authored in the hand asset. set_dof_drive_types writes USD,
-        # so the change has to be flushed before the tensor-backed calls that follow.
+        # Establish body force drives before mode-specific gains/control settings.
+        # Physical decoupled mode switches these to effort control below. The
+        # `set_dof_drive_types` USD edit must be flushed before tensor-backed calls.
         self.robot.set_dof_drive_types("force", dof_indices=self._body_dof_indices)
         get_physics_simulation_interface().flush_changes()
         self.robot.switch_dof_control_mode("position", dof_indices=self._body_dof_indices)
@@ -719,9 +715,9 @@ class G1TeleopRobot:
         self._apply_articulation_properties()
 
         if self._disable_gravity:
-            # The root is teleported every step, so gravity only makes the limbs sag
-            # between teleports and forces very stiff drives to compensate. Switching it
-            # off gives a crisp, stable teleoperation avatar; scene objects keep theirs.
+            # Stationary and kinematic avatars disable robot-link gravity. The
+            # former has a fixed root and the latter writes its root pose; objects
+            # retain gravity in both cases. Physical policy mode never takes this path.
             try:
                 self.robot.set_link_enabled_gravities([[False] * self.robot.num_links])
             except Exception as e:
@@ -743,7 +739,14 @@ class G1TeleopRobot:
         self._reset_walk_policy_state(clear_fault=False)
 
     def post_reset(self) -> None:
-        """Restore the default articulation state, the spawn base pose and the policy state."""
+        """Restore the registered spawn state, controller history, and zero body efforts.
+
+        Initialization must already have resolved the current articulation.
+        An invalid view preserves the fault latch and requires fresh initialization.
+
+        Raises:
+            RuntimeError: If the articulation is uninitialized or its view is invalid.
+        """
         if not self._initialized or not self.robot.is_physics_tensor_entity_valid():
             self.invalidate_physics_state()
             raise RuntimeError("G1 reset requires an initialized, valid physics articulation")
@@ -764,6 +767,10 @@ class G1TeleopRobot:
                 before calling ``apply_body_efforts()`` once in the same physics
                 callback. The caller must perform that final update before the
                 next simulation step. Standalone callers keep the default.
+
+        Raises:
+            RuntimeError: If physical locomotion has a latched fault, no active
+                actor, invalid actor output, or a failed motor-effort update.
         """
         physical = getattr(self, "_physical_locomotion", False)
         if physical and self.locomotion_fault:
@@ -793,9 +800,9 @@ class G1TeleopRobot:
             self._write_base_pose(command)
             posture_indices = self._body_dof_indices
         if self._default_dof_positions is not None and posture_indices:
-            # Posture targets are rewritten every step; the teleoperation layer runs after
-            # this call and overrides the arm and finger DOFs it owns. In policy mode the
-            # legs are excluded — the policy owns them.
+            # Assisted modes rewrite their body/posture defaults before the caller
+            # overrides arm targets. Legacy policy legs are excluded. Physical
+            # decoupled mode leaves this list empty, preserving independent arm targets.
             self.robot.set_dof_position_targets(
                 [self._default_dof_positions[posture_indices]], dof_indices=posture_indices
             )
@@ -953,7 +960,14 @@ class G1TeleopRobot:
         )
 
     def _step_velocity_policy(self, dt: float, command: object) -> None:
-        """Run the physical actor once per 20 ms using live articulation measurements."""
+        """Run the physical actor at its simulation-time period using live measurements.
+
+        At most one inference runs per callback. A late callback skips overdue
+        periods instead of feeding repeated observations into controller history.
+        World angular velocity is rotated into body axes; normalized scalar-first
+        base orientation also supplies projected gravity. Only actor-owned target
+        indices are written here; the caller updates arm targets and motor efforts.
+        """
         if self.locomotion_fault:
             raise RuntimeError(self.locomotion_fault)
         self._walk_time += dt
@@ -996,7 +1010,7 @@ class G1TeleopRobot:
             self._fail_physical_locomotion(f"Physical walking policy step failed: {error}")
 
     def _load_walk_policy(self, dof_names: list[str]) -> None:
-        """Resolve the checkpoint, joint map, and tensors for the policy adapter."""
+        """Load the legacy recurrent actor, falling back to avatar mode when unavailable."""
         torch = import_module("torch")
 
         missing = [name for name in self.WALK_LEG_JOINT_ORDER if name not in dof_names]
@@ -1071,14 +1085,14 @@ class G1TeleopRobot:
 
     @property
     def supports_arm_teleoperation(self) -> bool:
-        """Whether arm targets have an independent owner in this control mode."""
+        """Return whether this mode allows teleoperation to own arm targets."""
         return not getattr(self, "_physical_locomotion", False) or isinstance(
             getattr(self, "_velocity_policy", None), G1DecoupledPolicy
         )
 
     @property
     def uses_explicit_body_efforts(self) -> bool:
-        """Whether this actor requires its own clipped motor PD each physics step."""
+        """Return whether this actor requires explicit clipped motor PD every physics step."""
         return getattr(self, "_physical_locomotion", False) and isinstance(
             getattr(self, "_velocity_policy", None), G1DecoupledPolicy
         )
@@ -1101,7 +1115,11 @@ class G1TeleopRobot:
         raise RuntimeError(self.locomotion_fault)
 
     def _activate_kinematic_fallback(self, reason: str = "Walking policy is unavailable") -> None:
-        """Select the complete avatar configuration after a checkpoint load failure."""
+        """Select avatar posture/gravity for legacy failure; fault in physical mode.
+
+        Policy-owned joint mappings must be cleared before defaults are selected.
+        Physical mode raises through its fault latch before changing root behavior.
+        """
         if getattr(self, "_physical_locomotion", False):
             self._fail_physical_locomotion(reason)
         self._walk_policy = None
@@ -1133,10 +1151,10 @@ class G1TeleopRobot:
     def _reset_walk_policy_state(self, *, clear_fault: bool = True) -> None:
         """Reset the selected actor's history or legacy LSTM memory.
 
-        The exported actor is ``PolicyExporterLSTM`` and carries its hidden and cell
-        state *inside* the scripted module — feeding it the same observation twice gives
-        two different actions. Without this the robot resumes mid-stride from whatever
-        the last episode left behind, which reliably topples it on the first step.
+        Physical mode delegates to its actor's history reset. The legacy scripted
+        ``PolicyExporterLSTM`` instead stores hidden/cell state inside the module;
+        clear both so a new episode or assisted hold cannot resume an old stride.
+        This helper resets Python/controller state without reading physics tensors.
 
         Args:
             clear_fault: Clear the fault only for an explicit reset or initialization.
@@ -1166,7 +1184,7 @@ class G1TeleopRobot:
             carb.log_warn(f"G1TeleopRobot: could not reset the walking policy's LSTM state: {e}")
 
     def _compute_walk_observation(self, command: object):
-        """Build the policy's 47-dim observation, laid out exactly as it was trained."""
+        """Build the legacy actor's 47-value observation in checkpoint order and units."""
         torch = import_module("torch")
         import warp as wp
 
@@ -1225,16 +1243,19 @@ class G1TeleopRobot:
         return obs
 
     def _update_idle_hold(self, dt: float, command: object) -> bool:
-        """Pin the robot in place once the operator has been idle for a moment.
+        """Apply the legacy assisted base/leg hold after sustained idle input.
+
+        The captured root pose and zero velocities are rewritten while holding.
+        Physical decoupled locomotion bypasses this helper entirely.
+
+        Args:
+            dt: Simulation timestep in seconds.
+            command: Body-frame forward/lateral speed and yaw rate before assistance.
 
         Returns:
             True when the hold is active and has driven the robot this step, in which
             case the caller should not run the policy.
 
-        The policy cannot hold station on its own: commanded zero it walks off at
-        0.62 m/s, and cancelling that by commanding reverse barely works because reverse
-        tracking is ~40%. Pinning the base is the honest answer for a teleoperation rig —
-        letting go of the stick should mean the robot stays where you left it.
         """
         if not (self.STATION_HOLD_ENABLED and self.STATION_KEEP_ENABLED):
             return False
@@ -1278,11 +1299,10 @@ class G1TeleopRobot:
         return True
 
     def _update_turn_in_place(self, dt: float, command: object) -> None:
-        """Hold the robot's ground position while it is only being asked to turn.
+        """Correct legacy root XY during yaw-only input without replacing leg targets.
 
-        Called after the policy has written its leg targets, so this decides only where
-        the base is allowed to end up, never what the legs do -- the gait, the yaw and the
-        vertical bob all stay exactly as the policy produced them.
+        This assisted pose/velocity write follows the legacy actor and preserves
+        current root height and orientation. Physical decoupled mode bypasses it.
 
         Args:
             dt: Physics timestep in seconds.
@@ -1351,11 +1371,11 @@ class G1TeleopRobot:
             carb.log_warn(f"G1TeleopRobot: turn-in-place hold failed: {e}")
 
     def _station_keeping_command(self, command: object) -> object:
-        """Replace an idle command with one that cancels the robot's residual motion.
+        """Add legacy drift correction when requested translation is near zero.
 
-        Only engages when the operator is asking for (near) nothing. While they are
-        actively driving, their command passes through untouched -- this must never fight
-        the person holding the stick.
+        A translating command passes through. During yaw-only input, preserve
+        requested yaw while correcting linear drift; at full idle, correct yaw
+        drift too. Corrections use body-frame measured velocity and bounded gains.
         """
         if not self.STATION_KEEP_ENABLED:
             return command
@@ -1411,7 +1431,7 @@ class G1TeleopRobot:
         ]
 
     def _step_walk_policy(self, dt: float, command: object) -> None:
-        """Run the walking policy at 50 Hz and drive the leg joints from its actions."""
+        """Step the legacy recurrent actor at 50 simulation Hz and write leg targets."""
         torch = import_module("torch")
         import warp as wp
 
@@ -1582,11 +1602,21 @@ class G1TeleopRobot:
         carb.log_info(f"G1TeleopRobot: {self._hand_variant} finger DOFs: {indices_by_side}")
 
     def get_finger_roles(self, side: str) -> list[str]:
-        """Return the finger roles controllable on one hand."""
+        """Return the sorted driven-finger roles resolved for one hand.
+
+        Args:
+            side: ``"left"`` or ``"right"``.
+
+        Returns:
+            Available actuator-role names, or an empty list if none were resolved.
+        """
         return sorted(self._finger_dof_indices.get(side, {}))
 
     def has_finger_control(self) -> bool:
-        """Return whether any finger DOF was resolved on the articulation."""
+        """Return whether initialization resolved at least one driven finger joint.
+
+        This describes the configured mapping, not current tracking or contact health.
+        """
         return any(self._finger_dof_indices.values())
 
     def get_finger_joint_range(self, side: str, role: str) -> tuple[float, float] | None:
@@ -1595,6 +1625,14 @@ class G1TeleopRobot:
         These are the same endpoints used by :meth:`set_finger_curls`, including
         its margin before the hard stop. The closed angle can be lower than the
         open angle for a Dex3 finger; callers must preserve that direction.
+
+        Args:
+            side: ``"left"`` or ``"right"``.
+            role: A driven actuator role, including ``thumb_yaw`` for opposition.
+
+        Returns:
+            Open and closed endpoint angles, or None for an unresolved, nonfinite,
+            or effectively zero-width actuator range.
         """
         if role not in self._finger_dof_indices.get(side, {}):
             return None
@@ -1616,6 +1654,12 @@ class G1TeleopRobot:
         pushes a joint outside that range. Missing/invalid measurements are omitted;
         unavailable physics returns an empty dictionary. Commanded targets are never
         substituted for actual motion or inferred for mimic joints.
+
+        Args:
+            side: ``"left"`` or ``"right"``.
+
+        Returns:
+            Measured actuator curls keyed by the roles with usable joint measurements.
         """
         roles = self._finger_dof_indices.get(side, {})
         ranges = {role: value for role in roles if (value := self.get_finger_joint_range(side, role)) is not None}
@@ -1624,8 +1668,8 @@ class G1TeleopRobot:
         try:
             if not self.robot.is_physics_tensor_entity_valid():
                 return {}
-            # Experimental Articulation returns a Warp array. Its numpy() method
-            # copies a GPU observation to the host, as used by initialization above.
+            # The articulation returns a Warp array; `numpy()` exposes the values
+            # on the host regardless of the configured simulation device.
             positions = np.asarray(self.robot.get_dof_positions().numpy(), dtype=float)
             if positions.ndim != 2 or positions.shape[0] != 1:
                 return {}
@@ -1644,6 +1688,10 @@ class G1TeleopRobot:
 
     def set_finger_curls(self, side: str, curls: dict[str, float]) -> None:
         """Drive one hand's fingers from normalized curl values.
+
+        Only resolved driven joints receive targets. Missing roles keep their
+        existing targets; nonfinite values are skipped and finite values are
+        clamped to the normalized range. Passive mimic joints follow their coupling.
 
         Args:
             side: ``"left"`` or ``"right"``.
@@ -1680,7 +1728,13 @@ class G1TeleopRobot:
     """
 
     def _apply_body_joint_gains(self, dof_names: list[str]) -> None:
-        """Apply per-group PD gains to the body joints, leaving hand drives untouched."""
+        """Configure body actuators by mode without modifying finger drives.
+
+        Physical decoupled mode installs deployment limits and armature, then
+        disables implicit PD by switching to effort control. Its explicit loop
+        reads position targets later; keeping implicit gains active would apply
+        two controllers to the same body motors.
+        """
         if getattr(self, "_physical_locomotion", False):
             policy = self._velocity_policy
             indices = self._velocity_dof_indices
@@ -1721,11 +1775,10 @@ class G1TeleopRobot:
                 carb.log_warn(f"G1TeleopRobot: could not set gains for {keywords}: {e}")
 
     def _apply_walk_policy_gains(self, dof_names: list[str]) -> None:
-        """Apply the gains the walking policy was trained and deployed with.
+        """Apply the legacy actor's leg gains and upper-body posture gains.
 
-        A position-target policy is only as good as the PD loop underneath it: it learned
-        against these exact stiffnesses, so substituting the Isaac Lab values would change
-        how every action lands.
+        These implicit drives are part of that checkpoint's deployment contract.
+        They do not configure the physical decoupled actor's explicit motor loop.
         """
         groups: list[tuple[list[int], list[float], list[float]]] = []
         if self._leg_dof_indices:
@@ -1766,7 +1819,7 @@ class G1TeleopRobot:
 
     @staticmethod
     def _command_to_floats(command: object) -> tuple[float, float, float]:
-        """Convert a 3-element command (torch tensor, list, ...) to plain floats."""
+        """Convert the first three command components, returning zero if any is invalid."""
         try:
             values = float(command[0]), float(command[1]), float(command[2])
             return values if all(math.isfinite(value) for value in values) else (0.0, 0.0, 0.0)
@@ -1781,5 +1834,5 @@ class G1TeleopRobot:
 
     @staticmethod
     def _wrap_angle(angle: float) -> float:
-        """Wrap an angle into ``[-pi, pi]`` so yaw never grows without bound."""
+        """Wrap a radian angle into ``[-pi, pi)`` for bounded yaw state."""
         return (angle + math.pi) % (2.0 * math.pi) - math.pi

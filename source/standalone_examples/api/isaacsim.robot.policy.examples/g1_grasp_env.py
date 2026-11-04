@@ -1,23 +1,21 @@
-"""Vectorised G1 grasping environment for reinforcement learning, without Isaac Lab.
+"""Benchmark a retained prototype of cloned, fixed-base G1 grasp scenes.
 
-Isaac Lab is not installed on this machine, and it is a large dependency to add for one
-task, so this builds the same thing directly on Isaac Sim's cloner and physics tensor API:
-N copies of the G1's upper body, each with a table and one YCB object, stepped together on
-GPU PhysX.
+This standalone experiment uses Isaac Sim's cloner and physics APIs without Isaac
+Lab. It builds one G1/table/YCB-object scene, clones it, and times physics stepping.
+It does not implement a training loop, observations/actions/rewards interface,
+episode reset, or a trained grasping policy. The reported policy-step budgets are
+throughput extrapolations that exclude learning and data-processing costs.
 
-Scope is deliberately narrow, and the narrowness is what makes it trainable in hours
-rather than days:
+The pelvis is anchored inside each clone, selected lower-body collisions are
+disabled, and idle joints receive stiff drives. These simplifications differ from
+the active VR example's physical manipulation and walking. The four right-arm
+indices retained here also differ from the current VR example's seven-joint IK;
+no direct policy-transfer compatibility is established.
 
-* **The base is fixed.** Grasping and walking are separate problems, and the Unitree
-  locomotion policy already handles the second one. Pinning the pelvis removes the legs,
-  removes falling over, and removes the need for the policy to learn balance before it can
-  learn to reach.
-* **Four arm joints plus one finger scalar.** The same DOFs teleoperation drives, so a
-  policy trained here can be dropped into the same control path.
-* **YCB objects.** Hand-sized (0.05-0.19 m); the warehouse crates this project started with
-  are 0.60 x 0.40 m against a ~0.12 m hand and cannot be grasped at all.
-
-Run directly to measure environment throughput, which is what sets the training time:
+Run this file as a separate Isaac Sim process. Argument parsing and SimulationApp
+startup occur at module scope, so importing it is not a passive utility import.
+The initial object is the first entry in `OBJECT_USDS`; no object randomization is
+implemented. Use Isaac Sim's Python wrapper to measure the configured scene:
 
     python.bat source/standalone_examples/api/isaacsim.robot.policy.examples/g1_grasp_env.py --envs 512
 """
@@ -52,12 +50,11 @@ from isaacsim.core.simulation_manager import SimulationManager  # noqa: E402
 from isaacsim.storage.native import get_assets_root_path  # noqa: E402
 from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics  # noqa: E402
 
-#: The arm joints the policy commands -- the same four teleoperation drives.
+#: Right-arm joint roles resolved by this prototype; no action API uses them yet.
 ARM_JOINTS = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow")
-#: Physics rate. 100 Hz matches the interactive example, so a trained policy transfers
-#: into it without a timestep mismatch.
+#: Physics timestep in seconds for this standalone benchmark, not every VR profile.
 PHYSICS_DT = 1.0 / 100.0
-#: Control decimation: the policy acts at 50 Hz, as the locomotion policy does.
+#: Divide measured physics throughput by this factor for the printed budget estimate.
 DECIMATION = 2
 
 G1_USD = "/Isaac/Robots/Unitree/G1/g1.usd"
@@ -72,7 +69,19 @@ PELVIS_HEIGHT = 0.80       # m, the spawn height the G1 asset expects
 
 
 class G1GraspEnv:
-    """N parallel G1 upper bodies, each reaching for one object on a table."""
+    """Build cloned fixed-base scenes and expose physics stepping for timing.
+
+    Construction creates a World, authors the template, clones it, resets physics,
+    and resolves articulation views. Reaching and grasping actions are not executed.
+
+    Args:
+        num_envs: Number of scene copies requested from the grid cloner.
+        device: Physics/tensor device passed to Isaac Sim.
+        spacing: Grid separation in meters.
+
+    Raises:
+        RuntimeError: The Isaac Sim assets root cannot be resolved.
+    """
 
     def __init__(self, num_envs: int, device: str = "cuda", spacing: float = 2.5):
         self.num_envs = num_envs
@@ -97,13 +106,12 @@ class G1GraspEnv:
         self._clone(spacing)
 
     def _enlarge_gpu_buffers(self) -> None:
-        """Raise the GPU PhysX capacities well above the defaults sized for one robot.
+        """Request GPU PhysX capacities scaled to the number of cloned scenes.
 
-        These live on the PhysicsScene PRIM, not in carb settings -- setting the carb keys
-        does nothing and PhysX keeps demanding more capacity while silently missing
-        interactions, which both wrecks the contacts a grasp depends on and collapses the
-        step rate. With N cloned humanoids the aggregate-pair count scales with N, so the
-        default (sized for a single robot) is short by orders of magnitude.
+        These requests are authored on the PhysicsScene prim. Missing scenes or
+        unsupported attributes are reported and leave the corresponding settings
+        unchanged. The chosen capacities do not establish that a particular GPU
+        can run every requested environment count.
         """
         stage = omni.usd.get_context().get_stage()
         scene_prim = None
@@ -116,8 +124,7 @@ class G1GraspEnv:
             return
 
         api = PhysxSchema.PhysxSceneAPI.Apply(scene_prim)
-        # Scaled off the environment count, with generous headroom: undersizing costs far
-        # more (missed contacts) than the memory these buffers take on a 32 GB card.
+        # Retain the prototype's capacity floors and per-environment scaling.
         envs = max(self.num_envs, 1)
         for setter, value in (
             (api.CreateGpuFoundLostAggregatePairsCapacityAttr, max(1 << 16, envs * 2048)),
@@ -179,13 +186,11 @@ class G1GraspEnv:
                 UsdPhysics.CollisionAPI.Apply(prim)
 
     def _fix_base(self, stage, robot_root: str) -> None:
-        """Weld the pelvis to the world.
+        """Anchor the pelvis relative to its environment so the cloner can remap it.
 
-        Grasping and locomotion are separate problems and the Unitree policy already solves
-        the second. Pinning the base removes the legs' dynamics, removes falling over, and
-        removes the need for the policy to learn balance before it can learn to reach --
-        and it is most of the simulation cost, since a free 53-DOF humanoid in contact with
-        the ground is far more solver work than an arm.
+        This removes free-base motion from the benchmark; it does not remove the
+        leg joints from the articulation. If no pelvis is found, the function
+        reports a warning and retains the unanchored scene.
         """
         pelvis = None
         for candidate in (f"{robot_root}/Asset/pelvis", f"{robot_root}/Asset/G1/pelvis"):
@@ -203,8 +208,7 @@ class G1GraspEnv:
         # Body0 must be a prim INSIDE the environment, not the world. A world-anchored
         # joint (no Body0) cannot be remapped by the cloner -- it warns "localPose wont be
         # updated" -- so every clone stays welded to env_0's origin and all N robots get
-        # dragged onto the same spot, interpenetrating. Measured, that alone was most of
-        # the simulation cost.
+        # dragged onto the same spot, interpenetrating.
         joint = UsdPhysics.FixedJoint.Define(stage, f"{robot_root}/BaseWeld")
         joint.CreateBody0Rel().SetTargets(["/World/envs/env_0"])
         joint.CreateBody1Rel().SetTargets([pelvis])
@@ -212,16 +216,17 @@ class G1GraspEnv:
         joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
         print(f"[grasp-env] base welded at {pelvis} (anchored inside the env)", flush=True)
 
-    #: Link name fragments whose collision geometry the grasp task can never use. The
-    #: pelvis is welded, so nothing below the waist moves or touches anything.
+    #: Lower-body link-name fragments whose colliders this benchmark disables.
     DEAD_COLLISION = ("hip", "knee", "ankle", "foot", "leg")
 
     def _strip_unused_physics(self, stage, robot_root: str) -> int:
-        """Turn off self-collision and the collision geometry of the locked lower body.
+        """Disable articulation self-collision and selected lower-body colliders.
 
-        Contact pairs are what the GPU broadphase spends its time on, and a welded humanoid
-        generates a great many that can never produce a useful contact. Returns the number
-        of colliders disabled.
+        This is a benchmark simplification, not the active VR contact configuration.
+        Individual authoring failures are skipped by the retained implementation.
+
+        Returns:
+            Number of successful collider-disable operations.
         """
         disabled = 0
         root = stage.GetPrimAtPath(robot_root)
@@ -245,7 +250,7 @@ class G1GraspEnv:
         return disabled
 
     def _select_g1_variants(self, prim) -> None:
-        """Pick the simplified-physics G1 with Inspire hands, as the example does."""
+        """Request this benchmark's simplified-physics and Inspire-hand variants."""
         if not prim.IsValid():
             return
         wanted = {"Physics": "SimplifiedPhysX", "left_hand": "Inspire", "right_hand": "Inspire"}
@@ -258,6 +263,11 @@ class G1GraspEnv:
             print(f"[grasp-env] variant selection skipped: {error}", flush=True)
 
     def _clone(self, spacing: float) -> None:
+        """Clone the template, reset physics, and bind batched articulation views.
+
+        Joint indices are resolved after reset because the composed asset defines
+        the actual DOF ordering. Scene/view errors propagate to the caller.
+        """
         cloner = GridCloner(spacing=spacing)
         targets = cloner.generate_paths("/World/envs/env", self.num_envs)
         self.env_origins = cloner.clone(
@@ -285,7 +295,10 @@ class G1GraspEnv:
 
     @staticmethod
     def _resolve_arm_dofs(dof_names: list[str]) -> list[int]:
-        """Right-arm joint indices, matched by name."""
+        """Return matching right-arm indices in the prototype's requested order.
+
+        Missing names are omitted; this helper does not validate a complete arm.
+        """
         found = []
         for joint in ARM_JOINTS:
             for index, name in enumerate(dof_names):
@@ -295,10 +308,10 @@ class G1GraspEnv:
         return found
 
     def _lock_idle_joints(self) -> None:
-        """Hold every non-arm, non-finger joint at its default with a stiff drive.
+        """Request zero position targets and stiff drives for the remaining joints.
 
-        The legs and waist are not part of this task and the pelvis is welded, so letting
-        the solver integrate them is work spent on joints that are supposed to stay still.
+        These are drive requests, not removal of DOFs or a hard joint lock. Failed
+        drive setup is reported without aborting the retained benchmark.
         """
         if not self.locked_dofs:
             return
@@ -321,11 +334,27 @@ class G1GraspEnv:
     # ------------------------------------------------------------------- step
 
     def step_physics(self, count: int = 1) -> None:
+        """Advance the benchmark World without rendering or supplying new actions.
+
+        Args:
+            count: Number of physics steps to request.
+
+        Example:
+
+            .. code-block:: python
+
+                env.step_physics(20)  # Warm up a constructed benchmark scene.
+        """
         for _ in range(count):
             self.world.step(render=False)
 
 
 def main() -> int:
+    """Time warmed-up physics stepping, print extrapolations, and close the app.
+
+    Returns:
+        Zero after the benchmark completes normally.
+    """
     env = G1GraspEnv(ARGS.envs, ARGS.device, ARGS.spacing)
     env.step_physics(20)
 

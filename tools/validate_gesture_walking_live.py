@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Replay physical gesture-walking acceptance in an already-loaded Isaac Sim.
+"""Replay physical walking and reach acceptance in an already-loaded Isaac Sim.
 
-Start tools/launch_gesture_walking.bat and load Humanoid, then run this host CLI
-with ordinary Python. The production actor, arm IK, finger control, contacts,
-and safety guards run in real PhysX. Synthetic commands exercise walking; the
-reach suite also injects right-palm targets and curls. This is not a Quest
-hardware test, a payload test, or a test of gesture recognition itself.
+The historical filename is retained for existing validation workflows.
+Start tools/launch_gesture_walking.bat (an alias for controller walking) and load
+Humanoid, then run this host CLI with ordinary Python. The production actor,
+arm IK, finger control, contacts, and safety guards run in real PhysX. Synthetic
+commands exercise walking; the reach suite also injects right-palm targets and
+curls. This is not a Quest hardware test, a payload test, or a test of gesture
+recognition itself.
 
 --reset explicitly resets the scene before the first suite. --suite all always
 resets between baseline and reach so the tests start independently. Input

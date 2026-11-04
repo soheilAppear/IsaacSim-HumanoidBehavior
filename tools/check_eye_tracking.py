@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Check the Quest Pro eye-gaze chain end to end, without launching anything.
+"""Inspect saved Quest Pro eye-tracking configuration and handshake evidence.
 
-Every link in the chain leaves a trace on disk, so "is eye tracking reaching Isaac Sim?"
-can be answered in a second instead of by putting the headset on and guessing:
+Read the OpenXR runtime registry, SteamVR settings, and Steam Link/Kit logs
+without launching applications:
 
     python tools/check_eye_tracking.py
 
-The one link that actually breaks in practice is the headset telling Steam Link it has eye
-tracking. Steam Link logs that explicitly, and Kit logs whether the resulting OpenXR
-device ever showed up, so the two can be lined up against each other.
+This legacy inspector uses fixed Steam paths and the Isaac-Sim XR VR ``6.0``
+log directory. Its findings may describe an earlier session; a missing log does
+not establish the state of a newer installation. A recorded eye-device handshake
+does not establish a currently valid gaze pose. Inspect the running example's
+eye-gaze tracker through ``tools/kit_exec.py`` for current source/ray validity.
 """
 
 from __future__ import annotations
@@ -131,9 +133,9 @@ def check_kit() -> None:
 def watch() -> int:
     """Tail the Steam Link log and report the moment the headset advertises eye tracking.
 
-    The whole chain hinges on one line appearing in Steam Link's driver log. Watching for
-    it live means the headset toggles can be fixed with immediate feedback, instead of
-    launching a 7 GB application to find out.
+    This watches the Steam Link advertisement handshake only. It provides feedback
+    when changing headset settings; current Kit device and pose validity still
+    require inspection of the running session.
     """
     path = STEAM_LOGS / "driver_vrlink.txt"
     print("Watching Steam Link for the eye-tracking handshake.")

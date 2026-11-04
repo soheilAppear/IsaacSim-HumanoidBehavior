@@ -7,6 +7,9 @@ Use Isaac Sim's python.bat/python.sh. The runner imports that installation's USD
 NumPy, and PyTorch libraries; simulator services and XR inputs are replaced by test
 doubles. This validates controller behavior and real USD joint/material authoring,
 but does not validate hardware tracking quality or a dynamically balanced gait.
+
+Discovery is limited to ``tools/tests/test_*control*.py``. Other standalone tool
+tests and the live replay validators are separate entry points.
 """
 
 from __future__ import annotations

@@ -130,6 +130,7 @@ class FactoryRoutePlanner:
         return result
 
     def _floor(self, point: Position) -> Generator[None, None, Position | None]:
+        """Verify floor height and a support patch within the shared query budget."""
         result = _position((yield from self._query(self._floor_at, point)))
         if result is None or math.hypot(result[0] - point[0], result[1] - point[1]) > 0.05:
             return None
@@ -163,6 +164,7 @@ class FactoryRoutePlanner:
         return True
 
     def _plan(self) -> Generator[None, None, None]:
+        """Find a verified direct route or search heading-aware grid alternatives."""
         start = yield from self._floor(self.start)
         goal = yield from self._floor(self.target)
         if start is None or goal is None or math.dist(goal, self.target) > 0.08:
@@ -199,6 +201,7 @@ class FactoryRoutePlanner:
         def corner_allowed(
             key: tuple[int, int, int], point: Position, outgoing: tuple[float, float]
         ) -> Generator[None, None, bool]:
+            """Require cached corner clearance when the search changes heading."""
             if key[2] < 0:
                 return True
             incoming = neighbors[key[2]]

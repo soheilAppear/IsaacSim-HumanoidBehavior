@@ -1,5 +1,22 @@
 # Changelog
 
+## HumanoidBehavior documentation cleanup — 2026-11-04
+
+This fork-only documentation update does not change the extension version,
+controller behavior, physics settings, policy weights, recording formats, or
+historical validation results.
+
+- Explain the custom G1 lifecycle, control ownership, coordinate/time conventions,
+  and retained fallback paths in source comments and docstrings.
+- Correct the extension overview and on-screen descriptions of physical grasping,
+  the robot-head view, and experimental pointing destinations.
+- Clarify launch profiles, local recording semantics, and the boundary between
+  implemented data collection and the planned learning pipeline.
+- Validate the cleanup with 891 standalone humanoid regressions before and after
+  the edits. Executable Python syntax trees and launcher commands match the prior
+  checkpoint, except for four corrected UI instruction strings; comments and
+  docstrings are the only other source changes.
+
 ## HumanoidBehavior fork changes — 2026-09-07
 
 This section records changes in this repository fork. It does not introduce an

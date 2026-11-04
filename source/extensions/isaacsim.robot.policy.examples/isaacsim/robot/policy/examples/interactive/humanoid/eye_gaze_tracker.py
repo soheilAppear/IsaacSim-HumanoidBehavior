@@ -300,6 +300,7 @@ class EyeGazeTracker:
         best = (None, None, None)
 
         def on_hit(hit):
+            """Keep the nearest finite hit after excluding known robot paths."""
             nonlocal best
             path = self._decode_hit_path(hit)
             if path and (path == self._robot_root_path or path.startswith(self._robot_root_path + "/")):
@@ -433,6 +434,7 @@ class EyeGazeTracker:
         carb.log_info(f"EyeGazeTracker: created gaze-ray visuals under {self._ray_root_path}")
 
     def _set_visuals_visible(self, visible: bool) -> None:
+        """Toggle the ray root or mark removed visuals for recreation on a later update."""
         if not self._visuals_created:
             return
         stage = omni.usd.get_context().get_stage()

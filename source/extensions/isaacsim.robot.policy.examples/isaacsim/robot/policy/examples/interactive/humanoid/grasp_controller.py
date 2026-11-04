@@ -66,6 +66,17 @@ class ContactGraspController:
     Use one instance per hand. Preparation of sensors, object eligibility, joint
     effort limits, friction, and drop-button inhibition belong to the caller.
     Only current contacts should be supplied: stale frames must not be replayed.
+
+    Args:
+        support_time_s: Simulation-time dwell required for opposing contacts.
+        min_force_n: Minimum measured normal force for a qualifying contact.
+        max_separation_m: Largest contact gap accepted as support evidence.
+        min_point_spacing_m: Minimum distance between opposing contact points.
+        opposing_normal_dot: Upper dot-product threshold for opposing unit normals.
+        contact_grace_s: Time to retain a closing limit through missing contacts.
+
+    Raises:
+        ValueError: A threshold is nonfinite or outside its permitted range.
     """
 
     def __init__(
@@ -118,6 +129,12 @@ class ContactGraspController:
         contacts: list[ContactSample],
         elapsed: float,
     ) -> dict[str, float]:
+        """Cap closing travel against first-contact anchors, including scenery.
+
+        Each actuator/body pair retains its original preload allowance while
+        contact persists. Brief contact loss keeps that limit for the grace time;
+        opening requests remain free to reduce the curl below it.
+        """
         paths_by_role: dict[str, set[str]] = {role: set() for role in ACTUATOR_ROLES}
         for contact in contacts:
             if contact.role in paths_by_role:
@@ -154,6 +171,7 @@ class ContactGraspController:
 
     @staticmethod
     def _curl(value, default: float = 0.0) -> float:
+        """Clamp a finite numeric curl to its normalized range, or use the fallback."""
         try:
             value = float(value)
             return min(1.0, max(0.0, value)) if math.isfinite(value) else default
@@ -161,6 +179,7 @@ class ContactGraspController:
             return default
 
     def _valid_contact(self, contact: ContactSample) -> ContactSample | None:
+        """Normalize measured contact geometry or discard malformed and weak samples."""
         try:
             if not isinstance(contact.object_path, str) or not contact.object_path or contact.role not in CONTACT_ROLES:
                 return None
@@ -190,14 +209,17 @@ class ContactGraspController:
             return None
 
     def _opposed(self, first: ContactSample, second: ContactSample) -> bool:
+        """Check normal opposition and point spacing on already validated contacts."""
         normal_dot = sum(a * b for a, b in zip(first.normal_world, second.normal_world))
         spacing = math.dist(first.point_world, second.point_world)
         return normal_dot <= self.opposing_normal_dot and spacing >= self.min_point_spacing_m
 
     def _classify(self, contacts: list[ContactSample]) -> tuple[str, tuple[str, ...]] | None:
+        """Prefer multi-digit wrap evidence, then check thumb/finger pinch evidence."""
         by_role = {role: [contact for contact in contacts if contact.role == role] for role in CONTACT_ROLES}
 
         def opposed_roles(first: str, second: str) -> bool:
+            """Find any opposing pair across two anatomical contact roles."""
             return any(self._opposed(a, b) for a in by_role[first] for b in by_role[second])
 
         # A wrap needs two distinct digits against a common thumb/palm surface.

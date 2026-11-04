@@ -70,6 +70,7 @@ def project_contact_step(
     corrections = np.zeros((len(rows) + 1, requested.size))
 
     def feasible(value: np.ndarray) -> bool:
+        """Require both joint-step bounds and contact half-spaces within tolerance."""
         return (
             np.all(value >= lower - tolerance)
             and np.all(value <= upper + tolerance)

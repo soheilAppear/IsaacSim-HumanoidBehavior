@@ -39,6 +39,7 @@ class CsvBatch:
         # formatting on the worker. Unknown objects are frozen to text here so
         # mutable data or simulator-backed values cannot cross the boundary.
         def freeze(value):
+            """Keep native scalar cells and detach other values as text."""
             return value if value is None or type(value) in (str, int, float, bool) else str(value)
 
         rows = tuple(tuple(freeze(record.get(name, "")) for name in names) for record in records)
@@ -76,6 +77,13 @@ class BehavioralCsvWriter:
     outside physics callbacks. Failures include the complete immutable batch.
     Once a path fails, later accepted batches for that path are retained as
     failures too, preserving row order for explicit recovery.
+
+    Args:
+        max_pending: Maximum accepted batches, including completed results that
+            the caller has not yet collected.
+
+    Raises:
+        ValueError: Queue capacity is not a positive nonboolean integer.
     """
 
     def __init__(self, max_pending: int = 8):
@@ -129,6 +137,7 @@ class BehavioralCsvWriter:
         self._pending.append(future)
 
     def _accept(self, batch: CsvBatch) -> None:
+        """Stage an owned batch during a group, or submit it immediately."""
         if self._grouping:
             self._staged.append(batch)
         else:
@@ -149,6 +158,7 @@ class BehavioralCsvWriter:
         return True
 
     def _write(self, batch: CsvBatch) -> CsvWriteResult:
+        """Append on the worker, retaining this and later batches after path failure."""
         if batch.path in self._failed_paths:
             return CsvWriteResult(batch, "An earlier batch for this file failed; later rows retained in order")
         try:

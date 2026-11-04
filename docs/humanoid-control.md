@@ -41,7 +41,7 @@ bimanual shelf pickup or loaded transport. Stationary defaults and gaze are unch
 Optical control accepts a valid **open hand** immediately. Finger updates do not
 require a fist, a grip/pinch gesture, or an active arm target. Pickup requires actually
 closing the robot fingers around the object. The user confirmed that eye and finger tracking
-returned after starting SteamVR independently. The latest recording also contains
+returned after starting SteamVR independently. The 12 September recording also contains
 both optical hands and real eye-gaze samples. This confirms input recovery; the new
 palm alignment and response changes still require a live hardware acceptance check.
 
@@ -230,10 +230,12 @@ Paths in this table are relative to
 
 | File | Responsibility |
 |---|---|
+| `interactive/humanoid/humanoid_example_extension.py` | Examples-browser registration and profile-specific UI instructions |
 | `interactive/humanoid/humanoid_example.py` | Scene, input arbitration, arm/finger retargeting, pickup, camera, recorder, lifecycle |
+| `interactive/humanoid/behavioral_csv_writer.py` | Bounded, ordered disk writes with immutable CSV batches and explicit failure retention |
 | `interactive/humanoid/xr_pose.py` | Validated virtual-world poses and timestep-independent smoothing |
 | `interactive/humanoid/eye_gaze_tracker.py` | Eye/head provenance, raycasts, latest sample, gaze visuals |
-| `interactive/humanoid/material_highlights.py` | Shared reversible gaze and hand material overrides |
+| `interactive/humanoid/material_highlights.py` | Preauthored nonphysical visual shells and shared gaze/hand color ownership; no live rigid-body material rebinding |
 | `interactive/humanoid/grasp_controller.py` | Contact-limited finger targets and single-hand opposing-contact diagnostics |
 | `interactive/humanoid/bimanual_grasp.py` | Cross-hand measured contacts, dwell and estimated friction capacity; no control forces |
 | `interactive/humanoid/grasp_contacts.py` | Prepared PhysX hand-contact view, object identities, and contact health |
@@ -251,14 +253,67 @@ Paths in this table are relative to
 | `robots/g1_decoupled_policy.py` | Paired balance/walk actors, 29-joint observation, 15 leg/waist actions, and 50 Hz inference |
 | `robots/g1_foot_contacts.py` | Walking-only deployment foot contacts in a session layer, preserving mass properties |
 | `robots/data/g1_decoupled_*.onnx` and `g1_decoupled_policy.json` | Pinned NVIDIA actors and deployment contract; provenance and model/source licenses are in the adjacent README |
-| `tools/validate_gesture_walking_live.py` | Host CLI for reproducible real-PhysX baseline and right-arm replays |
-| `tools/validate_controller_walking_live.py` | Bounded synthetic-stick physical replay; directions, release, loss and neutral rearm |
 | `robots/data/g1_unitree_motion.pt` | Older twelve-leg-joint TorchScript actor retained for legacy assisted policy mode |
 
-Keep these files together when installing. Copying only the example file omits its
-helper imports and robot changes. The complete extension can be copied or linked as
-described in the setup guide. Save the stage and reload the app/example after edits;
-an already-created Python instance retains its earlier class implementation.
+Keep these files together when loading the extension. The project launcher selects
+this checkout's complete package with `--ext-path` and its exact extension version;
+copying individual files into the installed package can mix incompatible APIs.
+Save the stage, restart the application, and load the example after Python edits;
+rebuilding a scene alone does not replace already-imported classes.
+
+The following entry points sit outside that extension package. Their paths are
+relative to the repository root:
+
+| File | Scope |
+| --- | --- |
+| [`tools/validate_gesture_walking_live.py`](../tools/validate_gesture_walking_live.py) | Host CLI for reproducible real-PhysX baseline and right-arm replays |
+| [`tools/validate_controller_walking_live.py`](../tools/validate_controller_walking_live.py) | Bounded synthetic-stick physical replay: directions, release, loss, and neutral rearm |
+| [`source/standalone_examples/api/isaacsim.robot.policy.examples/g1_grasp_env.py`](../source/standalone_examples/api/isaacsim.robot.policy.examples/g1_grasp_env.py) | Retained cloned-scene throughput benchmark; no action/reward interface, episode reset, or training loop |
+| [`source/standalone_examples/api/isaacsim.robot.policy.examples/g1_standalone.py`](../source/standalone_examples/api/isaacsim.robot.policy.examples/g1_standalone.py) | Retained keyboard/scripted assisted walking and hand demo; separate from the current strict physical VR profile and recorder |
+
+Both standalone files start their own Isaac Sim application at module scope;
+importing them is not a passive way to reuse a helper.
+
+## Runtime and data flow
+
+The repository includes the upstream Isaac Sim platform as well as this custom
+application. The main path is the project launcher, the modified
+`isaacsim.robot.policy.examples` package, `HumanoidExampleExtension` registration,
+and the `HumanoidExample` scene/controller. The standard launcher uses an installed
+Isaac Sim runtime; it does not build or replace that runtime. NVIDIA's pretrained
+balance/walk actors remain upstream assets executed by the G1 wrapper.
+
+For an initialized robot, `on_physics_step()` creates a hand-input snapshot for one
+callback, then `_advance_physics_step()` runs this sequence:
+
+1. Check physics-view validity, measured articulation health, and walking balance.
+2. Read the selected locomotion source, bound its velocity request, check unintended
+   motion, and update the filtered base command.
+3. Call `g1.forward()` to update the selected posture/locomotion controller. In
+   physical decoupled mode, the learned actors own legs and waist while teleoperation
+   owns the arms; finger drives are separate.
+4. Update contact-limited fingers and arm IK targets. With explicit body PD, call
+   `g1.apply_body_efforts()` after arm targets are final so the body receives one
+   combined effort update for the next simulation step.
+5. Update the mounted view and gaze, then collect the scheduled recording rows and
+   image. The callback releases its hand snapshot before the next update.
+
+Input, controller targets, and measured state are different data. A controller
+stick or hand pose expresses operator input; clamping, IK, contact constraints,
+and the policy determine the command sent to the articulation. Joint/object state
+is the measured response. Recording currently captures only part of that action
+path, as described below and in the [learning guide](../learning/README.md).
+
+There are also three distinct clocks: physics time for dynamics, bounded wall time
+for operator-response filters, and render updates for camera images. The nominal
+100 Hz CSV and 10 Hz image schedules use simulation time; they do not promise those
+rates per real second or a newly rendered image at every capture request.
+
+Retained code is not necessarily an active input. `PointNavigation` runs only in
+its explicit pointing profile; the older `LocomotionGesture` V-sign helper is not
+wired into this callback. Head-bob gait is disabled. Standard launchers disable
+webcam robot input, and the optional EEG host application records/previews signals
+without sending anything into the robot's control loop.
 
 ## Frames and pose validity
 
@@ -1425,7 +1480,16 @@ two independent gaze queries.
 is requested at 10 Hz and CSV buffers flush about every 2.5 seconds. `metadata.json`
 records requested/resolved locomotion mode, grasp mode, and grasp configuration.
 The session's simulation clock stays monotonic across world resets; gait and velocity
-filters clear so reset discontinuities do not become motion estimates.
+filters clear so reset discontinuities do not become motion estimates. A future
+episode converter must still mark reset boundaries rather than interpreting a
+continuous timestamp as a continuous physical trajectory.
+
+CSV rows share a physics-step index, but the image logger reads the camera's most
+recent render and stamps the save with the current clocks. It does not record the
+original render timestamp, render frame ID, or per-frame camera extrinsics. The
+recorder writes RGB only; depth, segmentation, full contact arrays, final arm joint
+targets, and body motor efforts are not part of this dataset schema. Applied finger
+curls and filtered base commands are recorded separately from operator requests.
 
 ## Performance and CPU physics
 
@@ -1989,7 +2053,7 @@ over a metre. Gaze still reported `eye_tracker` with zero failed updates.
 
 Earlier 20- and 45-second real-input observations contained no valid finger landmarks.
 The user subsequently confirmed that eyes and fingers worked again after starting
-SteamVR independently. In the latest recorded session ending `02-02-51`, the last
+SteamVR independently. In the 12 September session ending `02-02-51`, the last
 complete minute contains **1,627 rows with both optical hands and `eye_tracker`**.
 This supersedes the earlier missing-skeleton observation and confirms recovered input
 transport. It does not validate the new absolute palm alignment, revised IK response,
@@ -2106,9 +2170,11 @@ Evaluate them against fixed-grip and speed-only baselines using actual contact, 
 drop, and release outcomes before adding adaptation. No gaze/velocity intent model or
 training pipeline is implemented; the current contact diagnostic does not alter gaze.
 
-`g1_grasp_env.py` is an experimental benchmark scaffold. It does not provide a complete
-training environment with step/reward/reset semantics, and this repair does not claim
-to train or integrate a new grasp or whole-body policy.
+[`g1_grasp_env.py`](../source/standalone_examples/api/isaacsim.robot.policy.examples/g1_grasp_env.py)
+is a retained throughput benchmark. It does not provide a training environment with
+actions, rewards, or episode resets; its printed policy-step budgets extrapolate
+physics throughput without training costs. The [learning guide](../learning/README.md)
+separates the recording data and planned learning stages from these prototypes.
 
 ## API references
 

@@ -2,7 +2,13 @@
 
 This fork of [NVIDIA Isaac Sim](https://github.com/isaac-sim/IsaacSim) provides stationary
 VR manipulation with a Unitree G1, Inspire five-finger hands, Quest Pro eye tracking,
-and synchronized behavioral recordings.
+and timestamped behavioral recordings.
+
+This is the operator guide: installation, launch profiles, controls, recording files,
+and troubleshooting. The [developer guide](docs/humanoid-control.md) explains the
+implementation and test entry points; the [validation record](docs/validation/isaac-sim-6.1.md)
+preserves dated results and their limitations. The custom application runs inside the
+modified policy-examples extension, using the installed Isaac Sim runtime.
 
 **Current default:** the pelvis is fixed to the world. Arms and fingers remain articulated.
 The stabilized robot view uses the G1's optical-sensor height, smooths robot travel
@@ -25,6 +31,9 @@ objects and four floor cartons. Blue pointing navigation remains implemented but
 disabled. Earlier pointing and physical-walking results are historical evidence,
 not acceptance of the new controller layout, shelf pickups or bimanual transport.
 Eye tracking and its red ray remain unchanged.
+
+The following September 2026 observations describe specific historical tests and
+operator reports. They do not establish acceptance of every subsequent revision.
 
 **An open hand should be tracked immediately when valid optical data arrives.** A fist is
 not an activation requirement or a guarantee of pickup. On 12 September the user confirmed
@@ -724,9 +733,10 @@ hardware checks.
 
 ### Apply an update to an existing session
 
-Save your stage, restart Isaac Sim to reload Python, and LOAD a fresh example. A previous
-walking scene must be rebuilt to create the fixed pelvis anchor. The extension and launcher
-now enable Kit's native hand component; if it is enabled after an XR instance already exists,
+Save your stage, restart Isaac Sim to reload Python, and LOAD a fresh example in the
+selected profile. Switching between stationary and walking modes requires rebuilding
+the scene because the fixed pelvis anchor changes the articulation topology. The
+extension and launcher enable Kit's native hand component; if it is enabled after an XR instance already exists,
 restart the **XR session** as well so that instance requests the skeletal extensions.
 
 The standalone `g1_standalone.py` is a separate walking/hand demo, not this stationary VR
@@ -1378,7 +1388,11 @@ time in both modes**. Derived recording intervals account for the 200 Hz walking
 physics timestep, so walking does not double these log rates. The 256×256 eye-camera PNG rate
 remains approximately 10 Hz; gaze raycasts remain 50 Hz. PNG compression uses
 lossless level 1 to reduce encoding time; files can be larger than earlier captures.
-Frame timestamps identify captured images; wall-clock capture rates depend on runtime performance.
+Frame timestamps identify saved images; wall-clock capture rates depend on runtime performance.
+`get_rgba()` returns the most recently rendered image, and its timestamp is written
+after PNG saving. The recorder does not store that render's original timestamp or
+a per-frame camera transform, so CSV/image alignment is approximate rather than
+hardware synchronization.
 
 Hand inertia is recorded in `hand_joint_armature_floor_kg_m2`, the actual authored
 `hand_joint_armature_kg_m2_by_path` map, and `hand_joint_armature_meaning`. Use the
@@ -1426,7 +1440,9 @@ are 150° for fingers and 95° for the thumb; angles beyond 180° do not reverse
 curl. Thumb opposition uses a palm-local frame. Missing fingers relax independently.
 The request columns describe smoothed operator input, and target columns describe
 commands sent to the robot after contact limits; `behavior.csv` joint
-states describe its measured response.
+states describe its measured response. Final arm joint targets, walking-policy joint
+actions, and body motor efforts are not in the current CSV schema. Hand poses alone
+therefore do not specify the full action applied to the robot.
 
 ### `behavior.csv` schema
 
@@ -1718,6 +1734,7 @@ camera-cycle advice to the current default.
 
 | File | Responsibility |
 |---|---|
+| [`humanoid_example_extension.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example_extension.py) | Registers the Humanoid example and builds its profile-specific instructions |
 | [`humanoid_example.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/humanoid_example.py) | Scene, hand/controller input, IK, pickup, camera mount, recording |
 | [`g1.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/robots/g1.py) | Standing anchor, robot joint drives, optional locomotion |
 | [`g1_decoupled_policy.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/robots/g1_decoupled_policy.py) | Paired balance/walk actors, 29-joint observations, 15 leg/waist actions, and history |
@@ -1729,13 +1746,14 @@ camera-cycle advice to the current default.
 | [`comfort_camera.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/comfort_camera.py) | Robot XY/yaw stabilization and fixed neutral optical height; no HMD filtering |
 | [`tall_packages.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/tall_packages.py) | Lightweight tall cartons with physical handles |
 | [`xr_pose.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/xr_pose.py) | Shared world-pose validation and time-based smoothing |
-| [`material_highlights.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/material_highlights.py) | Stable overlapping gaze/candidate material overrides |
+| [`material_highlights.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/material_highlights.py) | Preauthored visual shells for gaze/hand colors; avoids binding edits on running rigid bodies |
 | [`grasp_controller.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/grasp_controller.py) | Contact-limited closing and eligible-object pinch/wrap support diagnostics |
 | [`grasp_contacts.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/grasp_contacts.py) | Prepared PhysX contact reader for hands, object/scenery identities, and reader health |
 | [`arm_contact.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/arm_contact.py) | Constrains final arm commands against measured scenery-contact normals |
 | [`articulation_health.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/articulation_health.py) | Detects unusable joint states and supplies a reason for latched simulation pause |
 | [`eye_gaze_tracker.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/eye_gaze_tracker.py) | Existing unified-eye gaze, raycasts, and visualization |
-| [`tools/`](tools/) | Offline tests, live replays, read-only inspection utilities |
+| [`behavioral_csv_writer.py`](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/behavioral_csv_writer.py) | Bounded background CSV writes; no simulator API access from the worker |
+| [`tools/`](tools/) | Host-side offline tests, live replays and read-only inspection utilities |
 
 The principal finger defaults are `_finger_smoothing=0.35`, `_finger_control_enabled=True`,
 and the open/close thresholds listed above. Robot-side finger drive defaults are

@@ -19,7 +19,30 @@ import numpy as np
 
 
 class G1DecoupledPolicy:
-    """Load a paired balance/walk actor and its checkpoint-specific contract."""
+    """Load paired balance/walk actors and preserve their deployment contract.
+
+    Construction reads and validates metadata; `load()` separately validates the
+    checkpoint bytes and creates CPU inference sessions. `G1TeleopRobot` owns the
+    physics clock, joint-order conversion, and actuator output. This class returns
+    leg/waist position targets without writing to the articulation.
+
+    Args:
+        metadata_path: Deployment JSON whose relative model paths resolve beside
+            that file. Use the bundled metadata when omitted.
+
+    Raises:
+        OSError: The metadata file cannot be read.
+        ValueError: JSON, joint ordering, dimensions, or deployment values are invalid.
+        KeyError: A required deployment field is absent.
+
+    Example:
+
+        .. code-block:: python
+
+            >>> policy = G1DecoupledPolicy()
+            >>> len(policy.action_joint_names)
+            15
+    """
 
     def __init__(self, metadata_path: str | Path | None = None):
         data = Path(__file__).resolve().parent / "data"
@@ -78,6 +101,11 @@ class G1DecoupledPolicy:
 
     @staticmethod
     def _vector(value: object, size: int, label: str, *, broadcast: bool = False) -> np.ndarray:
+        """Copy a finite float32 vector, optionally expanding a scalar parameter.
+
+        Scalars are accepted only for metadata fields whose deployment permits
+        broadcasting. Runtime observations must already have the required shape.
+        """
         array = np.asarray(value, dtype=np.float32)
         if broadcast and array.ndim == 0:
             array = np.full(size, array, dtype=np.float32)
@@ -86,7 +114,24 @@ class G1DecoupledPolicy:
         return array.copy()
 
     def resolve_joint_indices(self, dof_names: list[str]) -> list[int]:
-        """Resolve all observed joints by name, independent of tensor/SDK ordering."""
+        """Resolve all observed joints by name, independent of tensor/SDK ordering.
+
+        Args:
+            dof_names: Articulation DOF names in its measured-state array order.
+
+        Returns:
+            Articulation indices ordered by the policy's 29 observed joints.
+
+        Raises:
+            ValueError: Names are ambiguous or an observed body joint is absent.
+
+        Example:
+
+            .. code-block:: python
+
+                >>> policy.resolve_joint_indices(list(policy.joint_names))[:3]
+                [0, 1, 2]
+        """
         if len(dof_names) != len(set(dof_names)):
             raise ValueError("Articulation contains ambiguous duplicate DOF names")
         missing = [name for name in self.joint_names if name not in dof_names]
@@ -95,7 +140,25 @@ class G1DecoupledPolicy:
         return [dof_names.index(name) for name in self.joint_names]
 
     def load(self) -> None:
-        """Validate both pinned binaries before publishing either runtime session."""
+        """Validate both pinned binaries before publishing either runtime session.
+
+        Keep construction local until both actors satisfy their checksum and ONNX
+        interface contracts. A failed load cannot install just one new actor.
+        Successful loading clears observation history through `reset()`.
+
+        Raises:
+            ImportError: ONNX Runtime is unavailable in the active interpreter.
+            OSError: A checkpoint cannot be read.
+            ValueError: A checksum or declared tensor interface is incompatible.
+
+        Example:
+
+            .. code-block:: python
+
+                >>> policy.load()  # Requires the bundled ONNX Runtime and weights.
+                >>> policy.active_mode is None
+                True
+        """
         import onnxruntime as ort
 
         sessions = {}
@@ -133,7 +196,19 @@ class G1DecoupledPolicy:
         self.reset()
 
     def reset(self) -> None:
-        """Start with five zero past frames, as in the reference deployment."""
+        """Clear temporal state without unloading the actor sessions.
+
+        On the next inference call, five zero past frames precede the first
+        measured frame, matching the reference deployment's startup history.
+
+        Example:
+
+            .. code-block:: python
+
+                >>> policy.reset()
+                >>> policy.last_observation is None
+                True
+        """
         self.last_action = np.zeros(15, dtype=np.float32)
         self.last_observation = None
         self.active_mode = None
@@ -152,6 +227,32 @@ class G1DecoupledPolicy:
         ``height_command`` and ``torso_rpy`` default to the released deployment
         values. Arms affect balance through measured q/qd, never fabricated past
         actions: the previous-action term contains only the 15 policy outputs.
+
+        The caller advances this history once per policy tick, not every physics
+        tick. Balance/walk selection preserves the same history across switches.
+
+        Args:
+            positions: Measured body joint angles in radians, in policy joint order.
+            velocities: Measured joint velocities in radians per second, in the same order.
+            angular_velocity: Base angular velocity in the body frame, in radians per second.
+            projected_gravity: Unit gravity direction expressed in the body frame.
+            command: Unscaled body-frame forward/lateral velocity in meters per
+                second and yaw rate in radians per second.
+
+        Returns:
+            Finite leg/waist joint position targets in radians, in action joint order.
+
+        Raises:
+            RuntimeError: Both actors have not been loaded.
+            ValueError: An observation or returned action has an invalid shape or value.
+
+        Example:
+
+            .. code-block:: python
+
+                >>> targets = policy.infer(q, qd, body_omega, body_gravity, command)
+                >>> targets.shape
+                (15,)
         """
         if set(self._sessions) != {"balance", "walk"}:
             raise RuntimeError("Decoupled WBC checkpoints have not been loaded")
@@ -182,6 +283,7 @@ class G1DecoupledPolicy:
         targets = action * self.action_scale + self.default_positions[:15]
         if not np.isfinite(targets).all():
             raise ValueError("Decoupled WBC position targets are nonfinite")
+        # Commit temporal state only after the entire prediction is validated.
         self._history = history
         self.last_action = action
         self.last_observation = observation.copy()

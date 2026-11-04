@@ -4,150 +4,11 @@ Control a **Unitree G1 with Inspire five-finger hands** in Isaac Sim using Quest
 controllers or optical hand tracking. The project records hand input, robot joints,
 gaze, object states, and images for later analysis and learning experiments.
 
-## EEG teleoperation development
-
-The `eeg-brainbit-teleoperation-dev` branch starts from `eeg-brainbit-teleop`
-(the `TeleopG1Sim` snapshot at `c5af61c3`). Its first milestone is a standalone
-**BrainBit / BrainBit 2 four-channel recorder and command-preview panel**. It does not send
-movement commands to Isaac Sim. The existing VR launchers remain the robot-control
-entry points.
-
-Set up an isolated environment using a normal 64-bit Python 3.10, 3.11, or 3.12
-installation, outside Isaac Sim's Python:
-
-```powershell
-py -3.11 tools/brainbit_setup.py
-tools\launch_brainbit_teleop.bat --source synthetic
-```
-
-The synthetic demo cycles through artificial rest/forward/left/right signals.
-It is labeled **SYNTHETIC** in both the panel and recording. To connect the real
-headband, close other applications using it and run:
-
-```powershell
-tools\launch_brainbit_teleop.bat --source brainbit
-```
-
-If several headbands are found, select one with `--address AA:BB:CC:DD:EE:FF`.
-Acquisition checks contact resistance before switching to EEG: these devices
-measure the two modes separately. BrainBit 2 channels are reordered using their
-reported channel identifiers and sample-array indices. The panel shows the age of the
-preflight resistance measurement. Live acquisition defaults to **no configured
-decoder**, so it displays signal quality while producing no command.
-
-Sessions are stored locally in Git-ignored `.eeg/sessions/` directories:
-
-- `eeg.csv`: raw O1/O2/T3/T4 values in volts, packet counters, host receipt clocks,
-  estimated sample times, detected gaps, and manual task labels.
-- `events.jsonl`: connection changes, contact snapshots, labels and preview decisions.
-- `metadata.json`: source, settings, clock anchor, counters, and completion/failure state.
-
-Sample timestamps are estimates from the nominal 250 Hz packet counter and callback
-receipt time. They are not hardware timestamps or verified synchronization with
-Isaac Sim; retain both clocks when aligning recordings. Packet loss is recorded
-without interpolation. A task label describes what the operator intended and
-never changes the prediction. Recordings are local and are not uploaded.
-The native counter is preserved: modulus 2048 for the original device and the
-SDK's unsigned 32-bit counter for BrainBit 2. Device details are saved in session
-metadata. NeuroSDK also creates a local, Git-ignored `logs/sdk_log.log` file.
-
-To follow instructions while wearing VR, use the offline Windows speech helper.
-Keep the existing EEG recorder running; this helper reads its files without
-connecting to the headband or changing Isaac. First list outputs and play a test:
-
-```powershell
-.eeg\venv\Scripts\python.exe tools\brainbit_audio.py devices
-.eeg\venv\Scripts\python.exe tools\brainbit_audio.py --device "Speakers (Steam Streaming Speakers)" test
-```
-
-Use the exact output name shown on this PC (for example, the Oculus output instead
-of Steam when appropriate). Confirm the test is audible inside the headset before
-starting the spoken resting sequence:
-
-```powershell
-.eeg\venv\Scripts\python.exe tools\brainbit_audio.py --device "Speakers (Steam Streaming Speakers)" rest --seconds 30 --settle 10
-```
-
-The sequence speaks preparation/start/end cues and stays silent during the timed
-rest interval. `say "Your message"` speaks an individual instruction. Output
-selection and speech volume apply only to the helper; Windows defaults are not
-changed. This is instruction playback, not a microphone or voice-command listener.
-Separate timestamped markers are saved under `.eeg/guidance/`; raw CSV labels are
-unchanged. A marker records requested rest, not verified stillness or EEG quality.
-Timestamps are host software times, not measured audio onset or hardware synchronization.
-The helper requires a fresh real-device recording, pins that session, and aborts
-if it ends or becomes stale. Use `--session PATH` after `rest` when multiple
-recorders are active. Ctrl+C or creating an empty `cancel` file in the printed
-guidance directory cancels the sequence. This helper never commands robot motion.
-
-The optional `--target forward=12 --target left=15 --target right=20` mode previews
-an **experimental SSVEP frequency-template match** using O1/O2. It requires
-independently timed external stimuli; this tool supplies no flashing targets.
-The scores are spectral fits, not calibrated probabilities of movement intent.
-Natural rhythms and movement artifacts can resemble targets. No human decoding
-accuracy, motor-imagery control, or headset comfort has been established.
-
-Preview qualification requires a contiguous two-second window and additional
-fresh evidence. Stale, missing, duplicated, malformed, flat or gross-artifact
-input clears the candidate. Disconnection or a full callback queue ends acquisition;
-the tool does not reconnect automatically. These checks are prototype heuristics.
-
-Preview diagnostics now separate each channel's constant voltage offset, changing
-linear baseline, fitted mains component, and remaining fluctuations. A constant
-offset alone no longer triggers the former ±500 µV raw-voltage rejection. The
-full-window calculation jointly fits a linear trend and a 60 Hz sine/cosine pair;
-use `--line-frequency 50` or `--line-frequency off` when appropriate. This is a
-fixed-frequency least-squares fit, not a general band-pass filter. Raw CSV values
-and the centered raw waveform display remain unchanged.
-
-Large changing baselines, abrupt residual changes, and flat/repeated samples still
-block previews. A strong fitted mains component is reported as `interference`
-and prevents command qualification even when the remaining waveform is small.
-The display shows these measurements separately; passing prototype limits does
-not establish clean brain activity or reliable intent detection. The broad 1 V
-input sanity bound is not a validated hardware clipping limit. Target templates
-use the same conditioning and omit harmonics overlapping the removed mains
-frequency. Settings and measurements are retained with session events. Restart
-the EEG app to load these changes; editing the files does not update a running app.
-
-For a finite console run and the standalone EEG regression tests:
-
-```powershell
-tools\launch_brainbit_teleop.bat --source synthetic --headless --duration 20
-.eeg\venv\Scripts\python.exe -m unittest discover -s tools/tests -p "test_eeg*.py" -v
-```
-
-The initial milestone passed **76 standalone EEG tests**, a full synthetic command
-cycle, and desktop-panel inspection. A live BrainBit 2 check on 2 November 2026
-recorded **11,320 samples per channel at 250 Hz**, with no detected packet gaps,
-duplicates, or restarts. It exercised native channel reordering and counters beyond
-2048. O1/O2 contact readings were unavailable and the signal triggered artifact
-checks; this validates acquisition, not usable EEG quality or command decoding.
-Raw signals, device identifiers, and diagnostic sessions remain outside Git.
-
-The audio-guidance and conditioning update passes **117 standalone EEG tests**.
-An offline replay of the 7,504-sample spoken VR baseline produced no commands;
-its complete windows exceeded the changing-baseline heuristic, and fitted mains
-interference remained visible. The updated panel was checked with synthetic
-input. These checks validate software behavior, not human command accuracy.
-
-EEG work was paused on **3 November 2026** after additional spoken VR checks.
-The completed guided intervals and raw recordings are preserved locally; resume
-details are in Git-ignored `.eeg/pause_checkpoint_20261103.json`. The last long
-recording ended with a logged `[Errno 22] Invalid argument`; its 258,336 CSV rows
-match the saved count, with no detected counter gaps or malformed rows. Its
-failure status remains intact. Inspect that error before the next unattended run.
-Some live windows passed the prototype checks, but reliable intent decoding has
-not been demonstrated. The 100 microvolt baseline-trend cutoff is a prototype
-heuristic, not a manufacturer contact-quality threshold. No EEG recorder remains
-running at this checkpoint, and EEG robot actuation remains disabled.
-
-The next milestone is personal calibration and labeled evaluation, followed by
-an explicitly armed movement-input adapter with manual override and short-lived
-commands. Neither the preview nor a high match score currently enables robot motion.
-SDK references: [BrainBit acquisition](https://sdk.brainbit.com/sdk2_bb/) and
-[BrainBit 2 acquisition](https://sdk.brainbit.com/brainbit-2-devices/), plus
-[Python NeuroSDK](https://pypi.org/project/pyneurosdk2/).
+This repository is a fork of NVIDIA Isaac Sim. The custom application lives in
+the modified `isaacsim.robot.policy.examples` extension and the project host tools;
+the rest of the simulator source tree supplies the underlying platform. The VR
+launchers load this extension into an installed Isaac Sim 6.1 application, so
+operating the project does not require building the whole simulator.
 
 [![Isaac Sim 6.1 default](https://img.shields.io/badge/Isaac%20Sim-6.1.0%20default-76b900.svg)](https://github.com/isaac-sim/IsaacSim)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](tools/run_humanoid_tests.py)
@@ -157,7 +18,8 @@ SDK references: [BrainBit acquisition](https://sdk.brainbit.com/sdk2_bb/) and
 [Recorded demos](#recorded-g1-demos) ·
 [Developer guide and validation](docs/humanoid-control.md) ·
 [Performance](docs/humanoid-control.md#performance-and-cpu-physics) ·
-[Learning pipeline](learning/README.md)
+[Learning pipeline](learning/README.md) ·
+[Optional EEG development](#eeg-teleoperation-development)
 
 [![G1 carton lift beside the operator's webcam view](docs/readme/g1-carton-lift-webcam.png)](docs/readme/g1-quest-webcam-highlights.mp4?raw=true)
 
@@ -166,6 +28,19 @@ SDK references: [BrainBit acquisition](https://sdk.brainbit.com/sdk2_bb/) and
 side by side. Silent, **1× wall-clock speed**; cuts separate the four demonstrations.
 
 ## Current behavior
+
+Choose the operating mode before loading a scene. The base launcher is stationary
+unless walking environment overrides are already set; the controller walking
+launcher selects physical walking. The compatibility name
+`launch_gesture_walking.bat` also selects controller walking. Optical pointing
+navigation remains available through the explicit setup below. EEG acquisition
+and the webcam preview are separate host applications and do not drive the robot.
+
+Use [the operating guide](HUMANOID_VR_CONTROL.md) for launch and controls,
+[the developer guide](docs/humanoid-control.md#runtime-and-data-flow) for the control
+path, and [the validation record](docs/validation/isaac-sim-6.1.md) for dated evidence.
+Results quoted below describe their recorded configuration; they are not a new
+acceptance run of every later revision.
 
 The default is **stationary manipulation**. A world constraint anchors the robot's
 pelvis while its arms and fingers remain controllable. Walking, turning, keyboard
@@ -189,7 +64,7 @@ launcher is an alias for it.
 Inspire has six independent hand actuators. Distal knuckles are coupled, so it cannot
 reproduce every human knuckle angle or finger-splay movement separately.
 
-The latest source passed **888 offline tests**. Earlier controller replays passed all
+The recorded 20 September controller update passed **888 offline tests**. Earlier controller replays passed all
 six physical walking directions, release/loss/rearm checks, three Stop/Play cycles
 and two Pause/Play cycles. The neck-anchored head and eye-arc camera passed 25 native
 XR pose checks; ten desktop first-person views, including steep downward and
@@ -406,7 +281,10 @@ and the later live tracking recovery. A full
 Isaac Sim source build is optional. For Quest Pro, keep the working OpenXR runtime and gaze setup;
 the documented working connection uses SteamVR with Steam Link.
 
-1. Clone this fork's teleoperation branch and fetch its Git LFS assets:
+1. Clone the established VR baseline and fetch its Git LFS assets. The command
+   below selects `TeleopG1Sim`; the optional EEG tools require
+   `eeg-brainbit-teleoperation-dev` or a branch derived from it. Existing checkouts
+   can launch their current implementation directly without switching branches:
 
    ```powershell
    git clone --branch TeleopG1Sim https://github.com/soheilAppear/IsaacSim-HumanoidBehavior.git
@@ -892,8 +770,9 @@ time; behavior, hand, gaze, and object rows remain nominally **100 Hz in both mo
 Recording intervals adjust to the physics timestep, so 200 Hz walking physics does
 not double those log rates. Gaze queries remain 50 Hz and their latest result is reused.
 Periodic CSV flushes use one background writer with up to eight pending batches;
-disk I/O no longer runs in the physics callback. Orderly cleanup drains accepted
-writes, but an interrupted process can still lose queued or unflushed rows.
+CSV batch writes run on that worker; PNG encoding and saving still run in the
+physics callback. Orderly cleanup drains accepted writes, but an interrupted
+process can still lose queued or unflushed rows.
 
 Gaze hits record the collider intersected by the supplied ray; they are observations
 of the gaze signal, not a guarantee of human intent. Grasp mode must accompany each
@@ -909,17 +788,165 @@ passes operator checks, the [next research phase](HUMANOID_VR_CONTROL.md#next-re
 investigate gaze and hand/finger velocity as intent cues. Velocity is not measured
 finger pressure. A new intent-training pipeline is not implemented yet.
 
+## EEG teleoperation development
+
+The `eeg-brainbit-teleoperation-dev` branch starts from `eeg-brainbit-teleop`
+(the `TeleopG1Sim` snapshot at `c5af61c3`). Its first milestone is a standalone
+**BrainBit / BrainBit 2 four-channel recorder and command-preview panel**. It does not send
+movement commands to Isaac Sim. The existing VR launchers remain the robot-control
+entry points.
+
+Set up an isolated environment using a normal 64-bit Python 3.10, 3.11, or 3.12
+installation, outside Isaac Sim's Python:
+
+```powershell
+py -3.11 tools/brainbit_setup.py
+tools\launch_brainbit_teleop.bat --source synthetic
+```
+
+The synthetic demo cycles through artificial rest/forward/left/right signals.
+It is labeled **SYNTHETIC** in both the panel and recording. To connect the real
+headband, close other applications using it and run:
+
+```powershell
+tools\launch_brainbit_teleop.bat --source brainbit
+```
+
+If several headbands are found, select one with `--address AA:BB:CC:DD:EE:FF`.
+Acquisition checks contact resistance before switching to EEG: these devices
+measure the two modes separately. BrainBit 2 channels are reordered using their
+reported channel identifiers and sample-array indices. The panel shows the age of the
+preflight resistance measurement. Live acquisition defaults to **no configured
+decoder**, so it displays signal quality while producing no command.
+
+Sessions are stored locally in Git-ignored `.eeg/sessions/` directories:
+
+- `eeg.csv`: raw O1/O2/T3/T4 values in volts, packet counters, host receipt clocks,
+  estimated sample times, detected gaps, and manual task labels.
+- `events.jsonl`: connection changes, contact snapshots, labels and preview decisions.
+- `metadata.json`: source, settings, clock anchor, counters, and completion/failure state.
+
+Sample timestamps are estimates from the nominal 250 Hz packet counter and callback
+receipt time. They are not hardware timestamps or verified synchronization with
+Isaac Sim; retain both clocks when aligning recordings. Packet loss is recorded
+without interpolation. A task label describes what the operator intended and
+never changes the prediction. Recordings are local and are not uploaded.
+The native counter is preserved: modulus 2048 for the original device and the
+SDK's unsigned 32-bit counter for BrainBit 2. Device details are saved in session
+metadata. NeuroSDK also creates a local, Git-ignored `logs/sdk_log.log` file.
+
+To follow instructions while wearing VR, use the offline Windows speech helper.
+Keep the existing EEG recorder running; this helper reads its files without
+connecting to the headband or changing Isaac. First list outputs and play a test:
+
+```powershell
+.eeg\venv\Scripts\python.exe tools\brainbit_audio.py devices
+.eeg\venv\Scripts\python.exe tools\brainbit_audio.py --device "Speakers (Steam Streaming Speakers)" test
+```
+
+Use the exact output name shown on this PC (for example, the Oculus output instead
+of Steam when appropriate). Confirm the test is audible inside the headset before
+starting the spoken resting sequence:
+
+```powershell
+.eeg\venv\Scripts\python.exe tools\brainbit_audio.py --device "Speakers (Steam Streaming Speakers)" rest --seconds 30 --settle 10
+```
+
+The sequence speaks preparation/start/end cues and stays silent during the timed
+rest interval. `say "Your message"` speaks an individual instruction. Output
+selection and speech volume apply only to the helper; Windows defaults are not
+changed. This is instruction playback, not a microphone or voice-command listener.
+Separate timestamped markers are saved under `.eeg/guidance/`; raw CSV labels are
+unchanged. A marker records requested rest, not verified stillness or EEG quality.
+Timestamps are host software times, not measured audio onset or hardware synchronization.
+The helper requires a fresh real-device recording, pins that session, and aborts
+if it ends or becomes stale. Use `--session PATH` after `rest` when multiple
+recorders are active. Ctrl+C or creating an empty `cancel` file in the printed
+guidance directory cancels the sequence. This helper never commands robot motion.
+
+The optional `--target forward=12 --target left=15 --target right=20` mode previews
+an **experimental SSVEP frequency-template match** using O1/O2. It requires
+independently timed external stimuli; this tool supplies no flashing targets.
+The scores are spectral fits, not calibrated probabilities of movement intent.
+Natural rhythms and movement artifacts can resemble targets. No human decoding
+accuracy, motor-imagery control, or headset comfort has been established.
+
+Preview qualification requires a contiguous two-second window and additional
+fresh evidence. Stale, missing, duplicated, malformed, flat or gross-artifact
+input clears the candidate. Disconnection or a full callback queue ends acquisition;
+the tool does not reconnect automatically. These checks are prototype heuristics.
+
+Preview diagnostics now separate each channel's constant voltage offset, changing
+linear baseline, fitted mains component, and remaining fluctuations. A constant
+offset alone no longer triggers the former ±500 µV raw-voltage rejection. The
+full-window calculation jointly fits a linear trend and a 60 Hz sine/cosine pair;
+use `--line-frequency 50` or `--line-frequency off` when appropriate. This is a
+fixed-frequency least-squares fit, not a general band-pass filter. Raw CSV values
+and the centered raw waveform display remain unchanged.
+
+Large changing baselines, abrupt residual changes, and flat/repeated samples still
+block previews. A strong fitted mains component is reported as `interference`
+and prevents command qualification even when the remaining waveform is small.
+The display shows these measurements separately; passing prototype limits does
+not establish clean brain activity or reliable intent detection. The broad 1 V
+input sanity bound is not a validated hardware clipping limit. Target templates
+use the same conditioning and omit harmonics overlapping the removed mains
+frequency. Settings and measurements are retained with session events. Restart
+the EEG app to load these changes; editing the files does not update a running app.
+
+For a finite console run and the standalone EEG regression tests:
+
+```powershell
+tools\launch_brainbit_teleop.bat --source synthetic --headless --duration 20
+.eeg\venv\Scripts\python.exe -m unittest discover -s tools/tests -p "test_eeg*.py" -v
+```
+
+The initial milestone passed **76 standalone EEG tests**, a full synthetic command
+cycle, and desktop-panel inspection. A live BrainBit 2 check on 2 November 2026
+recorded **11,320 samples per channel at 250 Hz**, with no detected packet gaps,
+duplicates, or restarts. It exercised native channel reordering and counters beyond
+2048. O1/O2 contact readings were unavailable and the signal triggered artifact
+checks; this validates acquisition, not usable EEG quality or command decoding.
+Raw signals, device identifiers, and diagnostic sessions remain outside Git.
+
+The audio-guidance and conditioning update passes **117 standalone EEG tests**.
+An offline replay of the 7,504-sample spoken VR baseline produced no commands;
+its complete windows exceeded the changing-baseline heuristic, and fitted mains
+interference remained visible. The updated panel was checked with synthetic
+input. These checks validate software behavior, not human command accuracy.
+
+EEG work was paused on **3 November 2026** after additional spoken VR checks.
+The completed guided intervals and raw recordings are preserved locally; resume
+details are in Git-ignored `.eeg/pause_checkpoint_20261103.json`. The last long
+recording ended with a logged `[Errno 22] Invalid argument`; its 258,336 CSV rows
+match the saved count, with no detected counter gaps or malformed rows. Its
+failure status remains intact. Inspect that error before the next unattended run.
+Some live windows passed the prototype checks, but reliable intent decoding has
+not been demonstrated. The 100 microvolt baseline-trend cutoff is a prototype
+heuristic, not a manufacturer contact-quality threshold. No EEG recorder remains
+running at this checkpoint, and EEG robot actuation remains disabled.
+
+The next milestone is personal calibration and labeled evaluation, followed by
+an explicitly armed movement-input adapter with manual override and short-lived
+commands. Neither the preview nor a high match score currently enables robot motion.
+SDK references: [BrainBit acquisition](https://sdk.brainbit.com/sdk2_bb/) and
+[BrainBit 2 acquisition](https://sdk.brainbit.com/brainbit-2-devices/), plus
+[Python NeuroSDK](https://pypi.org/project/pyneurosdk2/).
+
 ## Project layout
 
 | Path | Purpose |
 |---|---|
 | [interactive/humanoid/](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/interactive/humanoid/) | Scene, input, IK, pickup, camera, gaze, and recording |
 | [robots/g1.py](source/extensions/isaacsim.robot.policy.examples/isaacsim/robot/policy/examples/robots/g1.py) | Stationary anchor, joint control, optional locomotion, and reset |
-| [tools/](tools/) | VR launcher, live Python helper, observers, and validation replays |
+| [tools/launch_isaac_vr.bat](tools/launch_isaac_vr.bat) and [walking launcher](tools/launch_controller_walking.bat) | Select the installed application and this checkout's complete custom extension |
+| [tools/](tools/) | Project host utilities, offline tests and live validation replays alongside upstream build tools |
+| [tools/eeg/](tools/eeg/) | Standalone acquisition, recording and non-actuating EEG preview |
 | [tools/tests/](tools/tests/) | Offline control regression suite |
 | [HUMANOID_VR_CONTROL.md](HUMANOID_VR_CONTROL.md) | Installation, operation, recording, and troubleshooting |
 | [docs/humanoid-control.md](docs/humanoid-control.md) | Implementation details, performance, and validation evidence |
 | [learning/](learning/) | Learning workflow plan and directory scaffolding |
+| [source/](source/) and [docs/](docs/) | Full upstream simulator tree and documentation, including the custom files identified above |
 
 ## Earlier captures
 

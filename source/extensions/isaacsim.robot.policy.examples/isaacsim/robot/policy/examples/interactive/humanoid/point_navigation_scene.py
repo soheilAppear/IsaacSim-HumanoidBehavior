@@ -56,6 +56,7 @@ class PointNavigationScene:
 
     @staticmethod
     def _field(hit: object, name: str, default: object = None) -> object:
+        """Read scene-query fields from either dictionary or attribute-style hits."""
         return hit.get(name, default) if isinstance(hit, dict) else getattr(hit, name, default)
 
     @classmethod
@@ -77,10 +78,12 @@ class PointNavigationScene:
         return None
 
     def _is_robot(self, path: str) -> bool:
+        """Match the robot root or its descendants without matching sibling prefixes."""
         return path == self.robot_root or path.startswith(self.robot_root + "/")
 
     @staticmethod
     def _current_stage() -> Usd.Stage | None:
+        """Return the current USD stage, tolerating an unavailable Kit context."""
         try:
             return omni.usd.get_context().get_stage()
         except (AttributeError, RuntimeError):
@@ -130,6 +133,7 @@ class PointNavigationScene:
         malformed = False
 
         def on_hit(hit: object) -> bool:
+            """Keep the nearest nonrobot surface, including obstacles before a floor."""
             nonlocal best, malformed
             path = self._hit_path(hit)
             if path and self._is_robot(path):
@@ -313,6 +317,7 @@ class PointNavigationScene:
         blockers = []
 
         def on_hit(hit: object) -> bool:
+            """Treat unknown and nonrobot overlap hits as blockers and retain a short trace."""
             nonlocal blocked
             path = self._hit_path(hit)
             if path is None or not self._is_robot(path):
@@ -485,6 +490,7 @@ class PointNavigationScene:
         self.hide()
 
     def _visuals_valid(self) -> bool:
+        """Check that all retained visual transform attributes remain usable."""
         try:
             return self._stage is not None and all(
                 op is not None and op.GetAttr().IsValid() for op in (self._ray_op, self._marker_op, self._target_op)
@@ -566,6 +572,7 @@ class PointNavigationScene:
             pass
 
     def _drop_handles(self) -> None:
+        """Forget cached stage and visual handles without authoring or removing prims."""
         self._stage = None
         self._ray_op = None
         self._marker_op = None

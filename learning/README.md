@@ -10,6 +10,20 @@ For running the robot and collecting data, use the
 [project README](../README.md), [VR guide](../HUMANOID_VR_CONTROL.md), and
 [control and recording reference](../docs/humanoid-control.md).
 
+The retained standalone examples are separate from this planned pipeline:
+
+- [`g1_grasp_env.py`](../source/standalone_examples/api/isaacsim.robot.policy.examples/g1_grasp_env.py)
+  builds cloned, fixed-base scenes and measures physics throughput. It has no
+  action/reward interface, episode reset, training loop, or trained grasp policy;
+  its printed policy-step budgets are extrapolations.
+- [`g1_standalone.py`](../source/standalone_examples/api/isaacsim.robot.policy.examples/g1_standalone.py)
+  demonstrates keyboard or scripted movement and finger closure using legacy
+  assisted policy/kinematic modes. It does not collect VR demonstrations or run
+  the current launcher's strict physical balance/walk profile.
+
+Both files start an Isaac Sim application at module scope. Run them as separate
+entry points; do not import them as dataset or training utilities.
+
 ## Available recording data
 
 The recorder lives in
@@ -41,23 +55,52 @@ mode, finger actuator roles, and grasp mode. Use it with the timestamps and
 `step_index` fields to interpret a session. Camera frames and sensor rows have
 different sampling rates; a future converter must align them explicitly.
 
+The current files distinguish some, but not all, operator inputs from applied
+robot actions:
+
+| Role | Recorded today | Remaining gap |
+| --- | --- | --- |
+| Observations | RGB, robot base pose, joint positions/velocities, hand poses and validity, gaze source/hits, sample-object poses/contact status | Exact camera render timing and camera calibration per frame |
+| Operator input | Controller buttons/grip/trigger, hand poses, smoothed finger requests | A complete calibrated task-intent label |
+| Applied action | Filtered base velocity commands and contact-limited finger curl targets | Final arm joint targets, policy joint actions and body motor efforts |
+| Outcomes | Subsequent measured joint/base/object states and contact/support diagnostics | Explicit episode boundaries, failure reasons and verified task success |
+
+For action-conditioned learning, use commands actually sent to the robot rather
+than treating a raw hand pose as its full motor action. Object linear velocities
+are finite differences between logged positions; full contact forces and object
+angular velocities are not in the object CSV. The recorder provides data for a
+future pipeline, not a ready-made observation/action/next-state training set.
+
 ## Limits of the current data
 
-- The default robot is the G1 with Inspire hands, fixed in place for arm and hand
-  teleoperation. Current default sessions do not demonstrate walking or balance.
+- The default profile fixes the G1 pelvis for arm and hand teleoperation. The
+  opt-in walking profile runs pretrained balance/walk policies. Select sessions
+  using `robot_locomotion`, `base_fixed_to_world`, and the other metadata fields;
+  a stationary session does not demonstrate walking or balance.
 - Each hand exposes five finger curls and separate thumb opposition. Coupled
   robot knuckles do not reproduce every human joint independently.
 - Valid optical landmarks drive open hands as well as closed hands. Real Quest
   landmark delivery has been intermittent; controller-only input and missing
   skeletons must not be labeled as valid optical finger demonstrations.
-- Pickup uses a distance-gated fixed joint. The recorded grasp is assisted and
-  does not establish that an unassisted physical grasp would hold the object.
-- The camera is rigidly mounted to the robot body at head height. The HMD reader
-  prefers physical-space poses but can fall back to virtual-world poses; the CSV
-  does not identify that choice per row. Check the session log before treating HMD
-  coordinates as physical motion or combining them with stage-space signals.
+- Current physical grasping uses contact and friction, with no hand-to-object
+  fixed joint. Earlier assisted sessions use a distance-gated attachment. Preserve
+  `grasp_mode`: `is_grabbed` describes legacy attachment, while `contact_supported`
+  describes opposing-contact evidence and does not prove a stable lift or hold.
+- The current camera stabilizes robot travel/heading and uses HMD orientation to
+  rotate the view and eye offset around the measured neck. Physical room translation
+  does not translate the view. Earlier fixed-camera sessions use a different mapping.
+  The raw HMD recorder can fall back from physical-space to virtual-world poses
+  without a per-row source field; do not assume those values share the robot's
+  world frame.
 - Gaze rows identify their source through `gaze_source`. Preserve this field when
-  distinguishing eye tracking from HMD-forward fallback.
+  distinguishing eye tracking from HMD-forward fallback. Gaze hits are observations,
+  not verified task intent.
+- Images are RGB only. Capture reads the most recent render and stamps the save;
+  original render timestamps, camera extrinsics, depth and segmentation are absent.
+  A future converter must handle image/state alignment and possible repeated renders.
+- Reset, pause, tracking loss, synthetic replay intervals and grasp-mode changes
+  must remain visible when making episodes. A continuous session clock does not
+  imply an uninterrupted physical trajectory.
 
 Inspect tracking availability, source labels, timestamps, and successful object
 movement before selecting sessions for a future training set. A live replay test

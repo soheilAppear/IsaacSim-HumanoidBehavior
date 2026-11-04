@@ -27,7 +27,10 @@ print([d.get_name() for d in XRCore.get_singleton().get_all_input_devices()])"
     # Gaze status: source, ray origin/direction, what it is hitting.
     python tools/kit_exec.py "print(EX._eye_gaze_tracker.describe())"
 
-``EX`` is bound automatically to the running HumanoidExample instance when one is found.
+``EX`` is bound automatically to a HumanoidExample instance when one is found,
+preferring one with a loaded G1. The binding persists in Kit's Python globals;
+after replacing the example instance, run ``EX = None`` once so the next command
+discovers the current instance again.
 """
 
 from __future__ import annotations
@@ -62,8 +65,15 @@ if "EX" not in globals() or EX is None:
 def execute(code: str, host: str, port: int, timeout: float) -> int:
     """Send *code* to the live Kit session and print the structured response.
 
+    Args:
+        code: Python source executed in Kit after the automatic ``EX`` binding.
+        host: Address of the running Python server.
+        port: TCP port exposed by the Python server.
+        timeout: Socket connection and read timeout in seconds.
+
     Returns:
-        A process exit code: 0 when Kit reported success, 1 otherwise.
+        Process exit code. Zero means Kit reported success, one means an invalid
+        JSON response or a Kit execution failure, and two means a socket error.
     """
     payload = json.dumps({"code": PRELUDE + "\n" + code}).encode("utf-8")
     try:
@@ -111,6 +121,7 @@ def execute(code: str, host: str, port: int, timeout: float) -> int:
 
 
 def main() -> int:
+    """Read source from the command line, a file, or stdin and execute it in Kit."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("code", nargs="?", help="Python source to run in Isaac Sim; '-' reads stdin")
     parser.add_argument("--file", help="Read the source from this file instead")

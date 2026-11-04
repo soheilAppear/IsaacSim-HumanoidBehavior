@@ -35,6 +35,7 @@ class ShelfSpec:
     deck_heights: tuple[float, float]
 
     def __post_init__(self) -> None:
+        """Require finite shelf placement and two ordered standing-practice decks."""
         if len(self.position_xy) != 2 or len(self.deck_heights) != 2:
             raise ValueError("Each shelf needs two floor coordinates and two deck heights")
         if not all(math.isfinite(value) for value in (*self.position_xy, *self.deck_heights)):
@@ -54,6 +55,7 @@ class ShelfPackageSpec:
     mass: float
 
     def __post_init__(self) -> None:
+        """Validate deck selection, practice mass, and room for side-palm access."""
         if (
             type(self.shelf) is not int
             or not 0 <= self.shelf < 3

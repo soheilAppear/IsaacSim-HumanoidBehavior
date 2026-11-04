@@ -13,7 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Extension that provides a VR-teleoperated Unitree G1 humanoid example."""
+"""Register this fork's G1 teleoperation sample in the Isaac Sim examples browser.
+
+The browser entry and instructions live here; scene creation, input ownership,
+robot control, and recording live in `HumanoidExample`. Read the selected sample
+profile when building the instructions so the UI describes the active launch mode.
+"""
 
 import os
 
@@ -26,17 +31,17 @@ from isaacsim.robot.policy.examples.interactive.humanoid import HumanoidExample
 class HumanoidExampleExtension(omni.ext.IExt):
     """Extension that provides a VR-teleoperated Unitree G1 humanoid example.
 
-    This extension demonstrates the 29-DOF Unitree G1 with Inspire five-finger hands driven by
-    VR head, hand and finger tracking. The example showcases humanoid teleoperation and
-    multimodal behavioural data collection in Isaac Sim.
+    The sample combines the 29-joint G1 body with Inspire hands. Launch settings
+    select an anchored stationary base or physical walking driven by controllers
+    or experimental pointing. Optical landmarks and controller grip/trigger
+    inputs control the arms and fingers according to the selected input profile.
 
-    The extension registers itself with the examples browser under the "Policy" category and provides
-    a user interface for stationary manipulation. The base is anchored while hands
-    are controlled by optical hand tracking or by controller grip/trigger inputs.
+    This class owns browser registration and descriptive UI text. The sample
+    framework owns LOAD/Reset/Play callbacks and the `HumanoidExample` lifecycle.
     """
 
     def on_startup(self, ext_id: str):
-        """Initializes the Humanoid example extension.
+        """Register the G1 sample and describe its selected control profile.
 
         Registers the Unitree G1 humanoid example with the examples browser and creates the UI template
         with hand-tracking and controller pickup instructions.
@@ -53,16 +58,19 @@ class HumanoidExampleExtension(omni.ext.IExt):
             overview += "right stick turns. Push farther for more speed; release the sticks to stop. "
             overview += "The blue pointing ray and controller face buttons are disabled. "
         elif sample._gesture_locomotion_enabled:
-            overview = "Pointing walking is enabled. Open your left hand, then point with your index finger. "
+            overview = (
+                "Experimental walking profile selected. If pointing navigation is enabled, "
+                "open your left hand, then point with your index finger. "
+            )
             overview += "Curl the other three fingers and hold the blue ray on clear floor for 0.6 seconds. "
-            overview += "Choose floor 0.5 to 12 meters ahead, or point at an object to approach its floor marker. Walls and blocked routes stop walking. "
+            overview += "Choose visible floor 0.5 to 50 meters away, or point at a practice object to select its floor approach. Walls and blocked routes stop walking. "
             overview += "Keep pointing to walk, and open your hand to stop. Gaze does not steer walking. "
         else:
             overview = "The G1 stands anchored in place. Walking and turning inputs are disabled. "
         overview += "Arms, fingers, gaze, and recording remain active."
-        overview += " The camera stays fixed to the robot head when you move your real head."
+        overview += " The robot-mounted view follows tracked head rotation through a stabilized neck-and-eye motion; room-scale headset translation does not move it."
         overview += "\n\nHand tracking: move individual fingers and thumb opposition. Reach with an open hand, "
-        overview += "close your fingers around a nearby object to take it, "
+        overview += "enclose the object with opposing thumb and finger contact, "
         overview += "then open your hand to release."
         if sample._optical_hands_only:
             overview += "\n\nUse tracked hands to place both palms on opposite sides of a shelf carton, "
@@ -96,7 +104,7 @@ class HumanoidExampleExtension(omni.ext.IExt):
 
         ui_handle = BaseSampleUITemplate(**ui_kwargs)
 
-        # Register the example with examples browser
+        # Keep the browser label stable for launch instructions and saved workflows.
         get_browser_instance().register_example(
             name=self.example_name,
             ui_hook=ui_handle.build_ui,
@@ -104,5 +112,5 @@ class HumanoidExampleExtension(omni.ext.IExt):
         )
 
     def on_shutdown(self):
-        """Cleans up the extension by deregistering the Humanoid example from the examples browser."""
+        """Deregister the browser entry when Kit unloads this extension."""
         get_browser_instance().deregister_example(name=self.example_name, category=self.category)

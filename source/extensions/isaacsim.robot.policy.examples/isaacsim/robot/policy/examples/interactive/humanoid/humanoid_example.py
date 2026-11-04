@@ -13,7 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Interactive humanoid simulation example: Unitree G1 with dexterous hands, VR teleoperated."""
+"""Coordinate the G1 scene, operator input, robot control, and behavioral recording.
+
+Scene construction authors assets and contact configuration before physics views
+exist. The first valid post-physics callback initializes the robot; subsequent
+callbacks read operator input, update locomotion, fingers and arms, then record
+the completed state. The application-update camera callback also runs while
+physics is paused and has its own stage-lifetime guards.
+
+The default scene anchors the pelvis for manipulation. Physical walking is a
+separate load-time configuration with pointing or controller input. Live arm IK,
+contact-based grasping, and optional calibrated webcam fallback are independent
+of the selected base input. Legacy avatar controls remain available explicitly.
+
+See ``docs/humanoid-control.md`` and ``HUMANOID_VR_CONTROL.md`` for setup and use.
+"""
 
 from __future__ import annotations
 
@@ -65,34 +79,15 @@ from isaacsim.robot.policy.examples.robots import G1TeleopRobot
 from isaacsim.storage.native import get_assets_root_path
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
-#: Arm teleoperation inverse kinematics, measured rather than hand-tuned.
-#:
-#: The previous mapping was four hand-written gain rows, and measured against the real
-#: hand link it was wrong in ways no amount of re-tuning would have found by feel:
-#: commanded "up" moved the hand DOWN (correlation -0.92 over 24 cm of travel),
-#: commanded "outward" saturated after 2 cm, and "forward" was doing most of the vertical
-#: motion. That is what "the hand does not go where my hand goes" actually was.
-#:
-#: These come from a measured Jacobian of hand position against the four driven arm
-#: joints, taken around ARM_IK_NEUTRAL on the right arm (condition number 7.4, so the
-#: inverse is well behaved). ARM_IK_PINV is its damped least-squares pseudo-inverse:
-#:
-#:     dq = ARM_IK_PINV @ (target_body - ARM_IK_REFERENCE)
-#:
-#: Left-arm values mirror about the sagittal plane: negate the target's y, then negate
-#: the resulting roll and yaw deltas.
-#:
-#: Re-measure with scratchpad/measure_arm_jacobian.py if the asset or the neutral pose
-#: changes -- do not re-tune these by hand.
+#: Four-joint linear IK fallback, used when live seven-joint IK is disabled or
+#: unavailable. The measured right-arm model is local to `ARM_IK_NEUTRAL`:
+#: `dq = ARM_IK_PINV @ (target_body - ARM_IK_REFERENCE)`. The left arm mirrors
+#: target Y and the shoulder roll/yaw deltas about the sagittal plane.
+#: Re-measure the complete Jacobian after asset/pose changes; changing individual
+#: coefficients would invalidate the measured mapping.
 ARM_IK_JOINT_ORDER = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow")
-#: The neutral pose is deliberately an ARM-RAISED one. A linear inverse is only good near
-#: the pose it was measured at, and the first version was taken with the arm hanging (hand
-#: at 0.79 m), so its +/-0.30 m band spanned 0.63-1.03 m -- while the work surfaces are at
-#: 0.99 and 1.08 m and the packages sit at 0.99-1.15 m. The arm itself reaches 1.40 m, so
-#: nothing was physically out of range; the linearisation was simply centred in the wrong
-#: place, and raising ARM_IK_MAX_OFFSET did not help (measured: ceiling stayed at ~1.03 m
-#: for caps of 0.30 through 0.60). Centred here the band is 0.74-1.34 m, which covers both
-#: surfaces and every package, and the Jacobian is better conditioned too (5.4 vs 7.4).
+#: Raised-arm reference pose in radians. Centering the local model near the work
+#: surfaces avoids spending its limited valid range below the manipulation area.
 ARM_IK_NEUTRAL = (-1.20, 0.0, 0.0, 0.60)  # rad, the pose the Jacobian was taken at
 ARM_IK_REFERENCE = (0.4121, -0.0890, 0.2832)  # m, right hand vs pelvis at that pose
 ARM_IK_PINV = (
@@ -101,9 +96,8 @@ ARM_IK_PINV = (
     (-0.77920, +1.23439, -0.23597),  # shoulder_yaw
     (+7.68972, +1.71222, -0.58731),  # elbow
 )
-#: m: the linear inverse is only valid near the neutral pose, so the requested offset is
-#: capped to this radius before it is applied. Beyond it the hand stops tracking rather
-#: than flinging the arm somewhere the linearisation cannot justify.
+#: Maximum fallback position offset in meters. Radial clamping preserves the
+#: requested direction while bounding extrapolation from the measured pose.
 ARM_IK_MAX_OFFSET = 0.30
 
 
@@ -116,6 +110,12 @@ class _WebcamHandDevice:
     closed knuckle. PIP/DIP bones and the thumb's real landmarks stay unchanged.
     Only translation-invariant finger angles use this adapter, never room
     position or wrist orientation.
+
+    Args:
+        landmarks: Twenty-one XYZ hand landmarks in MediaPipe anatomical order.
+
+    Raises:
+        ValueError: If the landmarks do not define a usable palm plane.
     """
 
     def __init__(self, landmarks):
@@ -154,73 +154,70 @@ class _WebcamHandDevice:
                 self.positions[f"{role}_metacarpal"] = points[offset] - reference * proximal.GetLength()
 
     def get_hand_tracking_data_source(self):
+        """Identify this landmark adapter as optical input for the curl reader."""
         return "hand"
 
     def get_pose_names(self):
+        """Return the anatomical joint names available to the curl reader."""
         return tuple(self.positions)
 
     def get_virtual_world_pose_desc(self, name=""):
+        """Wrap a landmark as a position-valid descriptor for finger-angle reads.
+
+        The coordinates stay in the sender's landmark frame. This compatibility
+        method does not transform them into a calibrated robot or XR world pose.
+
+        Args:
+            name: Anatomical joint name returned by ``get_pose_names()``.
+
+        Returns:
+            A translation-only pose descriptor with position validity set.
+
+        Raises:
+            KeyError: If the requested joint is absent.
+        """
         return SimpleNamespace(
             pose_matrix=Gf.Matrix4d().SetTranslate(Gf.Vec3d(*self.positions[name])), validity_flags=2
         )
 
 
 class HumanoidExample(BaseSample):
-    """A humanoid robot simulation example using the Unitree G1 with dexterous hands.
+    """G1 teleoperation scene with independent base, arm, finger, and camera control.
 
-    This class demonstrates a complete humanoid teleoperation setup with real-time control
-    capabilities. The default 100 Hz simulation supports VR arm and finger control
-    while the G1's pelvis remains anchored at its spawn pose.
+    The default 100 Hz stationary scene fixes the pelvis to the world and disables
+    robot-link gravity; objects remain dynamic. Physical walking instead uses
+    200 Hz physics and 50 Hz GR00T actors. Its input profile selects pointing or
+    two VR sticks before loading, while arms and fingers retain separate targets.
+    These choices affect articulation topology and cannot be swapped during Play.
 
-    The robot is the 29-DOF G1 fitted with Inspire five-finger hands — the Unitree humanoid
-    that Isaac Teleop drives for dexterous manipulation. Stationary mode disables
-    walking/turning commands and the balance policy, uses a world-to-pelvis fixed
-    articulation root, and holds the standing posture with gravity off on robot links.
-    The arms and fingers remain articulated; scene objects retain their gravity.
-    Optional policy/kinematic locomotion must be selected before loading a new scene.
+    Optical hand poses take precedence over controller arm clutches. Optional
+    calibrated webcam landmarks can fill an optical-input gap independently per
+    arm; a released controller clutch deliberately holds the arm. Finger input
+    remains independent of that clutch. Physical grasping uses measured contacts;
+    the optional assisted mode creates distance-gated fixed-joint attachments.
 
-    VR extensions (this fork — see HUMANOID_VR_CONTROL.md for the full guide):
-        - Finger teleoperation: OpenXR hand-tracking joints give a per-finger curl that
-          drives the G1's real finger joints. With controllers, grip enables arm
-          movement/rotation and trigger curls all fingers for pickup.
-        - Headset gait: bob the HMD up/down (step in place) to walk forward; a
-          horizontal-motion gate suppresses false triggers from nodding on the spot.
-          Currently DISABLED by default (_headset_gait_enabled = False) while step
-          detection is tuned; stationary mode suppresses it regardless of the toggle.
-          The HMD pose is still read every step for logging.
-        - Quest Pro eye gaze (eye_gaze_tracker.py): the runtime's calibrated unified
-          gaze (its own fusion of both eyes) drawn as a red ray with a large
-          blood-red marker sphere at the gazed collider (boxes, ground), gazed box
-          tinted yellow, and live "[EyeGaze] looking at ..." terminal events on
-          every target change.
-        - First-person eye camera: the viewport/XR camera follows the G1 head at eye height.
-        - Hand-tracking / controller arm teleoperation, plus a grab system for sample boxes.
-        - Behavioral session logging: each load creates a session folder under
-          ~/BehavioralCollection/raw_sessions/ holding behavior.csv, hand_tracking.csv,
-          gaze.csv, object_states.csv, frame_timestamps.csv + eye-camera PNG frames,
-          and metadata.json — the raw input for the learning/ pipeline in this repo.
+    ``setup_scene`` authors the scene, ``setup_post_load`` installs subscriptions
+    and starts recording, and the first valid physics callback initializes native
+    views. Stop invalidates those views; Pause disarms navigation while retaining
+    them. Explicit Reset clears fault state. Clear and teardown detach callbacks,
+    close recording, and restore the application settings owned by this example.
 
-    The example automatically handles robot initialization after scene reset and manages GPU memory resources
-    through proper cleanup routines. Physics tensors are validated each step to ensure robust simulation
-    restart capabilities.
+    Physics ``dt`` drives simulation clocks and joint-speed bounds. Bounded
+    monotonic wall time drives input smoothing and freshness checks. Recording
+    uses a shared simulation-step counter, with wall timestamps stored separately.
+    Each load creates a session under ``~/BehavioralCollection/raw_sessions/``
+    containing metadata, behavioral/hand/gaze/object CSVs, and eye-camera frames.
+    CSV batches write on a worker; PNG capture remains in the physics callback.
+    Quest eye gaze is optional, with HMD-forward recording as its fallback.
     """
 
     def __init__(self):
         super().__init__()
-        # Stationary manipulation runs CPU physics at 100 Hz. The optional walking
-        # scene uses the policy's training step of 200 Hz.
-        #
-        # CUDA was inherited from the H1 sample and is simply the wrong device here. GPU
-        # PhysX is built to step thousands of environments in parallel; with a single
-        # robot you pay the kernel-launch overhead and get none of the parallelism.
-        # Measured on this scene: 23-28 ms per step on CUDA against 6.8 ms on CPU. The
-        # sim was running at 0.22x real time, which is what "terrible movement",
-        # "it never stops" and the sluggish turns actually were -- commands arriving
-        # late into a world playing back five times too slowly.
-        #
-        # 100 Hz then buys the rest: the per-step cost barely moves but the budget
-        # doubles to 10 ms, giving 1.39x real time with headroom. Control stays at 50 Hz
-        # because the walking policy's decimation is derived from dt, not hard-coded.
+        # Scene configuration is resolved before constructing any physics views.
+        # CPU physics is the measured single-robot configuration for this scene.
+        # Stationary manipulation runs at 100 Hz; physical walking preserves the
+        # controller's 200 Hz motor loop and 50 Hz actor schedule. These rates
+        # describe simulation time and do not guarantee wall-clock throughput.
         self._world_settings["stage_units_in_meters"] = 1.0
         self._gesture_locomotion_enabled = os.environ.get("G1_GESTURE_WALKING", "0").strip().lower() in (
             "1",
@@ -276,7 +273,7 @@ class HumanoidExample(BaseSample):
         self._controller_xr_tools_setting = None
         self._xr_input_status_logged = False
         self._locomotion_input_logged = False
-        self._locomotion_brake = False  # raised by the keyboard brake: full stop
+        self._locomotion_brake = False  # suppress translation while retaining requested yaw
         self._latest_stick_lateral = 0.0
         self._keyboard_brake = False
         self._keyboard_command = None
@@ -285,18 +282,13 @@ class HumanoidExample(BaseSample):
         self._locomotion_trigger_threshold = 0.25
         self._arm_pose_enable_threshold = 0.25
         self._max_forward_speed = 1.0
-        #: m/s cap for strafing. The walking policy has always accepted a lateral
-        #: velocity (WALK_MAX_COMMAND = (0.8, 0.5, 1.57)) but nothing ever sent one, so
-        #: the left stick only ever drove one axis. Capped below forward because the
-        #: gait is less assured sideways.
+        #: Legacy/avatar lateral speed cap in m/s. The physical walking profile
+        #: replaces these caps below to match its selected input controller.
         self._max_lateral_speed = 0.5
-        # Reverse is ON/OFF at this exact value, not proportional, and the value is not a
-        # preference -- it is the only one that works. Measured achieved speed against
-        # commanded, over 5 s each: -0.80 -> -0.119 m/s (reverses), -0.60 -> +0.215,
-        # -0.40 -> +0.389, -0.20 -> +0.528. Every gentler reverse command walks the robot
-        # FORWARDS, because the policy's forward steady-state error outweighs it. So the
-        # trigger commands full reverse or nothing; there is no usable middle.
-        self._max_backward_speed = 0.8  # the only commanded reverse the policy honours
+        # Retain the legacy policy's separately tuned reverse cap. Controller
+        # walking uses proportional stick input and overrides this value below;
+        # trigger input controls fingers rather than locomotion.
+        self._max_backward_speed = 0.8  # m/s, before physical-profile overrides
         self._max_yaw_speed = 1.0
         # Command ramping, asymmetric on purpose (see _smooth_base_command). Easing INTO
         # a command stops the gait lurching; easing out of one just makes the robot feel
@@ -578,11 +570,9 @@ class HumanoidExample(BaseSample):
         self._controller_pose_candidates = ("grip", "aim", "")
         # Names runtimes use for the thumbstick; the first that answers wins.
         self._xr_stick_input_candidates = ("thumbstick", "joystick", "trackpad")
-        # --- real IK, on the live PhysX Jacobian ---
-        # The ARM_IK_* constants below are a single Jacobian measured once at one pose;
-        # they are only right near that pose, which is what makes reaching feel like the
-        # arm is fighting you. PhysX recomputes the true Jacobian every step, so use it
-        # and solve properly. Set False to fall back to the measured constants.
+        # Live seven-joint IK uses measured articulation poses and the PhysX
+        # Jacobian. The four-joint `ARM_IK_*` model is a degraded fallback when
+        # this solver is disabled or unavailable, and is local to its reference pose.
         self._arm_ik_use_jacobian = True
         self._arm_ik_damping = 0.08  # damped-least-squares lambda; higher = smoother, slower
         self._arm_ik_gain = 0.55  # fraction of the solved step taken per control tick
@@ -750,9 +740,8 @@ class HumanoidExample(BaseSample):
         # ground instead of penetrating it
         # Locomotion mode:
         #   "stationary" - fixed world anchor, no walking/turning; arms and hands stay active.
-        #   "policy"    - Unitree's pretrained G1 walking policy drives the 12 leg joints
-        #                 with real physics-based gait; waist and arms stay free for
-        #                 teleoperation. Needs robots/data/g1_unitree_motion.pt.
+        #   "policy"    - physical walking selects the GR00T balance/walk pair below;
+        #                 without that profile, use the legacy 12-leg-joint actor.
         #   "kinematic" - no policy: the posture is held and the base glides on command.
         # Choose a mode before loading the scene; the fixed anchor changes its topology.
         self._g1_locomotion = "stationary"
@@ -801,13 +790,13 @@ class HumanoidExample(BaseSample):
             self._work_surface_placements = ((2.0, -2.0, 90.0), *self._work_surface_placements[1:])
         # Finger teleoperation
         self._finger_control_enabled = True
-        self._finger_smoothing = 0.35  # low-pass on curl, per physics step
+        self._finger_smoothing = 0.35  # curl smoothing rescaled by the bounded input clock
         self._finger_curl_deadzone = 0.04  # ignore controller/tracking noise near open
         self._smoothed_finger_curls = {}  # side -> {finger role: curl}
         self._latest_finger_curls = {}  # side -> {finger role: curl}, for hand_tracking.csv
-        self._finger_curl_source = {}  # side -> "hand_tracking" | "controller" | "none"
-        self._finger_grab_threshold = 0.55  # mean curl at which a nearby box is grabbed
-        self._finger_release_threshold = 0.35  # hysteresis avoids repeated attach/detach near the threshold
+        self._finger_curl_source = {}  # side -> hand tracking, controller, webcam hand, or none
+        self._finger_grab_threshold = 0.55  # mean curl used by assisted grasp hysteresis
+        self._finger_release_threshold = 0.35  # assisted release threshold; physical contact has separate guards
         self._grab_trigger_release_threshold = 0.35
         self._grab_trigger_threshold = 0.6  # trigger pull that counts as 'take this'.
         # Deliberately high: a light touch curls the
@@ -1610,7 +1599,11 @@ class HumanoidExample(BaseSample):
             self._navigation_scene.create(omni.usd.get_context().get_stage())
 
     async def setup_post_load(self):
-        """Setup keyboard input and physics callback after initial load."""
+        """Start a session and subscribe input, timeline, camera, and physics callbacks.
+
+        Physics initialization is deferred until a callback sees valid tensor
+        views. Flush any preceding session before replacing its recording buffers.
+        """
         self._unsubscribe_keyboard()
         self._reset_teleoperation_state()
         self._appwindow = omni.appwindow.get_default_app_window()
@@ -1723,7 +1716,7 @@ class HumanoidExample(BaseSample):
             )
 
     async def setup_pre_reset(self):
-        """Called before world reset."""
+        """Release constraints and clear episode faults before physics is rebuilt."""
         self._timeline_stopped = True
         # Remove live constraints before physics destroys their body handles.
         self._reset_teleoperation_state()
@@ -1746,7 +1739,11 @@ class HumanoidExample(BaseSample):
         """
 
     async def setup_post_clear(self):
-        """Called after clearing the scene."""
+        """Detach callbacks, finalize recording, and restore owned application settings.
+
+        This also runs after stage replacement, so cleanup helpers must tolerate
+        invalid native handles and an already closed recording session.
+        """
         self._restore_controller_xr_tools()
         self._restore_robot_head_xr_orientation()
         self._timeline_navigation_sub = None
@@ -1783,6 +1780,15 @@ class HumanoidExample(BaseSample):
         Retained for future fallback experiments. The standard webcam launcher
         is display-only and sends no landmarks. A deliberately started sender
         and paired Quest/webcam calibration are also required for robot input.
+
+        Args:
+            port: Local UDP port for the explicitly enabled landmark receiver.
+
+        Returns:
+            Current receiver and calibration status; enabling alone is not calibration.
+
+        Raises:
+            ValueError: If the port is not an integer in the supported UDP range.
         """
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("Webcam port must be an integer from 1 to 65535")
@@ -1792,13 +1798,21 @@ class HumanoidExample(BaseSample):
         return self.webcam_tracking_status()
 
     def disable_webcam_tracking(self) -> dict:
-        """Close the local receiver and restore ordinary Quest-only operation."""
+        """Close the local receiver and discard its calibration and cached targets.
+
+        Returns:
+            Current status after webcam fallback has been disabled.
+        """
         self._webcam_enabled = False
         self._reset_webcam_tracking(close_receiver=True)
         return self.webcam_tracking_status()
 
     def request_webcam_calibration(self) -> None:
-        """Wait for one fresh webcam frame paired with both valid Quest palms."""
+        """Request calibration from a fresh webcam frame and both valid Quest palms.
+
+        The request is asynchronous: the physics callback performs the pairing
+        before its wall-clock deadline. Disabled webcam input ignores the request.
+        """
         if self._webcam_enabled:
             self._invalidate_webcam_calibration("Waiting for both optical Quest hands and a fresh webcam pose")
             self._webcam_calibration_pending = True
@@ -1828,7 +1842,12 @@ class HumanoidExample(BaseSample):
         self._webcam_receiver_error = None
 
     def webcam_tracking_status(self) -> dict:
-        """Describe reception, calibration, confidence, and selected input sources."""
+        """Describe reception, calibration, confidence, and selected input sources.
+
+        Returns:
+            A status snapshot containing capture age in seconds, calibration
+            state, source labels, and measured robot arm lengths in metres.
+        """
         frame = self._webcam_frame
         age = frame.age_s() if frame is not None else None
         receiver = self._webcam_receiver
@@ -1978,6 +1997,14 @@ class HumanoidExample(BaseSample):
         )
 
     def _get_webcam_arm_target(self, side: str):
+        """Return the side's calibrated target only while its sender remains fresh.
+
+        Args:
+            side: ``"left"`` or ``"right"``.
+
+        Returns:
+            The cached body-frame arm target, or None when missing, stale, or uncalibrated.
+        """
         return self._webcam_arm_targets.get(side) if self._webcam_input_is_fresh() else None
 
     def _get_webcam_finger_curls(self, side: str) -> dict[str, float] | None:
@@ -2029,7 +2056,15 @@ class HumanoidExample(BaseSample):
         return self._webcam_wrist_hold_rotations.get(side)
 
     def on_physics_step(self, dt: float, context: object) -> None:
-        """Drive one completed physics step with a callback-local hand snapshot."""
+        """Process completed physics state and prepare targets for the next solve.
+
+        Hand input is shared only within this callback and discarded even when
+        initialization, validation, or a subsystem raises or returns early.
+
+        Args:
+            dt: Simulation timestep in seconds, independent of render/wall time.
+            context: Context supplied by the post-physics event dispatcher.
+        """
         # XR input is published once per application update. Navigation, fingers,
         # and both arm tasks can share it during this synchronous callback, but
         # must never reuse its validity flags or landmarks on a later callback.
@@ -2040,7 +2075,14 @@ class HumanoidExample(BaseSample):
             self._teleop_step_hand_samples = None
 
     def _advance_physics_step(self, dt: float, context: object) -> None:
-        """Physics step callback - initialize on first step, then drive the robot.
+        """Initialize a valid episode or update control and recording in dependency order.
+
+        Health guards precede commands. Locomotion writes body targets, fingers
+        supply this step's grasp evidence, and arms replace their owned targets.
+        Physical walking then writes explicit body efforts once using those
+        final targets. Camera, gaze, and recording consume the completed state.
+        Locomotion/motor faults latch and pause; optional subsystem errors are
+        contained so other updates can continue.
 
         Args:
             dt: Delta time for the physics step.
@@ -2054,7 +2096,8 @@ class HumanoidExample(BaseSample):
             self._pause_faulted_articulation()
             return
 
-        # Check if physics tensors are valid, if not, reinitialize
+        # Invalidate without reading dead tensors. Initialization waits for a
+        # later callback with valid views; Stop/Play can recreate them asynchronously.
         if not self.g1.robot.is_physics_tensor_entity_valid():
             self._physics_ready = False
             self._timeline_stopped = True
@@ -2980,6 +3023,7 @@ class HumanoidExample(BaseSample):
         self._xr_diagnostic_done = True
 
         def describe(label, matrix):
+            """Print one diagnostic transform's translation and local forward axis."""
             if matrix is None:
                 print(f"[G1-XR]   {label:22s} None", flush=True)
                 return
@@ -4214,18 +4258,24 @@ class HumanoidExample(BaseSample):
         )
 
     def _start_behavioral_session(self) -> None:
-        """Open a new recording session: create its folder tree and write metadata.json.
+        """Create a unique recording directory and write its initial metadata.
 
         Layout produced under ~/BehavioralCollection/raw_sessions/:
 
             session_YYYY-MM-DD_HH-MM-SS/
-            ├── metadata.json            (written here, at session start)
-            ├── frames/eye_camera/       (PNG frames appended during the run)
-            ├── behavior.csv             ┐
-            ├── frame_timestamps.csv     │ written by _save_behavioral_data()
-            ├── hand_tracking.csv        │ when the session ends
-            ├── gaze.csv                 │
-            └── object_states.csv        ┘
+            ├── metadata.json
+            ├── frames/eye_camera/
+            ├── behavior.csv
+            ├── frame_timestamps.csv
+            ├── hand_tracking.csv
+            ├── gaze.csv
+            └── object_states.csv
+
+        CSV files are created lazily by periodic worker submissions; closing
+        drains accepted work and retains unsaved rows for inspection. PNG files
+        are written during capture. Metadata records requested settings here;
+        resolved locomotion is updated after robot initialization. A folder or
+        metadata file alone does not establish that samples were recorded.
         """
         if not self._behavioral_data_enabled:
             return
@@ -4521,9 +4571,9 @@ class HumanoidExample(BaseSample):
         Called every ~2.5 s during play and once at session close. Incremental
         appends reduce buffered data; a force-quit can lose queued/unsaved rows,
         and a stalled disk can retain more than one interval in memory.
-        (Previously the CSVs were only written at scene clear — which never runs
-        when the app window is simply closed, so whole sessions ended up with
-        camera frames but no sensor logs at all.)
+        Queue acceptance transfers ownership of copied rows to the worker;
+        buffers remain intact when a submission is rejected. Disk failures are
+        reported later through ``_collect_behavioral_csv_results``.
         """
         if self._behavioral_session_dir is None:
             return
@@ -4632,9 +4682,10 @@ class HumanoidExample(BaseSample):
     def _capture_eye_camera_frame(self) -> None:
         """Save one PNG frame from the G1 eye camera (~10 Hz) and log it for frame_timestamps.csv.
 
-        Deliberately slower than the 100 Hz sensor logs: PNG encoding is expensive, and
-        the downstream sync tool aligns each frame to the nearest behavior.csv row by
-        sim_time anyway, so a dense frame stream buys nothing.
+        Capture is decimated relative to the 100 Hz scalar logs because PNG
+        encoding runs synchronously here. The timestamp identifies the sampling
+        callback, not a hardware exposure time; the camera may supply its latest
+        rendered image. Downstream alignment uses the nearest behavioral simulation time.
         """
         if self._behavioral_session_dir is None or self._behavioral_frame_dir is None:
             return
@@ -4700,12 +4751,14 @@ class HumanoidExample(BaseSample):
 
         Unlike the arm-teleop path, poses here are logged unconditionally — not gated on
         grip being held — so the dataset always contains raw hand motion whenever
-        tracking is available. valid=0 rows mean the device was absent that sample.
+        tracking is available. ``valid=0`` means no usable pose was available,
+        including an absent device or a present device with invalid tracking.
         """
         left_xr = self._get_xr_input_device("/user/hand/left")
         right_xr = self._get_xr_input_device("/user/hand/right")
 
         def _pose_fields(device):
+            """Serialize a valid world pose as XYZ/WXYZ, or explicit missing fields."""
             pose = self._get_raw_hand_or_controller_pose(device)
             if pose is None:
                 return {
@@ -6325,6 +6378,7 @@ class HumanoidExample(BaseSample):
                 return None
 
             def damped_step(jacobian, residual):
+                """Solve the damped least-squares task correction in joint coordinates."""
                 return jacobian.T @ np.linalg.solve(
                     jacobian @ jacobian.T + damping * damping * np.eye(jacobian.shape[0]), residual
                 )
@@ -6584,12 +6638,13 @@ class HumanoidExample(BaseSample):
         *,
         physics_snapshot: dict | None = None,
     ) -> dict[int, float]:
-        """Turn a desired hand position (body frame, relative to the pelvis) into arm joint targets.
+        """Solve live arm IK, using the measured four-joint model only as fallback.
 
-        A linear inverse of the arm's MEASURED Jacobian, not a hand-tuned gain table. See
-        ARM_IK_PINV above for why: the old gains inverted the vertical axis and flattened
-        the lateral one, so the robot's hand moved down when the operator's went up and
-        barely moved sideways at all.
+        The preferred solve uses all seven arm joints and the live world-frame
+        Jacobian. If it cannot produce targets, the local linear model mirrors
+        the right-arm reference and caps its position offset. That fallback
+        supplies position targets only; it does not track wrist orientation.
+        Both paths still pass through the shared command and contact limiters.
 
         Args:
             side: ``"left"`` or ``"right"``.
@@ -7023,8 +7078,10 @@ class HumanoidExample(BaseSample):
 
         Runs every physics step, before arm/grasp decisions. Each hand independently
         prefers OpenXR hand tracking (per-finger flexion measured from the tracked hand
-        skeleton) and falls back to the controller's trigger. Thumb opposition has
-        its own target. Curls are smoothed, sent to the robot, and recorded.
+        skeleton), then the controller's trigger, then eligible fresh webcam hand
+        landmarks. Thumb opposition has its own target. Requested curls are
+        smoothed before contact limits produce the applied actuator commands;
+        recording keeps requested and applied values distinguishable.
         """
         self._latest_hand_contacts = {"left": [], "right": []}
         if not self._finger_control_enabled or not self.g1 or not self.g1.has_finger_control():
@@ -7229,6 +7286,7 @@ class HumanoidExample(BaseSample):
         positions_by_name = {}
 
         def position(name):
+            """Read each named landmark at most once during this curl measurement."""
             if name not in positions_by_name:
                 positions_by_name[name] = (
                     self._get_hand_joint_position(input_device, name) if name in pose_names else None
@@ -7977,11 +8035,12 @@ class HumanoidExample(BaseSample):
             # stay put, turn to face it -- do nothing at all. Turning in place is safe now
             # that a yaw-only command holds station (see g1.TURN_HOLD_ENABLED).
             forward = 0.0
-        # Reverse is capped separately: the walking policy tracks backward commands at
-        # about 40% and is less stable doing it, so full stick back is not full speed back.
+        # This branch belongs to legacy/avatar input. Physical pointing and
+        # controller profiles return above and apply their own command limits.
+        # Keep the separately configured forward and reverse speed caps.
         speed = self._max_forward_speed if forward >= 0.0 else self._max_backward_speed
         self._controller_command[0] = speed * forward
-        # Strafe. The policy has always taken this; nothing ever sent it.
+        # Convert normalized lateral input to body-frame speed in m/s.
         self._controller_command[1] = self._max_lateral_speed * float(getattr(self, "_latest_stick_lateral", 0.0))
         self._controller_command[2] = self._max_yaw_speed * yaw
 
@@ -8059,7 +8118,11 @@ class HumanoidExample(BaseSample):
             self._sub_keyboard = None
 
     def physics_cleanup(self):
-        """Clean up physics resources."""
+        """Release example-owned resources when the host tears down physics.
+
+        Clear can also invoke equivalent cleanup. Subscription removal, session
+        finalization, and setting restoration therefore tolerate repeated calls.
+        """
         self._restore_controller_xr_tools()
         self._restore_robot_head_xr_orientation()
         self._timeline_navigation_sub = None

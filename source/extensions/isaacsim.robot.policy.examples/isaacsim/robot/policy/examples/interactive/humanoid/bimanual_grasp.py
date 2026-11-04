@@ -53,6 +53,8 @@ class BimanualGraspResult:
 
 @dataclass(frozen=True)
 class _MeasuredContact:
+    """Retain a validated world contact with a unit normal and force in newtons."""
+
     path: str
     point: tuple[float, float, float]
     normal: tuple[float, float, float]
@@ -65,6 +67,19 @@ class BimanualGraspMonitor:
     The caller supplies complete fresh contact samples and optical finger intent.
     Eligible-object membership comes from the existing contact reader. Unknown
     mass leaves weight comparison unavailable; it does not invent an object mass.
+
+    Args:
+        support_time_s: Simulation-time dwell required for opposing contacts.
+        min_force_n: Minimum force on each side of an opposing contact pair.
+        max_separation_m: Largest contact gap included in the diagnostic.
+        min_point_spacing_m: Minimum distance between opposing contact points.
+        opposing_normal_dot: Upper dot-product threshold for opposing unit normals.
+        min_curl_intent: Minimum curl reached by at least one finger on each hand.
+        max_contacts_per_hand: Input capacity; exceeding it invalidates the update.
+        gravity_m_s2: Acceleration used to estimate the object's weight.
+
+    Raises:
+        ValueError: A threshold or contact capacity is outside its permitted range.
     """
 
     def __init__(
@@ -108,6 +123,7 @@ class BimanualGraspMonitor:
 
     @staticmethod
     def _finite(value: object) -> bool:
+        """Accept finite real measurements while excluding boolean flags."""
         return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
 
     def reset(self) -> None:
@@ -117,11 +133,17 @@ class BimanualGraspMonitor:
         self.result = BimanualGraspResult()
 
     def _unavailable(self, detail: str) -> BimanualGraspResult:
+        """Clear contact dwell and report why this update cannot provide evidence."""
         self.reset()
         self.result = BimanualGraspResult(state="unavailable", detail=detail)
         return self.result
 
     def _collect(self, values: Iterable[ContactSample]) -> dict[str, list[_MeasuredContact]]:
+        """Validate eligible contacts and group positive-force samples by object.
+
+        Invalid eligible measurements or an exceeded input capacity raise rather
+        than silently producing a diagnostic from incomplete evidence.
+        """
         grouped: dict[str, list[_MeasuredContact]] = {}
         for index, sample in enumerate(values):
             if index >= self.max_contacts_per_hand:
@@ -153,6 +175,7 @@ class BimanualGraspMonitor:
         return grouped
 
     def _opposed(self, left: list[_MeasuredContact], right: list[_MeasuredContact]) -> bool:
+        """Require one separated cross-hand pair with sufficient opposing forces."""
         return any(
             first.force >= self.min_force_n
             and second.force >= self.min_force_n

@@ -49,6 +49,7 @@ class ControllerLocomotion:
 
     @staticmethod
     def _finite(value: object) -> bool:
+        """Accept finite real inputs while excluding boolean flags."""
         return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
 
     def reset(self) -> None:
@@ -58,6 +59,7 @@ class ControllerLocomotion:
         self.command = ControllerCommand()
 
     def _stop(self, state: str, detail: str) -> ControllerCommand:
+        """Clear motion and require the neutral interlock before rearming."""
         self._armed = False
         self.command = ControllerCommand(state=state, detail=detail)
         return self.command
