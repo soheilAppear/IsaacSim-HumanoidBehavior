@@ -245,6 +245,8 @@ Paths in this table are relative to
 | `interactive/humanoid/point_navigation_scene.py` | Blue visuals, real floor/object approaches, segment clearance, and turning-footprint queries |
 | `interactive/humanoid/factory_route.py` | Incremental bounded floor-route search and collision-checked corner reduction |
 | `interactive/humanoid/controller_locomotion.py` | Joystick deadzones, signs, diagonal cap and neutral/reconnect interlock |
+| `interactive/humanoid/gaze_locomotion.py` | Eye-dwell selection, preview, measured short moves/turns, settling and look-away interlock |
+| `interactive/humanoid/gaze_controls_scene.py` | Camera-following button panels, dwell/command feedback and eye-ray hit geometry |
 | `interactive/humanoid/comfort_camera.py` | Wall-time filtering of robot XY/yaw, idle hold, and fixed neutral eye-height calibration; no HMD filtering |
 | `interactive/humanoid/tall_packages.py` | Three lightweight compound cartons with collision-open handles |
 | `interactive/humanoid/package_shelves.py` | Twelve free handle-free cartons on three static two-level racks |
@@ -268,6 +270,7 @@ relative to the repository root:
 | --- | --- |
 | [`tools/validate_gesture_walking_live.py`](../tools/validate_gesture_walking_live.py) | Host CLI for reproducible real-PhysX baseline and right-arm replays |
 | [`tools/validate_controller_walking_live.py`](../tools/validate_controller_walking_live.py) | Bounded synthetic-stick physical replay: directions, release, loss, and neutral rearm |
+| [`tools/validate_gaze_walking.py`](../tools/validate_gaze_walking.py) | Separate headless preview/movement checks in the real warehouse with synthetic eyes and camera captures |
 | [`source/standalone_examples/api/isaacsim.robot.policy.examples/g1_grasp_env.py`](../source/standalone_examples/api/isaacsim.robot.policy.examples/g1_grasp_env.py) | Retained cloned-scene throughput benchmark; no action/reward interface, episode reset, or training loop |
 | [`source/standalone_examples/api/isaacsim.robot.policy.examples/g1_standalone.py`](../source/standalone_examples/api/isaacsim.robot.policy.examples/g1_standalone.py) | Retained keyboard/scripted assisted walking and hand demo; separate from the current strict physical VR profile and recorder |
 
@@ -899,9 +902,106 @@ wrapper, including keyboard, XR/gamepad sticks and buttons, and headset gait. Th
 world constraint also prevents arm motion and carried-object reactions from tipping
 the free base. This is a supported manipulation setup, not a demonstration of balance.
 
+### Gaze buttons and optical hands
+
+`tools/launch_gaze_walking.bat` selects `G1_LOCOMOTION_INPUT=gaze`, disables
+pointing navigation, and sets `G1_OPTICAL_HANDS_ONLY=1` so both hands remain
+available for manipulation. Its default `G1_GAZE_PREVIEW=1` is reset on every
+invocation; only a first `--move` changes it to `0`. A first `--preview` explicitly
+retains preview. Remaining raw arguments pass through to `launch_isaac_vr.bat`.
+The base launcher still disables webcam robot input and loads this checkout's
+complete extension. See the [operator procedure](../HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free).
+
+Preview uses the stationary world anchor with the same shelf/carton layout as
+movement. It exercises gaze selection without any base movement. Movement uses
+the existing physical GR00T scene, 200 Hz physics and 50 Hz actor schedule.
+Changing between them requires exit/relaunch and LOAD because the base topology
+differs. Preview does not validate dynamic balance, braking or carried loads.
+
+Camera-following side panels keep the middle of the view available for the box.
+Look off all buttons to arm, then dwell continuously for 0.7 wall seconds on
+Forward, Back, Turn left or Turn right. The ring indicates dwell progress; one
+completed dwell starts one bounded command. The operator can then look back at
+the box. Busy selection is ignored and a fresh look-away is required before
+another dwell. Eye tracking loss clears unfinished dwell; an already accepted
+movement continues to its measured stop. XR profile/display shutdown and lifecycle/recenter transitions cancel
+and disarm. Eye-driven commands require the combined gaze device's current tracked
+pose; the visual/recording HMD-forward fallback never authorizes motion. Runtime
+permissions and calibration still determine whether the device supplies usable
+eye data. Application polling times are not hardware capture timestamps.
+
+Defaults are `G1_GAZE_DISTANCE_M=0.20`, `G1_GAZE_TURN_DEG=10`,
+`G1_GAZE_FORWARD_SPEED=0.20`, `G1_GAZE_BACKWARD_SPEED=0.15`,
+`G1_GAZE_YAW_SPEED=0.25`, and `G1_GAZE_DWELL_S=0.7`. Distance is in meters,
+turn angle in degrees, translational speed in m/s, and yaw speed in rad/s.
+Forward/reverse/yaw requests remain bounded by the direct-control caps
+0.65/0.35 m/s and 0.40 rad/s. These are requested targets, not guaranteed physical
+travel or stopping distances. The existing actor supports reverse movement;
+loaded transport still requires a separate physical acceptance check.
+Setting `G1_GAZE_BACKWARD_SPEED=0` disables reverse selection. Dwell uses wall time;
+motion and settling deadlines use simulation time, with measured planar pose and
+speed determining progress and completion rather than elapsed wall time alone.
+Completion requests exactly zero velocity, then waits for planar speed below
+0.03 m/s and yaw speed below 0.06 rad/s continuously for 0.20 simulation seconds.
+The settling deadline is 4 seconds to accommodate measured balance sway; failure
+to settle latches a fault. Independent balance and runaway guards remain active.
+
+Inspect `EX.gaze_locomotion_status()` through `tools/kit_exec.py` for the current
+selection/movement state. Gaze controls supply only base intent: the per-step
+health/balance/unintended-motion checks, independent finger and arm updates, and
+final explicit body-effort update retain their ownership. Any UI/log timestamp
+describes application observation rather than proven device freshness. The
+existing `gaze.csv` distinguishes eye tracking from HMD fallback; a ray hit alone
+does not establish selection or human intent.
+
+**Validation on 8 November 2026:** actual-scene anchored preview passed all four
+selections with zero sampled base displacement. Ordinary 0.3-second glances did
+not activate; full dwell fired once; sustained fixation did not repeat. The
+physical sequence also passed all four actions and measured stopping, with
+3,084 arm updates and 3,084 finger updates during the same run. It first backed
+away from the front shelf to satisfy the conservative turn-clearance preflight.
+No root/object teleports, policy changes, or physics-guard bypasses were used.
+
+| Request | Measured final result in that unloaded run |
+| --- | --- |
+| Back 0.20 m | 0.218 m backward |
+| Turn left 10 degrees | 10.93 degrees left; 0.015 m planar drift |
+| Turn right 10 degrees | 11.45 degrees right; 0.018 m planar drift |
+| Forward 0.20 m | 0.202 m forward |
+
+The validator uses synthetic tracked eye descriptors and an explicitly simulated
+selection clock; it does not test live XR delivery, wall-time fixation quality,
+headset readability, optical hand tracking, or frictional carrying. The real
+warehouse camera renders were inspected separately. All **965 offline regressions
+passed**, including production optical curl extraction and two-arm IK updates during
+active gaze locomotion with controlled contact/actuator fixtures. That test
+explicitly does not establish a physically supported grasp. Tests also cover strict
+source/validity, XR exit, occlusion, one-shot/rearm behavior, UI failure stopping,
+geometry, input ownership, and launcher argument handling.
+
+To reproduce, set `ISAAC_DIR` to the installed Isaac Sim 6.1 directory and run
+from this checkout with no other Isaac process open:
+
+```powershell
+$gazeCheck = @(
+  'tools\validate_gaze_walking.py', '--output-dir', "$env:TEMP\gaze-validation",
+  '--ext-path', "$PWD\source\extensions\isaacsim.robot.policy.examples",
+  '--enable', 'isaacsim.robot.policy.examples-5.2.11',
+  '--/app/vulkan=false', '--/metricsAssembler/changeListenerEnabled=false',
+  '--/app/extensions/fsWatcherEnabled=0'
+)
+& "$env:ISAAC_DIR\python.bat" @gazeCheck --mode preview
+& "$env:ISAAC_DIR\python.bat" @gazeCheck --mode move
+```
+
+Each invocation owns and closes its own headless process, disables behavioral
+recording, and retains a unique JSON report and PNGs in the requested output
+directory, including failed runs. A cold shader/asset cache may need a larger
+`--load-timeout`; that deadline cannot interrupt a native blocking startup call.
+
 ### Controller sticks and optical hands
 
-`tools/launch_controller_walking.bat` is the current walking entry point.
+`tools/launch_controller_walking.bat` is the controller walking entry point.
 `tools/launch_gesture_walking.bat` delegates to it as a compatibility alias.
 Both set `G1_GESTURE_WALKING=1` to select the existing physical GR00T scene,
 `G1_LOCOMOTION_INPUT=controller` and `G1_POINTING_NAVIGATION=0`. The launcher defaults

@@ -10,7 +10,7 @@ import math
 from pxr import Gf
 
 
-def read_world_pose(device: object, pose_name: str = "") -> Gf.Matrix4d | None:
+def read_world_pose(device: object, pose_name: str = "", *, tracked_only: bool = False) -> Gf.Matrix4d | None:
     """Read a finite, valid pose in the virtual stage frame.
 
     Use the runtime validity flags when available. Older matrix-only wrappers use
@@ -21,6 +21,9 @@ def read_world_pose(device: object, pose_name: str = "") -> Gf.Matrix4d | None:
     Args:
         device: XR input device, or None if the runtime did not expose one.
         pose_name: Named pose on that device.
+        tracked_only: Require all position/orientation VALID and TRACKED bits and
+            a descriptor. Use for deliberate eye-controlled actions; inferred
+            or matrix-only poses remain usable by existing visualization callers.
 
     Returns:
         World pose, or None when missing, invalid, or malformed.
@@ -39,11 +42,15 @@ def read_world_pose(device: object, pose_name: str = "") -> Gf.Matrix4d | None:
         if callable(descriptor_reader):
             descriptor = descriptor_reader(pose_name)
             # Kit's XRPoseValidityFlags use the OpenXR VALID bits (orientation=1,
-            # position=2). TRACKED bits are not required: inferred valid poses are usable.
-            if int(descriptor.validity_flags) & 0x3 != 0x3:
+            # position=2). Ordinary visualization accepts inferred valid poses;
+            # deliberate eye controls also require orientation/position TRACKED.
+            required_flags = 0xF if tracked_only else 0x3
+            if int(descriptor.validity_flags) & required_flags != required_flags:
                 return None
             value = descriptor.pose_matrix
         else:
+            if tracked_only:
+                return None
             value = device.get_virtual_world_pose(pose_name)
         # Gf accepts undersized nested lists and fills omitted entries with identity;
         # reject that coercion at the tracking boundary instead of inventing a pose.
@@ -55,6 +62,8 @@ def read_world_pose(device: object, pose_name: str = "") -> Gf.Matrix4d | None:
         if not all(math.isfinite(float(matrix[row][column])) for row in range(4) for column in range(4)):
             return None
         if float(matrix.GetDeterminant()) < 1e-8:
+            return None
+        if tracked_only and abs(float(matrix.ExtractRotationMatrix().GetDeterminant()) - 1.0) > 0.01:
             return None
         return matrix
     except (AttributeError, TypeError, ValueError, RuntimeError):

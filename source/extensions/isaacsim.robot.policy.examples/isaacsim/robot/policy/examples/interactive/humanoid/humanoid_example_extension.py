@@ -53,7 +53,17 @@ class HumanoidExampleExtension(omni.ext.IExt):
         self.category = "Policy"
 
         sample = HumanoidExample()
-        if sample._controller_walking_enabled:
+        if sample._gaze_walking_enabled:
+            config = sample._gaze_locomotion.config
+            overview = "Eye-gaze preview: the base is anchored. " if config.preview else "Eye-gaze walking: "
+            overview += f"Look between the side buttons first, then dwell for {config.dwell_s:g} seconds. "
+            overview += f"Forward/Back request {config.distance_m:g} m; turns request {config.turn_degrees:g} degrees. "
+            overview += "The ring shows selection progress. Look back at your box after selection. "
+            overview += "Each action finishes and stops automatically; other selections are ignored while moving. "
+            overview += "Look away and return for another action. Only tracked eyes select; head direction cannot. "
+            if config.backward_speed == 0.0:
+                overview += "Back is disabled because the configured reverse speed is zero. "
+        elif sample._controller_walking_enabled:
             overview = "Controller walking: center both sticks once. Left stick moves forward/backward and sideways; "
             overview += "right stick turns. Push farther for more speed; release the sticks to stop. "
             overview += "The blue pointing ray and controller face buttons are disabled. "
@@ -76,7 +86,7 @@ class HumanoidExampleExtension(omni.ext.IExt):
             overview += "\n\nUse tracked hands to place both palms on opposite sides of a shelf carton, "
             overview += "curl your fingers around its edges, then lift both hands together. Open and separate to release. "
             overview += "Contact and friction support the package; it is never glued to the hands. "
-            overview += "If the headset switches between controllers and hands, center the sticks and stop, "
+            overview += "If the headset switches between controllers and hands, wait for the robot to stop, "
             overview += "then put down the controllers and show your open hands to the headset. "
             overview += "Arm and finger control resume when optical hand poses return."
             overview += "\nKeyboard B: recenter forward heading while preserving head tilt."
@@ -88,7 +98,7 @@ class HumanoidExampleExtension(omni.ext.IExt):
                 overview += "Keyboard B recenters forward heading."
             else:
                 overview += "Y drops objects; B recenters forward heading."
-        overview += "\nThe factory includes practice objects and, in controller walking, twelve handle-free shelf cartons."
+        overview += "\nThe factory includes practice objects and, in controller/gaze profiles, twelve handle-free shelf cartons."
         overview += "\nIf the simulation pauses after a movement fault, the console shows why. "
         overview += "Use this example's Reset to recover; Play alone does not clear a fault."
         overview += "\n\nPress the 'Open in IDE' button to view the source code."

@@ -32,6 +32,10 @@ disabled. Earlier pointing and physical-walking results are historical evidence,
 not acceptance of the new controller layout, shelf pickups or bimanual transport.
 Eye tracking and its red ray remain unchanged.
 
+The separate [gaze-button profile](#gaze-buttons-with-both-hands-free) keeps both
+optical hands free. Its default preview anchors the base; a fresh `--move` launch
+enables short physical walking/turning requests after a deliberate eye dwell.
+
 The following September 2026 observations describe specific historical tests and
 operator reports. They do not establish acceptance of every subsequent revision.
 
@@ -425,6 +429,93 @@ approach but its fingers caught the rear face and failed to hold the box. The ne
 palm-first validator checks opposing palm contact before curl and opposing side
 contact before lift. A live grip-only trial of that sequence failed the palm-contact
 gate and stopped before finger closure or lift; successful pickup remains unverified.
+
+### Gaze buttons with both hands free
+
+This experimental profile uses genuine tracked eye gaze for four controls:
+**Forward**, **Back**, **Turn left**, and **Turn right**. The panels follow the
+camera on either side, leaving the central box/manipulation view free. Optical
+hands continue to control arms and fingers independently; no hand gesture or
+controller button activates walking. Head direction can still serve the existing
+gaze visualization/recording fallback, but it cannot select a locomotion button.
+
+1. Enable and calibrate eye tracking in the headset, allow the streaming/runtime
+   eye-tracking permissions, and connect the supported XR runtime. Extension
+   availability or a visible red ray alone does not establish actual eye input.
+2. Launch the anchored preview:
+
+   ```powershell
+   .\tools\launch_gaze_walking.bat
+   ```
+
+3. Open **Window → Examples → Robotics Examples → Policy → Humanoid** (panel title
+   **Humanoid: Unitree G1**), click **LOAD**, then **Play**.
+   If the headset view is not already active, open **Window → Rendering → XR**.
+   Under **Experience → Select Experience Type**, use **Virtual Reality Experience**;
+   under **General → Selected Output Plugin**, use **OpenXR**, if these are not
+   already selected. Preserve the working OpenXR runtime settings and click
+   **Start XR**.
+4. Put down the controllers and show both hands to the headset. Look between the
+   buttons first to arm selection. Hold one button for **0.7 seconds** while its
+   ring fills. Preview reports the selection while the base remains anchored.
+   Look away from every button before trying another selection.
+   **NO EYE** means Isaac is not receiving a currently tracked eye pose. Check
+   headset calibration, eye-tracking permission and runtime transport before
+   continuing; a visible head-direction ray cannot substitute for eye input.
+5. After verifying tracking and comfortable panel placement, exit Isaac and run:
+
+   ```powershell
+   .\tools\launch_gaze_walking.bat --move
+   ```
+
+   Repeat LOAD, Play, and Start XR if needed. The new scene uses the physical GR00T
+   balance/walk actor. Try one **Back** movement first to make room for turning
+   beside the front shelf; the existing clearance guard can reject a crowded turn.
+   Preview and movement share the shelf/carton layout, but the preview's fixed
+   anchor changes the robot topology: do not try to turn preview into movement
+   by toggling an attribute in a running scene.
+
+After a completed dwell, one bounded command runs and you can look back at the
+box. Forward/backward defaults to **0.20 m**; a left/right turn defaults to **10°**.
+Requests use **0.20 m/s forward**, **0.15 m/s backward**, or **0.25 rad/s yaw**.
+These are command targets: physical braking and contacts determine actual travel.
+New selections are ignored while busy, and holding a button cannot repeat it.
+Look away before the next dwell. Lost/invalid eye tracking cancels unfinished dwell;
+an already accepted movement continues to its measured stop. XR shutdown, Pause/Stop, Reset and
+recentering cancel selection/movement and require rearming. Use the example's **Reset** after
+a latched simulation fault; Play alone does not clear it.
+
+Every launcher invocation resets preview to on, including when an old terminal
+contains `G1_GAZE_PREVIEW=0`. Only a **first** `--move` enables motion; a first
+`--preview` explicitly selects the default. Remaining arguments pass to the base
+Isaac launcher, for example `--move --xr-verbose`. The launcher fixes
+`G1_LOCOMOTION_INPUT=gaze`, `G1_POINTING_NAVIGATION=0`, and
+`G1_OPTICAL_HANDS_ONLY=1`; controller manipulation and webcam robot input stay off.
+Numerical settings can be supplied in the launch environment before starting Isaac:
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `G1_GAZE_DWELL_S` | `0.7` | Continuous button dwell, in wall seconds |
+| `G1_GAZE_DISTANCE_M` | `0.20` | Requested forward/backward distance, in meters |
+| `G1_GAZE_TURN_DEG` | `10` | Requested turn angle, in degrees |
+| `G1_GAZE_FORWARD_SPEED` | `0.20` | Forward command speed, in m/s |
+| `G1_GAZE_BACKWARD_SPEED` | `0.15` | Backward command speed, in m/s |
+| `G1_GAZE_YAW_SPEED` | `0.25` | Turn command speed, in rad/s |
+
+Set `G1_GAZE_BACKWARD_SPEED=0` to disable backward selection. The default enables
+it. Dwell uses wall time; movement and settling deadlines use simulation time, so
+a slow-rendering session takes longer in real time to complete the same movement.
+
+The directional speed settings remain bounded by the existing physical profile's
+0.65 m/s forward, 0.35 m/s backward and 0.40 rad/s yaw caps. The source supports
+backward walking. The actual-scene synthetic-eye check passed forward/backward
+steps and both turns, including measured stopping: about 20 cm forward, 22 cm
+backward and 11-degree turns for the default requests. Preview checks selection and hand availability, not balance,
+gait, braking, shelf pickup or loaded transport. A displayed selection is an
+explicit interface action, not a claim that gaze reveals general mental intent.
+Live eye-tracker calibration, in-headset readability, and picking up/carrying a
+box while walking remain operator acceptance checks. See the
+[validation details](docs/humanoid-control.md#gaze-buttons-and-optical-hands).
 
 ### Experimental gesture walking
 

@@ -22,7 +22,7 @@ the completed state. The application-update camera callback also runs while
 physics is paused and has its own stage-lifetime guards.
 
 The default scene anchors the pelvis for manipulation. Physical walking is a
-separate load-time configuration with pointing or controller input. Live arm IK,
+separate load-time configuration with pointing, controller, or eye-gaze input. Live arm IK,
 contact-based grasping, and optional calibrated webcam fallback are independent
 of the selected base input. Legacy avatar controls remain available explicitly.
 
@@ -58,6 +58,8 @@ from isaacsim.robot.policy.examples.interactive.humanoid.bimanual_grasp import B
 from isaacsim.robot.policy.examples.interactive.humanoid.comfort_camera import ComfortCameraFilter
 from isaacsim.robot.policy.examples.interactive.humanoid.controller_locomotion import ControllerLocomotion
 from isaacsim.robot.policy.examples.interactive.humanoid.factory_route import FactoryRoutePlanner
+from isaacsim.robot.policy.examples.interactive.humanoid.gaze_controls_scene import GazeControlsScene
+from isaacsim.robot.policy.examples.interactive.humanoid.gaze_locomotion import GazeLocomotion, GazeLocomotionConfig
 from isaacsim.robot.policy.examples.interactive.humanoid.grasp_controller import ContactGraspController
 from isaacsim.robot.policy.examples.interactive.humanoid.material_highlights import MaterialHighlights
 from isaacsim.robot.policy.examples.interactive.humanoid.operator_head import (
@@ -186,8 +188,9 @@ class HumanoidExample(BaseSample):
 
     The default 100 Hz stationary scene fixes the pelvis to the world and disables
     robot-link gravity; objects remain dynamic. Physical walking instead uses
-    200 Hz physics and 50 Hz GR00T actors. Its input profile selects pointing or
-    two VR sticks before loading, while arms and fingers retain separate targets.
+    200 Hz physics and 50 Hz GR00T actors. Its input profile selects pointing,
+    two VR sticks, or eye-gaze buttons before loading; arms and fingers retain
+    separate targets. Gaze preview anchors the base and only reports selections.
     These choices affect articulation topology and cannot be swapped during Play.
 
     Optical hand poses take precedence over controller arm clutches. Optional
@@ -228,11 +231,24 @@ class HumanoidExample(BaseSample):
         # The historical walking flag selects the physical GR00T scene; input
         # ownership is separate so changing gestures never replaces the gait.
         self._locomotion_input_mode = os.environ.get("G1_LOCOMOTION_INPUT", "pointing").strip().lower()
-        if self._locomotion_input_mode not in ("pointing", "controller"):
-            raise ValueError("G1_LOCOMOTION_INPUT must be pointing or controller")
+        if self._locomotion_input_mode not in ("pointing", "controller", "gaze"):
+            raise ValueError("G1_LOCOMOTION_INPUT must be pointing, controller, or gaze")
+        self._gaze_walking_enabled = self._locomotion_input_mode == "gaze"
+        self._gaze_locomotion = GazeLocomotion(self._read_gaze_locomotion_config())
+        self._gaze_controls = GazeControlsScene(
+            backwards_enabled=self._gaze_locomotion.config.backward_speed > 0.0,
+            preview=self._gaze_locomotion.config.preview,
+        )
+        self._gaze_eye_valid = False
+        if self._gaze_walking_enabled:
+            # Preview fixes the pelvis to the world, so a preview selection
+            # cannot move the base even if a learned balance policy drifts.
+            # Moving mode must be chosen before LOAD; it changes topology.
+            self._gesture_locomotion_enabled = not self._gaze_locomotion.config.preview
         self._controller_walking_enabled = (
             self._gesture_locomotion_enabled and self._locomotion_input_mode == "controller"
         )
+        self._direct_walking_enabled = self._controller_walking_enabled or self._gaze_walking_enabled
         # Sticks can walk while grip/trigger control manipulation. Optical input
         # remains preferred; retain an explicit opt-in for optical-only hands.
         self._optical_hands_only = os.environ.get("G1_OPTICAL_HANDS_ONLY", "0").strip().lower() in (
@@ -241,7 +257,7 @@ class HumanoidExample(BaseSample):
             "yes",
             "on",
         )
-        self._pointing_navigation_enabled = not self._controller_walking_enabled and os.environ.get(
+        self._pointing_navigation_enabled = not self._direct_walking_enabled and os.environ.get(
             "G1_POINTING_NAVIGATION", "1"
         ).strip().lower() in ("1", "true", "yes", "on")
         self._controller_locomotion = ControllerLocomotion()
@@ -776,7 +792,7 @@ class HumanoidExample(BaseSample):
             # The final physics clamp must match the selected input profile.
             # Point navigation only walks forward; sticks also need reverse and
             # sidesteps. Sharing its zero caps silently discarded those inputs.
-            if self._controller_walking_enabled:
+            if self._direct_walking_enabled:
                 self._max_forward_speed = 0.65
                 self._max_backward_speed = 0.35
                 self._max_lateral_speed = 0.30
@@ -787,6 +803,10 @@ class HumanoidExample(BaseSample):
                 self._max_backward_speed = 0.0
                 self._max_lateral_speed = 0.0
             # Leave the spawn aisle clear while retaining the practice table.
+            self._work_surface_placements = ((2.0, -2.0, 90.0), *self._work_surface_placements[1:])
+        if self._gaze_walking_enabled:
+            # Preview and movement show the same shelf layout. Only the robot's
+            # fixed-base/physical-controller configuration differs.
             self._work_surface_placements = ((2.0, -2.0, 90.0), *self._work_surface_placements[1:])
         # Finger teleoperation
         self._finger_control_enabled = True
@@ -922,9 +942,9 @@ class HumanoidExample(BaseSample):
         stage = omni.usd.get_context().get_stage()
         if self._grasp_mode == "physical":
             self._create_contact_grasp_objects()
-            if self._gesture_locomotion_enabled:
+            if self._gesture_locomotion_enabled or self._gaze_walking_enabled:
                 self._create_floor_cartons()
-                create_packages = create_shelf_packages if self._controller_walking_enabled else create_tall_packages
+                create_packages = create_shelf_packages if self._direct_walking_enabled else create_tall_packages
                 self._spawned_sample_box_paths.extend(
                     create_packages(stage, self._sample_box_root_path, first_index=len(self._spawned_sample_box_paths))
                 )
@@ -1506,6 +1526,7 @@ class HumanoidExample(BaseSample):
         self._timeline_stopped = True
         self._timeline_navigation_sub = None
         self._navigation_scene.cleanup()
+        self._gaze_controls.cleanup()
         self._reset_webcam_tracking(close_receiver=True)
         # BaseSample creates the new stage before invoking scene cleanup. Detach
         # first so application frames during that await cannot use the old stage.
@@ -1521,6 +1542,7 @@ class HumanoidExample(BaseSample):
         self._timeline_stopped = True
         self._timeline_navigation_sub = None
         self._navigation_scene.cleanup()
+        self._gaze_controls.cleanup()
         self._reset_webcam_tracking(close_receiver=True)
         self._head_camera_update_sub = None
         # Also make an already queued frame callback return before using USD or
@@ -1589,12 +1611,14 @@ class HumanoidExample(BaseSample):
             hand_variant=self._g1_hand_variant,
             locomotion=self._g1_locomotion,
             physical_locomotion=self._gesture_locomotion_enabled,
-            arm_gravity_compensation=self._controller_walking_enabled,
+            arm_gravity_compensation=self._direct_walking_enabled and self._gesture_locomotion_enabled,
         )
         self._prepare_physical_grasping()
         self._create_arm_control_rig()
         self._create_head_camera()
         self._create_xr_anchor()
+        if self._gaze_walking_enabled:
+            self._gaze_controls.create(omni.usd.get_context().get_stage())
         if self._gesture_locomotion_enabled and self._pointing_navigation_enabled:
             self._navigation_scene.create(omni.usd.get_context().get_stage())
 
@@ -1749,6 +1773,7 @@ class HumanoidExample(BaseSample):
         self._timeline_navigation_sub = None
         self._timeline_stopped = True
         self._navigation_scene.cleanup()
+        self._gaze_controls.cleanup()
         self._head_camera_update_sub = None
         self._reset_teleoperation_state()
         self._operator_head_visual.clear()
@@ -2230,6 +2255,14 @@ class HumanoidExample(BaseSample):
 
     def _pause_faulted_articulation(self) -> None:
         """Pause invalid physics; pressing Play alone must not bypass the latch."""
+        if self._gaze_walking_enabled:
+            for command in (self._base_command, self._controller_command, self._keyboard_command):
+                if command is not None:
+                    command[:] = 0.0
+            try:
+                self._gaze_controls.update({"state": "fault"}, eye_valid=False)
+            except Exception as error:
+                self._log_physics_step_error("gaze fault display", error)
         try:
             timeline = import_module("omni.timeline").get_timeline_interface()
             if timeline.is_playing():
@@ -2612,7 +2645,10 @@ class HumanoidExample(BaseSample):
         stage = omni.usd.get_context().get_stage()
         camera = UsdGeom.Camera.Define(stage, self._head_camera_path)
         self._head_camera_active_near_clip_m = self._head_camera_near_clip_m
-        camera.CreateFocalLengthAttr().Set(16.0)
+        # Gaze panels need about 90 degrees of horizontal desktop coverage.
+        # Native XR retains the headset's own projection; only this USD camera
+        # and its recorded images use the wider lens in the gaze profile.
+        camera.CreateFocalLengthAttr().Set(10.5 if self._gaze_walking_enabled else 16.0)
         camera.CreateClippingRangeAttr().Set(Gf.Vec2f(self._head_camera_near_clip_m, 1000.0))
 
         xformable = UsdGeom.Xformable(camera.GetPrim())
@@ -3807,9 +3843,10 @@ class HumanoidExample(BaseSample):
             self._restore_controller_xr_tools()
             raise RuntimeError("Cannot resolve the active XR profile's tools-layout setting")
         key = prefix.rstrip("/") + "/tools/layout"
+        owns_tools = self._controller_walking_enabled or self._gaze_walking_enabled
         saved = self._controller_xr_tools_setting
         if saved is not None and saved[1] == key and saved[0].get(key) == saved[3]:
-            if self._controller_walking_enabled and self.g1 is not None:
+            if owns_tools and self.g1 is not None:
                 return
             self._restore_controller_xr_tools()
             return
@@ -3827,7 +3864,7 @@ class HumanoidExample(BaseSample):
             else:
                 settings.set(key, recovered)
             previous = recovered
-        if not self._controller_walking_enabled or self.g1 is None:
+        if not owns_tools or self.g1 is None:
             return
         layout = self._encode_controller_xr_tools_layout(previous)
         self._controller_xr_tools_setting = (settings, key, previous, layout)
@@ -3925,6 +3962,8 @@ class HumanoidExample(BaseSample):
         # shadows retain the complete robot.
         self._operator_head_visual.set_first_person_hidden(False)
         self._head_camera_transform_op.Set(camera_pose)
+        if self._gaze_walking_enabled:
+            self._gaze_controls.set_camera_pose(camera_pose)
         camera = UsdGeom.Camera(self._head_camera_transform_op.GetAttr().GetPrim())
         clipping = camera.GetClippingRangeAttr().Get()
         if abs(float(clipping[0]) - self._head_camera_active_near_clip_m) > 1e-7:
@@ -4326,6 +4365,7 @@ class HumanoidExample(BaseSample):
             "robot_locomotion": getattr(self.g1, "_locomotion", self._g1_locomotion),
             "gesture_walking_enabled": self._gesture_locomotion_enabled,
             "locomotion_input": self._locomotion_input_mode,
+            "gaze_locomotion": self.gaze_locomotion_status() if self._gaze_walking_enabled else None,
             "optical_hands_only": self._optical_hands_only,
             "pointing_navigation_enabled": self._pointing_navigation_enabled,
             "walking_policy": getattr(self.g1, "walking_policy_name", None),
@@ -7593,6 +7633,21 @@ class HumanoidExample(BaseSample):
 
     def _reset_gesture_locomotion(self) -> None:
         """Require a new deliberate gesture after resets, recentering, or faults."""
+        # Stopping must precede optional visual/scene updates, which can fail
+        # during stage teardown without leaving a previous command alive.
+        if self._gesture_locomotion_enabled or self._gaze_walking_enabled:
+            for name in ("_base_command", "_keyboard_command", "_controller_command"):
+                command = getattr(self, name, None)
+                if command is not None:
+                    command[:] = 0.0
+        self._gaze_locomotion.reset()
+        self._gaze_eye_valid = False
+        if self._gaze_walking_enabled:
+            status = {"state": "fault"} if self._articulation_health_fault else self._gaze_locomotion.command
+            try:
+                self._gaze_controls.update(status, eye_valid=False)
+            except Exception as error:
+                self._log_physics_step_error("gaze reset display", error)
         self._controller_locomotion.reset()
         self._controller_walking_status = self._controller_locomotion.command.detail
         self._gesture_command = self._locomotion_gesture.reset()
@@ -7615,11 +7670,6 @@ class HumanoidExample(BaseSample):
         self._walking_support_samples = None
         self._walking_support_anchor = None
         self._walking_runaway_time = 0.0
-        if self._gesture_locomotion_enabled:
-            for name in ("_base_command", "_keyboard_command", "_controller_command"):
-                command = getattr(self, name, None)
-                if command is not None:
-                    command[:] = 0.0
 
     @staticmethod
     def _read_gesture_physical_pose(device, name: str, flags: int = 2):
@@ -7988,6 +8038,114 @@ class HumanoidExample(BaseSample):
             self._base_command[:] = 0.0
         self._navigation_scene.hide()
 
+    def _read_gaze_locomotion_config(self) -> GazeLocomotionConfig:
+        """Validate optional gaze settings against the direct walking actor's caps."""
+        if not self._gaze_walking_enabled:
+            return GazeLocomotionConfig()
+        preview = os.environ.get("G1_GAZE_PREVIEW", "1").strip().lower()
+        if preview not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
+            raise ValueError("G1_GAZE_PREVIEW must be a boolean (1 for preview, 0 for movement)")
+        config = GazeLocomotionConfig(
+            dwell_s=float(os.environ.get("G1_GAZE_DWELL_S", "0.7")),
+            distance_m=float(os.environ.get("G1_GAZE_DISTANCE_M", "0.20")),
+            turn_degrees=float(os.environ.get("G1_GAZE_TURN_DEG", "10")),
+            forward_speed=float(os.environ.get("G1_GAZE_FORWARD_SPEED", "0.20")),
+            backward_speed=float(os.environ.get("G1_GAZE_BACKWARD_SPEED", "0.15")),
+            yaw_speed=float(os.environ.get("G1_GAZE_YAW_SPEED", "0.25")),
+            preview=preview in ("1", "true", "yes", "on"),
+            max_gaze_gap_s=float(os.environ.get("G1_GAZE_MAX_GAP_S", "0.25")),
+        )
+        if config.forward_speed > 0.65 or config.backward_speed > 0.35 or config.yaw_speed > 0.40:
+            raise ValueError("Gaze speeds exceed supported caps: forward 0.65 m/s, back 0.35 m/s, yaw 0.40 rad/s")
+        return config
+
+    def _update_gaze_locomotion(self, dt: float) -> None:
+        """Select with fresh eyes, then finish a short base action independently of hands.
+
+        The panels use the last displayed camera transform, matching their USD
+        geometry. Query tracked eye descriptors directly rather than reusing the
+        visualization's 50 Hz snapshot or its optional head-forward fallback.
+        Motion uses live root pose and velocity; neither grip state nor a held
+        box gates it. Normal balance/contact/arm guards remain downstream.
+        """
+        tracker = self._eye_gaze_tracker
+        ray = tracker.read_control_ray() if tracker is not None else None
+        self._gaze_eye_valid = ray is not None
+        target = None
+        if ray is not None:
+            target = self._gaze_controls.hit_test(*ray)
+            if target is not None:
+                visible_target = self._gaze_controls.hit_test(
+                    *ray, max_distance=tracker.control_occlusion_distance(*ray)
+                )
+                # An occluded button is not a verified look-away. Otherwise a
+                # box passing over a held button would silently rearm it.
+                target = visible_target if visible_target is not None else "occluded"
+        base = self._get_g1_base_pose_for_arms()
+        pose = (float(base[0][0]), float(base[0][1]), float(base[1])) if base is not None else None
+        linear_speed = yaw_speed = 0.0
+        if not self._gaze_locomotion.config.preview:
+            linear, angular = self.g1.robot.get_velocities()
+            linear = tuple(float(value) for value in self._first_pose_value(linear))
+            angular = tuple(float(value) for value in self._first_pose_value(angular))
+            if len(linear) != 3 or len(angular) != 3:
+                raise ValueError("Invalid gaze walking velocity dimensions")
+            linear_speed, yaw_speed = math.hypot(linear[0], linear[1]), abs(angular[2])
+        command = self._gaze_locomotion.update(
+            target=target,
+            eye_valid=self._gaze_eye_valid,
+            now_s=time.perf_counter(),
+            dt=dt,
+            pose=pose,
+            linear_speed_m_s=linear_speed,
+            yaw_speed_rad_s=yaw_speed,
+            ready=(
+                self._physics_ready
+                and not self._timeline_stopped
+                and self._articulation_health_fault is None
+                and tracker is not None
+                and tracker.control_session_ready()
+            ),
+        )
+        self._keyboard_command[:] = 0.0
+        self._locomotion_brake = False
+        for axis, value in enumerate(command.velocity):
+            self._controller_command[axis] = value
+        if not any(command.velocity):
+            # Bypass smoothing at completion, cancellation and preview. Zero
+            # command still uses the actor's physical standing/balance control.
+            self._base_command[:] = 0.0
+        self._navigation_scene.hide()
+        self._gaze_controls.update(command, eye_valid=self._gaze_eye_valid)
+        if command.activated_action is not None:
+            carb.log_info(f"Gaze walking: {command.detail} (selection {command.activation_count})")
+        if command.state == "fault":
+            self._articulation_health_fault = f"gaze walking: {command.detail}"
+            self._pause_faulted_articulation()
+
+    def gaze_locomotion_status(self) -> dict:
+        """Report gaze selection and motion without changing input or simulation state."""
+        command = self._gaze_locomotion.command
+        config = self._gaze_locomotion.config
+        return {
+            "enabled": self._gaze_walking_enabled,
+            "preview": config.preview,
+            "eye_valid": self._gaze_eye_valid,
+            "state": command.state,
+            "target": command.target,
+            "progress": command.progress,
+            "last_action": command.last_action,
+            "activation_count": command.activation_count,
+            "requested_velocity": command.velocity,
+            "detail": command.detail,
+            "dwell_s": config.dwell_s,
+            "distance_m": config.distance_m,
+            "turn_degrees": config.turn_degrees,
+            "back_enabled": config.backward_speed > 0.0,
+            "robot_locomotion": self._g1_locomotion,
+            "fault": self._articulation_health_fault,
+        }
+
     def _update_controller_command(self, dt: float) -> None:
         """Poll XR actions and recording inputs, optionally allowing locomotion.
 
@@ -8000,6 +8158,19 @@ class HumanoidExample(BaseSample):
 
         # Cleared before the inputs are polled; any of them may raise it this step.
         self._locomotion_brake = self._keyboard_brake
+        if self._gaze_walking_enabled:
+            self._update_headset_gait_command(dt)  # Record head motion without using it as intent.
+            try:
+                self._update_gaze_locomotion(dt)
+            except Exception as error:
+                self._articulation_health_fault = f"gaze walking input failed: {error}"
+                self._log_physics_step_error("gaze walking input", error)
+                try:
+                    self._reset_gesture_locomotion()
+                except Exception as reset_error:
+                    self._log_physics_step_error("gaze fault reset", reset_error)
+                self._pause_faulted_articulation()
+            return
         if self._controller_walking_enabled:
             self._update_headset_gait_command(dt)  # Preserve the recording clock, never its walking intent.
             self._update_joystick_locomotion()
@@ -8067,7 +8238,7 @@ class HumanoidExample(BaseSample):
             return True
         if self._keyboard_command is None:
             return True
-        if self._gesture_locomotion_enabled:
+        if self._gesture_locomotion_enabled or self._gaze_walking_enabled:
             self._keyboard_command[:] = 0.0
             self._pressed_keys.clear()
             self._keyboard_brake = False
@@ -8128,6 +8299,7 @@ class HumanoidExample(BaseSample):
         self._timeline_navigation_sub = None
         self._timeline_stopped = True
         self._navigation_scene.cleanup()
+        self._gaze_controls.cleanup()
         self._head_camera_update_sub = None
         self._reset_teleoperation_state()
         self._operator_head_visual.clear()

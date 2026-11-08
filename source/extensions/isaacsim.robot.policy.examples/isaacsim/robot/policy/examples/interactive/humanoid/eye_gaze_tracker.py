@@ -155,6 +155,60 @@ class EyeGazeTracker:
 
     # ------------------------------------------------------------------ pose
 
+    def control_session_ready(self) -> bool:
+        """Distinguish eye loss from XR session/display teardown.
+
+        A blink may not interrupt an accepted step, but disabling the XR profile
+        or losing its display/viewport cancels locomotion through readiness.
+        """
+        try:
+            profile = self._xr_core.get_current_profile()
+            return bool(
+                profile is not None
+                and profile.get_name()
+                and profile.is_enabled()
+                and self._xr_core.is_xr_enabled()
+                and self._xr_core.is_xr_display_enabled()
+                and self._xr_core.is_xr_viewport_enabled()
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
+    def read_control_ray(self) -> tuple[Gf.Vec3d, Gf.Vec3d] | None:
+        """Read currently tracked combined eye input for deliberate controls.
+
+        Unlike the optional visualization, this never substitutes head direction
+        or an inferred VALID-only pose. Query the device on every control tick;
+        ``latest`` is a throttled scene-raycast snapshot, not an input latch.
+        The installed XR descriptor has no capture timestamp or confidence, so
+        the caller can bound polling gaps but cannot prove hardware sample age.
+
+        Returns:
+            Stage-space origin and unit direction, or None without tracked eyes.
+        """
+        try:
+            if not self.control_session_ready():
+                return None
+            for handle in self.UNIFIED_DEVICES:
+                device = self._xr_core.get_input_device(handle)
+                for name in self.POSE_CANDIDATES:
+                    pose = read_world_pose(device, name, tracked_only=True)
+                    ray = self._matrix_to_ray(pose) if pose is not None else None
+                    if ray is not None:
+                        return ray
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+        return None
+
+    def control_occlusion_distance(self, origin: Gf.Vec3d, direction: Gf.Vec3d) -> float | None:
+        """Return the nearest non-robot collider for a control ray.
+
+        A failed query blocks selection instead of allowing a hidden button
+        through an object. Nonphysical gaze panels are absent from the query.
+        """
+        _, distance, _ = self._raycast(origin, direction)
+        return 0.0 if self._raycast_error_logged else distance
+
     def _describe_input_devices(self) -> str:
         """One-line inventory of the session's XR input devices for the missing-eye-device warning.
 

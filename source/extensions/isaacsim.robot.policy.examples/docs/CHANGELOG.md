@@ -1,5 +1,24 @@
 # Changelog
 
+## HumanoidBehavior eye-gaze walking — 2026-11-08
+
+- Add four stereo scene buttons with a configurable 0.7-second dwell and progress
+  rings. Selection requires tracked combined-eye input; head-forward visualization
+  cannot activate controls. Each selection fires once and requires look-away to rearm.
+- Add anchored preview and explicit physical movement profiles through
+  `tools/launch_gaze_walking.bat`. Short measured steps/turns use the existing
+  GR00T controller, preserve independent arm/finger updates, and stop automatically.
+- Retain busy-command rejection, bounded motion/settling, and existing physics
+  health guards. XR shutdown cancels motion; eye loss cancels only unfinished dwell.
+  Occluded buttons cannot rearm, and UI failures cannot prevent stopping.
+- Add deterministic control, real-USD panel, input ownership, and launcher tests,
+  plus an isolated actual-scene validator with synthetic eye descriptors. Hardware
+  gaze usability and loaded two-hand carrying remain separate acceptance checks.
+- Pass 965 standalone humanoid regressions, including both optical hands changing
+  arm targets and finger curls during an active gaze command. Actual-scene preview
+  holds the base fixed; all four unloaded physical actions reach their measured
+  targets and stop. Side-panel rendering is checked from the robot camera.
+
 ## HumanoidBehavior documentation cleanup — 2026-11-04
 
 This fork-only documentation update does not change the extension version,

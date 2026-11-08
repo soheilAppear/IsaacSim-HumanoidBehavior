@@ -19,6 +19,9 @@ Launch configuration selects the control profile before the scene is built:
   translation and turning and controller or optical input for manipulation.
 - Experimental pointing navigation uses an optical left-index ray to select a
   checked destination and requires the pointing gesture to remain active.
+- Eye-gaze buttons use tracked combined-eye input to select one short step or
+  turn with a progress-ring dwell. Preview anchors the base; explicit movement
+  mode uses the existing walking policy and finishes without continued fixation.
 
 These profiles share the arm, finger, contact, and recording pipeline; switching
 between anchored and walking configurations requires rebuilding the scene. They
@@ -36,8 +39,12 @@ the current default and is not evidence that a physical grasp succeeds.
 The robot-mounted view follows tracked head orientation through a neck/eye arc
 and comfort stabilization. Room-scale headset translation does not reposition
 the robot-head view. The visible operator-head proxy and near-camera visibility
-handling are visual features, not extra physical robot joints. Eye-gaze tracking
-and its source-labelled fallback remain independent of locomotion.
+handling are visual features, not extra physical robot joints. The eye-gaze
+visualization retains its source-labelled head-forward fallback, but only the
+currently tracked combined-eye source can activate the gaze walking controls.
+Side-panel meshes appear in the headset through ordinary stereo scene rendering.
+The gaze profile widens the desktop camera lens to fit them; native headset
+projection remains owned by the runtime.
 
 The recorder writes robot state/commands, hand inputs, gaze, object states, and
 RGB images. CSV output uses an asynchronous writer with bounded queues; RGB image
@@ -71,7 +78,7 @@ Play alone does not clear a latched fault. Scene reset is the recovery boundary.
 
 The `interactive.humanoid` package contains this fork's implementation boundaries:
 
-- Input and view helpers normalize XR poses, interpret controller/pointing inputs,
+- Input and view helpers normalize XR poses, interpret controller/pointing/gaze inputs,
   and compute the robot-head camera and visual head transforms.
 - Contact and grasp helpers interpret PhysX evidence and constrain requested
   movement; they do not replace physical contact with a successful-grasp label.

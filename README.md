@@ -36,6 +36,10 @@ launcher selects physical walking. The compatibility name
 navigation remains available through the explicit setup below. EEG acquisition
 and the webcam preview are separate host applications and do not drive the robot.
 
+The experimental [gaze-button profile](#gaze-buttons-with-both-hands-free) leaves
+both optical hands available for manipulation. It starts with an anchored preview;
+physical walking requires a separate launch with `--move`.
+
 Use [the operating guide](HUMANOID_VR_CONTROL.md) for launch and controls,
 [the developer guide](docs/humanoid-control.md#runtime-and-data-flow) for the control
 path, and [the validation record](docs/validation/isaac-sim-6.1.md) for dated evidence.
@@ -57,6 +61,7 @@ launcher is an alias for it.
 | Pickup | Experimental physical contact grasping with bounded finger targets; objects must be held by fingers and friction, with no hand-to-object fixed joint |
 | Camera | Stabilized robot frame follows travel; HMD orientation rotates the view and its eye offset around the measured neck. Torso roll/pitch, gait bob, and real-world head translation are excluded |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
+| Gaze buttons | Experimental eye-only dwell controls request one short forward/backward movement or left/right turn; anchored preview is the default, and both optical hands remain free |
 | Physics | CPU: 100 Hz stationary / 200 Hz walking; rendering requests 90 Hz stationary / 60 Hz walking |
 | Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
 | Experimental walking | Left stick moves forward/backward/sideways; right stick turns. Grip/trigger manipulation and optical hands remain available; controller face buttons/stick clicks are unused, and blue pointing navigation is disabled but retained |
@@ -402,6 +407,49 @@ before curling and opposing side contact before lift. Its live grip-only trial
 failed the palm-contact gate and stopped before curling or lifting.
 See the [validation record](docs/validation/isaac-sim-6.1.md#shelf-pickup-attempts-remain-failed).
 
+### Gaze buttons with both hands free
+
+Start with the anchored preview to check actual eye tracking and button placement:
+
+```powershell
+.\tools\launch_gaze_walking.bat
+```
+
+Open **Window → Examples → Robotics Examples → Policy → Humanoid**, click **LOAD**,
+then **Play**. If the headset view is not already active, open **Window → Rendering
+→ XR**. Use **Virtual Reality Experience** and **OpenXR** if they are not already
+selected, preserve the working runtime settings, and click **Start XR**.
+Side panels follow the view while leaving its center free. Look
+between the buttons first to arm selection, then hold a button for **0.7 seconds**
+as its dwell ring fills. Preview confirms the selection without moving the base.
+Both hands use optical tracking; controllers and the webcam do not substitute for
+them in this profile. Eye tracking must be enabled, calibrated and exposed by the
+VR runtime; a head-direction fallback cannot activate these controls.
+
+After checking the preview, exit Isaac and relaunch for physical movement:
+
+```powershell
+.\tools\launch_gaze_walking.bat --move
+```
+
+Load the scene again, click **Play**, and **Start XR** if needed. A completed dwell
+requests one **0.20 m forward/backward movement** or **10° left/right turn**, then
+you can look back at the box. The
+default requested speeds are **0.20 m/s forward, 0.15 m/s backward, and 0.25 rad/s
+turning**. Additional selections are ignored while busy; look away from all buttons
+before selecting again. Tracking loss clears unfinished dwell; an already accepted
+movement continues to its measured stop without requiring continued fixation.
+These are experimental motion targets, not guaranteed achieved distances or speeds;
+physical braking, gait and contact affect the outcome. Live gaze usability, shelf
+pickup and loaded transport still require validation. See the
+[operating guide](HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free) for
+configuration and the preview/movement distinction.
+
+The actual-scene synthetic-eye checks passed anchored preview and all four
+physical movements with measured stopping. The unloaded run achieved about
+20 cm forward, 22 cm backward, and 11-degree turns; arm/finger updates continued.
+Live eye tracking and carrying a gripped box are separate acceptance checks.
+
 ### Retained pointing navigation
 
 **Walking is opt-in; the normal launcher remains stationary.** The pretrained
@@ -409,7 +457,7 @@ NVlabs GR00T-WholeBodyControl G1 balance/walk models command 15 leg/waist joints
 while both arms and fingers retain teleoperation. These are upstream models;
 this repository does not train them. This is GR00T **Whole-Body Control**, rather
 than the GR00T foundation/VLA model. The following describes the retained
-**left-hand pointing** profile, which is disabled in both walking launchers.
+**left-hand pointing** profile, which is disabled in the controller and gaze launchers.
 To select it explicitly for development, close Isaac and run:
 
 ```powershell
