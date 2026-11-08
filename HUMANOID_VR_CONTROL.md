@@ -435,19 +435,23 @@ gate and stopped before finger closure or lift; successful pickup remains unveri
 
 This experimental profile uses genuine tracked eye gaze for four controls:
 **Forward**, **Back**, **Turn left**, and **Turn right**. The panels follow the
-camera on either side, leaving the central box/manipulation view free. Optical
-hands continue to control arms and fingers independently; no hand gesture or
-controller button activates walking. Head direction can still serve the existing
+camera on either side, leaving the central box/manipulation view free. Each hand
+prefers optical input and can fall back to its current controller: grip controls
+arm motion, and trigger controls finger closure independently. Controller sticks
+can override gaze movement. Head direction can still serve the existing
 gaze visualization/recording fallback, but it cannot select a locomotion button.
 
 1. Enable and calibrate eye tracking in the headset, allow the streaming/runtime
    eye-tracking permissions, and connect the supported XR runtime. Extension
    availability or a visible red ray alone does not establish actual eye input.
-2. Launch the anchored preview:
+2. Save your work and close Isaac. From this repository's root directory, launch
+   the anchored preview:
 
    ```powershell
    $env:G1_GAZE_MODE = 'hold'
    $env:G1_GAZE_DWELL_S = '0'
+   $env:G1_OPTICAL_HANDS_ONLY = '0'
+   $env:G1_GAZE_CONTROLLER_OVERRIDE = '1'
    .\tools\launch_gaze_walking.bat
    ```
 
@@ -458,11 +462,11 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
    under **General → Selected Output Plugin**, use **OpenXR**, if these are not
    already selected. Preserve the working OpenXR runtime settings and click
    **Start XR**.
-4. Put down the controllers and show both hands to the headset. Look between the
+4. Use bare optical hands or controllers for manipulation. Look between the
    buttons first to arm selection. Look at one button to activate it **immediately**,
    then keep looking to sustain the request. **Even a quick glance activates it.**
    The default zero delay has no dwell ring. Look away to end the request.
-   Preview reports the interaction while the base remains anchored.
+   Preview reports the interaction while the base remains anchored, even for sticks.
    Look away from every button before trying another selection.
    **NO EYE** means Isaac is not receiving a currently tracked eye pose. Check
    headset calibration, eye-tracking permission and runtime transport before
@@ -472,6 +476,8 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
    ```powershell
    $env:G1_GAZE_MODE = 'hold'
    $env:G1_GAZE_DWELL_S = '0'
+   $env:G1_OPTICAL_HANDS_ONLY = '0'
+   $env:G1_GAZE_CONTROLLER_OVERRIDE = '1'
    .\tools\launch_gaze_walking.bat --move
    ```
 
@@ -483,11 +489,11 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
    anchor changes the robot topology: do not try to turn preview into movement
    by toggling an attribute in a running scene.
 
-The default **hold** mode starts on the first valid button sample after arming,
+When gaze owns movement, the default **hold** mode starts on the first valid button sample after arming,
 without a fixation timer, and continues only while
 you keep looking at the same button. **Look away to stop**, including when looking
 back at the box. Changing buttons or lost/invalid eye tracking also requests a
-stop. Hold requests use **0.40 m/s forward**, **0.25 m/s backward**, or **0.40 rad/s
+stop. Hold requests use **0.60 m/s forward**, **0.35 m/s backward**, or **0.40 rad/s
 yaw**; turning continues while the turn button is held. Physical braking and
 contacts determine actual travel and stopping distance. A stop request is not an
 instant physical stop. A valid look outside all buttons rearms the next selection
@@ -498,7 +504,28 @@ unintended-motion guards can still pause a detected fault. XR shutdown, Pause/St
 cancel selection/movement and require rearming. Use the example's **Reset** after
 a latched simulation fault; Play alone does not clear it.
 
-The reported automatic pause came from the duplicate four-second pelvis-settling
+To use the controller override, center both sticks while both controllers are
+tracked. **Left-stick up/down** requests forward/backward movement at the configured
+gaze speeds (hold defaults **0.60/0.35 m/s**); **left-stick left/right** requests
+sidestepping up to **0.30 m/s**; **right-stick left/right** requests turning (hold
+default **0.40 rad/s**). Diagonal translation input is normalized before applying
+directional speed limits. `launch_controller_walking.bat` retains its existing
+speeds and layout. Sticks
+take priority and cancel the gaze action, including an accepted step. Releasing
+the sticks or losing their tracking requests zero. Gaze then requires a fresh
+valid look outside every button before another selection; a held button cannot
+restart movement automatically. The HUD shows **STICKS**, **STICK PREVIEW**, or
+**CENTER STICKS** as appropriate. Neutral mixed optical/controller input does not
+block gaze; both tracked controllers are required only for stick movement.
+
+Optical/controller hand selection is independent per hand. With a controller,
+hold grip to move/rotate its arm; releasing grip holds the arm's measured pose.
+The index trigger closes the fingers independently of grip, so it can remain held
+while the arm is stationary. A partial or lost optical skeleton does not make stale
+controller values valid; fallback requires a current controller input. The existing
+stopping feedback and motion/fall guards remain active and unchanged.
+
+An earlier automatic pause came from the duplicate four-second pelvis-settling
 check during arm movement, with a near-zero movement command and an upright robot.
 Removing that hold-mode check leaves the existing support-aware motion guard active.
 
@@ -510,11 +537,23 @@ Heading control sends commands through the existing walking controller; it does
 not pin or teleport the robot or alter the camera to conceal drift. It does not
 correct sideways displacement or guarantee a straight path.
 
+A stopping-feedback candidate applies only in physical **hold** mode. After one
+simulation second of normal braking, it fixes a reference from the foot centroid
+and sole heading. Deadbands and smoothing limit corrections for sustained support
+travel; the walking actor receives at most **0.20 m/s** of planar correction and
+**0.30 rad/s** of yaw correction. This does not set the root pose or apply external
+forces, change the operator-command buffers, or change hand control. Motion guards
+still evaluate the raw movement request. It passed the recorded-input replay
+described under [walking pauses near a box](#walking-pauses-after-looking-away-near-a-box);
+that replay did not reproduce the original late-contact fault or establish
+sustained loaded carrying.
+
 To retain the previous bounded interaction, set `$env:G1_GAZE_MODE='step'` and
 `$env:G1_GAZE_DWELL_S='0.7'` before launching, replacing the zero delay above.
 The **0.7-second dwell** requests one **0.20 m** forward/backward move
 or **10°** left/right turn. That accepted step continues to its measured stop after
 looking away or losing eye tracking; tracking loss still cancels unfinished dwell.
+A controller-stick override cancels the accepted step.
 Holding a button cannot repeat a step. New selections are ignored while busy, and
 look-away is required before another dwell. Set `$env:G1_GAZE_MODE='hold'` and
 `$env:G1_GAZE_DWELL_S='0'` to return to immediate continuous movement in the next launch.
@@ -523,37 +562,72 @@ Every launcher invocation resets preview to on, including when an old terminal
 contains `G1_GAZE_PREVIEW=0`. Only a **first** `--move` enables motion; a first
 `--preview` explicitly selects the default. Remaining arguments pass to the base
 Isaac launcher, for example `--move --xr-verbose`. The launcher fixes
-`G1_LOCOMOTION_INPUT=gaze`, `G1_POINTING_NAVIGATION=0`, and
-`G1_OPTICAL_HANDS_ONLY=1`; controller manipulation and webcam robot input stay off.
+`G1_LOCOMOTION_INPUT=gaze` and `G1_POINTING_NAVIGATION=0`; webcam robot input stays
+off. It defaults `G1_OPTICAL_HANDS_ONLY=0` and `G1_GAZE_CONTROLLER_OVERRIDE=1` only
+when unset, preserving independent optical-only or eye-only opt-outs.
 The launcher defaults `G1_GAZE_MODE` to `hold` only when it is unset; it preserves
 an explicit `step` override. Supply settings in the environment before starting Isaac:
 
 | Environment variable | Default | Meaning |
 |---|---:|---|
 | `G1_GAZE_MODE` | `hold` | Continue while looking; `step` selects one bounded movement |
+| `G1_GAZE_CONTROLLER_OVERRIDE` | `1` | Allow tracked controller sticks to override gaze; `0` keeps eye-only locomotion |
+| `G1_OPTICAL_HANDS_ONLY` | `0` | Allow controller grip/trigger fallback for manipulation; `1` requires optical hands |
 | `G1_GAZE_DWELL_S` | `0` in hold; `0.7` in step | Activation delay in wall seconds; zero activates on the first valid button hit |
 | `G1_GAZE_DISTANCE_M` | `0.20` | Step mode only: requested forward/backward distance, in meters |
 | `G1_GAZE_TURN_DEG` | `10` | Step mode only: requested turn angle, in degrees |
-| `G1_GAZE_FORWARD_SPEED` | `0.40` in hold; `0.20` in step | Requested forward speed, in m/s |
-| `G1_GAZE_BACKWARD_SPEED` | `0.25` in hold; `0.15` in step | Requested backward speed, in m/s |
+| `G1_GAZE_FORWARD_SPEED` | `0.60` in hold; `0.20` in step | Requested forward speed, in m/s |
+| `G1_GAZE_BACKWARD_SPEED` | `0.35` in hold; `0.15` in step | Requested backward speed, in m/s |
 | `G1_GAZE_YAW_SPEED` | `0.40` in hold; `0.25` in step | Requested turn speed, in rad/s |
 | `G1_GAZE_HEADING_HOLD` | `1` | Enable heading feedback during Forward/Back; `0` disables it |
 | `G1_GAZE_HEADING_GAIN` | `3.0` | Corrective yaw speed per radian of heading error, in 1/s |
 | `G1_GAZE_HEADING_MAX_YAW_SPEED` | `0.15` | Maximum heading-correction magnitude, in rad/s |
+| `G1_GAZE_STOP_FEEDBACK` | `1` | Enable the stopping-feedback candidate in physical hold mode; `0` disables it for diagnostics |
 
 Set `G1_GAZE_BACKWARD_SPEED=0` to disable backward selection. The default enables
 it. A positive override such as `$env:G1_GAZE_DWELL_S='0.7'` restores a fixation
 delay and progress ring; explicit overrides are preserved in either mode.
-The launch examples explicitly set the delay to `0` to clear an older terminal's override.
+The launch examples explicitly select zero delay and hybrid input to clear older
+terminal overrides. Set `G1_GAZE_CONTROLLER_OVERRIDE=0` for eye-only locomotion;
+set `G1_OPTICAL_HANDS_ONLY=1` independently for optical-only manipulation.
 Immediate activation removes the selection wait, while the physical command
 still uses the existing acceleration and stopping behavior. Dwell uses wall time;
 requested speeds and settling use simulation time, so
 slow simulation changes actual movement per wall second. Explicit speed overrides
 are preserved in both modes.
 
-The faster defaults passed **1,001 offline regressions** and were configured in
-the live instance with no health fault or callback error observed at that check.
-Dedicated physical validation at the higher speeds, including carrying, remains pending.
+**The new speeds and hybrid sidestepping passed 1,062 offline regressions in
+13.613 seconds and hybrid preview/movement checks.** Preview had zero sampled root
+translation/rotation with **1,348** normal input, arm and finger updates. Movement
+ran **18.40 simulation seconds / 3,680 callbacks**: 0.30 m/s left/right requests
+produced **17.11/18.64 cm** in 1.215 seconds, diagonals progressed along both expected
+axes, and normalized caps plus neutral/tracking-loss interlocks passed. The final
+two-second root-position envelope was **1.44 mm**, peak planar speed **0.00370 m/s**;
+final raw/filtered requests were zero and native speed **0.000718 m/s**.
+Production controller-grip arm IK and trigger-driven fingers ran with synthetic XR
+devices and real simulation physics.
+
+The separate faster gaze check passed all four directions with **5,967** normal
+input/arm/finger callbacks. Mean held forward/backward speeds were **0.355/0.275 m/s**
+against **0.60/0.35 m/s** requests; left/right means were **0.310/0.358 rad/s** against
+**0.40 rad/s** requests. Back held for 2.530 simulation seconds and the other actions
+for 1.525–1.530 seconds. Every release was observed for five simulation seconds,
+with maximum final planar speed **0.003395 m/s**. Forward's simulated eye loss
+cleared requested and filtered commands; the other actions ended on look-away.
+The run used synthetic eyes, neutral arms and no payload. Forward's cross-track
+offset at the end of its hold was **4.70 cm** despite heading feedback, so this
+does not establish perfectly straight travel. These checks do not validate hardware
+or optical tracking, real wall-time input gaps or loaded grasping.
+**The following results predate hybrid input.**
+
+The faster defaults initially passed **1,001 offline regressions**. With the
+stopping-feedback update, all four physical directions passed two-second holds
+and five-second release observations at the requested **0.40/0.25 m/s** and
+**0.40 rad/s** settings, without faults. Mean held speeds were **0.252 m/s forward**,
+**0.178 m/s backward**, **0.320 rad/s left** and **0.374 rad/s right**; final native
+planar speed was at most **0.0011 m/s** in each case. This used the real gaze
+geometry with synthetic eyes and neutral arms; Forward's simulated eye loss
+cleared intent. Hardware gaze and higher-speed loaded carrying remain unvalidated.
 
 The directional speed settings remain bounded by the existing physical profile's
 0.65 m/s forward, 0.35 m/s backward and 0.40 rad/s yaw caps. The source supports
@@ -1747,9 +1821,49 @@ height while following headset pitch/roll and relative heading. **B** resets hea
 it never stores headset tilt as a horizon offset and does not
 change eye-gaze calibration. The left stick cannot enable room-scale camera motion.
 
+### Walking pauses after looking away near a box
+
+The later recorded pause occurred **9.54 simulation seconds after release**, while
+the robot remained upright and box contact was active. Over the guard's window,
+net root speed was **0.182 m/s**, foot-centroid speed **0.183 m/s**, and stance
+excursion **0.151 m**. This was the support-aware residual-motion guard, separate
+from the removed four-second gaze settling timer; the recording does not establish
+whether arm contact or the walking controller caused the drift.
+
+With zero movement requested, the translation guard allows **1.5 simulation
+seconds** for braking, then requires a **0.4-second** sustained-overspeed interval,
+net root and support speeds both above **0.10 m/s**, and support excursion above
+**0.15 m**. The independent fast-runaway guard still pauses root speed above
+**0.8 m/s** or yaw speed above **1.2 rad/s** sustained for **0.25 seconds**.
+These thresholds remain unchanged.
+
+Inspect `EX.gaze_locomotion_status()['last_motion_fault']` for the retained reason,
+commands, signed velocities, support measurements and bounded contact summary.
+It survives Pause/Reset on the same example; cached arm/contact and actor fields
+are labeled as preceding the failing callback. Use **Reset** after a latched fault;
+Play alone does not clear it.
+
+The revised stopping feedback passed **1,019 offline regressions in 12.521 seconds**
+and a **68.75-simulation-second** recorded-input replay over **13,750 normal physics
+ticks**. In the final two seconds, the root-position envelope was **3.09 mm** and
+foot-centroid envelope below **0.001 mm**; final native root speed was **0.00438 m/s**.
+At 1.4 seconds after a zero request, net support travel was **2.15 cm**, versus
+**7.18 cm** in the baseline; both runs passed. The candidate replay included earlier
+bimanual support of Box 21 and a **1.87 cm** lift, but late contacts were only with
+the shelf. It did not demonstrate sustained payload support or reproduce the
+original late Box 20 fault at 9.54 seconds after release. These results do not
+establish that the original contact failure is fixed. The separate higher-speed
+four-direction check passed with synthetic eyes and neutral arms, as described
+above; it does not extend the payload evidence.
+
+Inspect `EX.gaze_locomotion_status()['stop_feedback']` for the correction and
+effective actor input. The `behavior.csv` fields `cmd_forward`, `cmd_lateral` and
+`cmd_yaw` record the ordinary filtered request and omit this separate corrective
+actor input; a zero value there does not establish that the actor received zero.
+
 ### Touching the table bends the robot or pauses physics
 
-The latest sudden stops correspond to measured joint-speed faults, including a real
+Earlier table-contact stops corresponded to measured joint-speed faults, including a real
 ring-joint observation above 108 rad/s. They are not merely missing hand input or a
 false pause flag. Earlier fixed-pose table passes did not exercise repeated close/open
 motion. The selected fix adds a **1e-4 kg·m²** armature floor before Play and passed

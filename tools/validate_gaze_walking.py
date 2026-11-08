@@ -12,7 +12,13 @@ Run with the installed Isaac Sim python.bat and this checkout's entire extension
 
 Use a fresh invocation with --mode move for the physical GR00T scene. Add
 --control-mode hold to verify sustained fixation and look-away/eye-loss stops;
---control-mode step retains the original short-action checks. The full
+--control-mode step retains the original short-action checks. The hold
+profile defaults to .60/.35 m/s forward/reverse and .40 rad/s yaw. The first
+back action holds for --back-hold-s 2.5 to create actual clearance; the remaining
+actions use --hold-s 1.5 to retain the one-meter measured travel bound. Explicit
+--forward-speed, --backward-speed and --yaw-speed overrides are supported;
+step defaults retain .20/.15 m/s and .25 rad/s. Larger/longer requests still
+must pass real corridor clearance and the one-meter measured travel bound. The
 production warehouse, camera, panel hit tests, occlusion checks, actor, motor loop,
 and health guards remain active. No robot root/joint state or payload is injected.
 The eye descriptors are synthetic, and only the synchronous gaze-selection call
@@ -268,15 +274,21 @@ async def _validate(example: object, module: object, report: dict, output: Path,
         while fixture["elapsed_s"] + 1e-9 < end:
             await advance()
 
-    def preflight(action: str, start: dict) -> None:
+    def preflight(action: str, start: dict) -> float | None:
+        """Require real floor/corridor space for requested travel plus braking margin."""
         if preview:
-            return
+            return None
         scene = example._navigation_scene
         position = start["position_m"]
         if action.startswith("turn_"):
             _require(scene.is_route_corner_clear(position), "Turn fixture lacks body/stepping clearance")
+            return None
         else:
-            distance = max(0.60, example._gaze_locomotion.config.distance_m + 0.35)
+            config = example._gaze_locomotion.config
+            speed = config.forward_speed if action == "forward" else config.backward_speed
+            duration = report["back_hold_s"] if action == "back" else report["hold_s"]
+            requested_distance = speed * (duration + 0.15) if hold else config.distance_m
+            distance = max(0.60, requested_distance + 0.35)
             sign = 1 if action == "forward" else -1
             yaw = start["yaw_rad"]
             goal = (position[0] + sign * distance * math.cos(yaw), position[1] + sign * distance * math.sin(yaw), 0.0)
@@ -284,6 +296,7 @@ async def _validate(example: object, module: object, report: dict, output: Path,
             _require(
                 scene.is_path_clear(position, goal), "Translation fixture corridor is blocked: " + str(scene.last_error)
             )
+            return distance
 
     try:
         if saved_tracker is not None:
@@ -303,8 +316,11 @@ async def _validate(example: object, module: object, report: dict, output: Path,
         for action in ACTIONS:
             report["phase"] = action
             entry = {"action": action, "passed": False, "start": snapshot()}
+            entry["requested_hold_s"] = (
+                (report["back_hold_s"] if action == "back" else report["hold_s"]) if hold else None
+            )
             report["actions"].append(entry)
-            preflight(action, entry["start"])
+            entry["preflight_translation_clearance_m"] = preflight(action, entry["start"])
             baseline_count = example._gaze_locomotion.command.activation_count
             fixture["target"] = None
             await wait_sim(0.10)
@@ -331,7 +347,7 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                 "Selection did not fire exactly once at the configured delay; inspect occlusion/tracking status",
             )
             entry["activated"] = snapshot()
-            await wait_sim(3.0 if hold else 1.0)
+            await wait_sim(entry["requested_hold_s"] if hold else 1.0)
             _require(
                 example._gaze_locomotion.command.activation_count == baseline_count + 1,
                 "Holding a gaze button repeated the action",
@@ -442,6 +458,30 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                         "turn_left": held_yaw,
                         "turn_right": -held_yaw,
                     }[action]
+                    config = example._gaze_locomotion.config
+                    requested_speed = {
+                        "forward": config.forward_speed,
+                        "back": config.backward_speed,
+                        "turn_left": config.yaw_speed,
+                        "turn_right": config.yaw_speed,
+                    }[action]
+                    duration = held["control_sim_time_s"] - start["control_sim_time_s"]
+                    _require(duration > 0, "Held interval has no measured simulation duration")
+                    entry["held_duration_s"] = duration
+                    entry["requested_speed"] = requested_speed
+                    entry["speed_units"] = "m/s" if action in ("forward", "back") else "rad/s"
+                    entry["mean_signed_held_speed"] = entry["signed_held_progress"] / duration
+                    entry["mean_speed_request_ratio"] = entry["mean_signed_held_speed"] / requested_speed
+                    _require(
+                        entry["mean_speed_request_ratio"] > 0.20,
+                        "Mean signed physical progress was below 20 percent of the requested speed",
+                    )
+                    entry["final_native_speed_m_s"] = math.hypot(*end["linear_velocity_m_s"][:2])
+                    entry["final_native_yaw_speed_rad_s"] = abs(end["angular_velocity_rad_s"][2])
+                    _require(
+                        entry["final_native_speed_m_s"] <= 0.10 and entry["final_native_yaw_speed_rad_s"] <= 0.25,
+                        "Physical residual speed remained above the fixture stop limits after five seconds",
+                    )
                     old_goal = (
                         example._gaze_locomotion.config.distance_m
                         if action in ("forward", "back")
@@ -542,12 +582,31 @@ def main() -> int:
     parser.add_argument("--dwell-s", type=float, default=None, help="Default: 0 for hold, 0.7 for step")
     parser.add_argument("--heading-hold", choices=("0", "1"), default="1", help="Use 0 for an unassisted baseline")
     parser.add_argument("--heading-gain", type=float, default=3.0, help="Heading feedback gain in 1/s")
+    parser.add_argument("--forward-speed", type=float, default=None, help="m/s; default hold .60, step .20")
+    parser.add_argument("--backward-speed", type=float, default=None, help="m/s; default hold .35, step .15")
+    parser.add_argument("--yaw-speed", type=float, default=None, help="rad/s; default hold .40, step .25")
+    parser.add_argument(
+        "--hold-s", type=float, default=1.5, help="Hold-mode forward/turn fixation after activation, in sim seconds"
+    )
+    parser.add_argument("--back-hold-s", type=float, default=2.5, help="Initial hold-mode back fixation for clearance")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--load-timeout", type=float, default=180.0)
     parser.add_argument("--test-timeout", type=float, default=180.0)
     args, kit_args = parser.parse_known_args()
     if args.dwell_s is None:
         args.dwell_s = 0.0 if args.control_mode == "hold" else 0.7
+    defaults = (0.60, 0.35, 0.40) if args.control_mode == "hold" else (0.20, 0.15, 0.25)
+    for name, default, lower, upper in zip(
+        ("forward_speed", "backward_speed", "yaw_speed"), defaults, (0.01, 0.0, 0.01), (0.65, 0.35, 0.40)
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, default)
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0 or value < lower or value > upper:
+            parser.error(f"--{name.replace('_', '-')} must be positive and within [{lower}, {upper}]")
+    for name in ("hold_s", "back_hold_s"):
+        if not math.isfinite(getattr(args, name)) or not 0 < getattr(args, name) <= 10:
+            parser.error(f"--{name.replace('_', '-')} must be finite and in (0, 10]")
     if not math.isfinite(args.dwell_s) or not 0 <= args.dwell_s <= 5:
         parser.error("--dwell-s must be finite and between 0 and 5")
     if not math.isfinite(args.heading_gain) or not 0 <= args.heading_gain <= 5:
@@ -567,6 +626,11 @@ def main() -> int:
         "dwell_s": args.dwell_s,
         "heading_hold": args.heading_hold == "1",
         "heading_gain": args.heading_gain,
+        "forward_speed": args.forward_speed,
+        "backward_speed": args.backward_speed,
+        "yaw_speed": args.yaw_speed,
+        "hold_s": args.hold_s,
+        "back_hold_s": args.back_hold_s,
         "run_id": run_id,
         "fixture": "Real warehouse/robot/actor; synthetic tracked eye descriptors; no injected hands or payload",
         "dwell_clock": "Synthetic monotonic selection time advanced by physics dt only inside gaze update",
@@ -597,9 +661,9 @@ def main() -> int:
             "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.15",
             "G1_GAZE_DISTANCE_M": "0.20",
             "G1_GAZE_TURN_DEG": "10",
-            "G1_GAZE_FORWARD_SPEED": "0.20",
-            "G1_GAZE_BACKWARD_SPEED": "0.15",
-            "G1_GAZE_YAW_SPEED": "0.25",
+            "G1_GAZE_FORWARD_SPEED": str(args.forward_speed),
+            "G1_GAZE_BACKWARD_SPEED": str(args.backward_speed),
+            "G1_GAZE_YAW_SPEED": str(args.yaw_speed),
             "G1_GAZE_MAX_GAP_S": "0.25",
         }
     )

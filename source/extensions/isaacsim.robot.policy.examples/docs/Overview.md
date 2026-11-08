@@ -29,6 +29,15 @@ Launch configuration selects the control profile before the scene is built:
   Forward/Back capture the robot's initial heading and request bounded corrective
   yaw through the walking controller while active. Turns are unchanged; heading
   feedback does not regulate sideways drift or guarantee a straight path.
+  The gaze launcher defaults to hybrid controller fallback: after centered-stick
+  arming, left Y requests forward/reverse, left X sidestepping and right X turning.
+  Hold defaults request 0.60 m/s forward, 0.35 m/s reverse and 0.40 rad/s turning,
+  with sidestepping capped at 0.30 m/s and normalized diagonal translation input.
+  Sticks cancel gaze, including an accepted step; release/loss requests zero and
+  gaze needs a fresh look outside all buttons before reactivation. Preview remains
+  anchored even with sticks. Explicit `G1_GAZE_CONTROLLER_OVERRIDE=0` retains
+  eye-only locomotion, and `G1_OPTICAL_HANDS_ONLY=1` independently disables controller
+  manipulation. Both overrides are preserved by the launcher.
 
 These profiles share the arm, finger, contact, and recording pipeline; switching
 between anchored and walking configurations requires rebuilding the scene. They
@@ -42,6 +51,13 @@ thumb opposition drive the six Inspire actuators per hand. Current physical
 grasping uses opposing contacts and friction, with contact-limited finger targets
 and arm obstruction guards. The retained assisted fixed-joint pickup path is not
 the current default and is not evidence that a physical grasp succeeds.
+
+In physical hold mode, bounded foot-support feedback can correct sustained stance
+travel after a one-second braking interval, through the walking actor. It does not
+set root pose or apply external forces. Existing motion/fall guards still inspect
+raw movement intent. `G1_GAZE_STOP_FEEDBACK=0` disables it for diagnostics; the
+recorded ordinary command fields omit its separate actor correction, exposed by
+`gaze_locomotion_status()['stop_feedback']`.
 
 The robot-mounted view follows tracked head orientation through a neck/eye arc
 and comfort stabilization. Room-scale headset translation does not reposition
@@ -67,6 +83,17 @@ hand tracking when the XR instance starts. The headset and active runtime must a
 provide valid landmarks. A connected headset or controller poses alone do not prove
 that optical tracking is available. Generated-input replay checks do not verify
 headset tracking quality, occlusion recovery, or walking with a carried payload.
+The latest higher-speed/lateral hybrid revision passed 1,062 offline regressions
+in 13.613 seconds and hybrid preview/movement checks. Preview had zero sampled base
+movement; lateral and diagonal movement, input handover and release interlocks passed.
+These checks used synthetic devices with real simulation physics and production
+controller-grip arm IK/trigger-driven fingers. The separate faster gaze check passed
+all four directions with five-second release observations. Mean forward/backward
+speeds were 0.355/0.275 m/s against 0.60/0.35 m/s requests; nominal speed is not
+guaranteed achieved speed or straight travel. The gaze run used synthetic eyes,
+neutral arms and no payload. These checks do not validate hardware/optical tracking,
+real wall-time input gaps or loaded grasping. A recorded-input stopping replay did not reproduce the original late box
+contact fault, so it does not establish that failure is resolved.
 
 **{class}`G1TeleopRobot <isaacsim.robot.policy.examples.robots.G1TeleopRobot>`
 provides the robot articulation and joint-control interface used by the example.**

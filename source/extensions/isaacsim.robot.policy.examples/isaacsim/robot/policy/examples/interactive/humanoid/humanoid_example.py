@@ -36,6 +36,7 @@ import math
 import os
 import random
 import time
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,6 +62,7 @@ from isaacsim.robot.policy.examples.interactive.humanoid.factory_route import Fa
 from isaacsim.robot.policy.examples.interactive.humanoid.gaze_controls_scene import GazeControlsScene
 from isaacsim.robot.policy.examples.interactive.humanoid.gaze_locomotion import GazeLocomotion, GazeLocomotionConfig
 from isaacsim.robot.policy.examples.interactive.humanoid.grasp_controller import ContactGraspController
+from isaacsim.robot.policy.examples.interactive.humanoid.hybrid_locomotion import HybridLocomotion
 from isaacsim.robot.policy.examples.interactive.humanoid.material_highlights import MaterialHighlights
 from isaacsim.robot.policy.examples.interactive.humanoid.operator_head import (
     RobotHeadVisual,
@@ -71,6 +73,7 @@ from isaacsim.robot.policy.examples.interactive.humanoid.point_gaze_navigation i
 from isaacsim.robot.policy.examples.interactive.humanoid.point_navigation_scene import PointNavigationScene
 from isaacsim.robot.policy.examples.interactive.humanoid.point_ray import PointRayFilter
 from isaacsim.robot.policy.examples.interactive.humanoid.tall_packages import create_tall_packages
+from isaacsim.robot.policy.examples.interactive.humanoid.walking_stop import WalkingStopRegulator
 from isaacsim.robot.policy.examples.interactive.humanoid.webcam_tracking import WebcamCalibration, WebcamReceiver
 from isaacsim.robot.policy.examples.interactive.humanoid.xr_pose import read_world_pose, smoothing_alpha
 from isaacsim.robot.policy.examples.interactive.utils import (
@@ -235,6 +238,28 @@ class HumanoidExample(BaseSample):
             raise ValueError("G1_LOCOMOTION_INPUT must be pointing, controller, or gaze")
         self._gaze_walking_enabled = self._locomotion_input_mode == "gaze"
         self._gaze_locomotion = GazeLocomotion(self._read_gaze_locomotion_config())
+        controller_override = os.environ.get("G1_GAZE_CONTROLLER_OVERRIDE", "1").strip().lower()
+        if controller_override not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
+            raise ValueError("G1_GAZE_CONTROLLER_OVERRIDE must be a boolean")
+        self._gaze_controller_override_enabled = self._gaze_walking_enabled and controller_override in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._hybrid_locomotion = HybridLocomotion()
+        self._hybrid_controller_velocity = (0.0, 0.0, 0.0)
+        self._hybrid_display_status = None
+        stop_feedback = os.environ.get("G1_GAZE_STOP_FEEDBACK", "1").strip().lower()
+        if stop_feedback not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
+            raise ValueError("G1_GAZE_STOP_FEEDBACK must be a boolean")
+        self._walking_stop_feedback_enabled = (
+            self._gaze_walking_enabled
+            and not self._gaze_locomotion.config.preview
+            and self._gaze_locomotion.config.control_mode == "hold"
+            and stop_feedback in ("1", "true", "yes", "on")
+        )
+        self._walking_stop_regulator = WalkingStopRegulator()
         self._gaze_controls = GazeControlsScene(
             backwards_enabled=self._gaze_locomotion.config.backward_speed > 0.0,
             preview=self._gaze_locomotion.config.preview,
@@ -787,6 +812,8 @@ class HumanoidExample(BaseSample):
         self._walking_support_samples = None
         self._walking_support_anchor = None
         self._walking_runaway_time = 0.0
+        # Retain the last guard failure through Pause/Reset for later inspection.
+        self._last_walking_fault_snapshot = None
         if self._gesture_locomotion_enabled:
             self._g1_locomotion = "policy"
             # The final physics clamp must match the selected input profile.
@@ -2159,12 +2186,16 @@ class HumanoidExample(BaseSample):
                 return
             self._smooth_base_command(target_command, dt)
             try:
+                # Supervise the operator's request above, never the braking
+                # correction. Otherwise correction would reset the zero-intent
+                # drift timer and conceal a controller that still cannot stop.
+                actor_command = self._walking_stop_command(dt, target_command)
                 if getattr(self.g1, "uses_explicit_body_efforts", False):
                     # Arm IK below replaces these targets before simulation. Write
                     # the complete body torque buffer once, after the arm update.
-                    self.g1.forward(dt, self._base_command, defer_body_efforts=True)
+                    self.g1.forward(dt, actor_command, defer_body_efforts=True)
                 else:
-                    self.g1.forward(dt, self._base_command)
+                    self.g1.forward(dt, actor_command)
             except Exception as error:
                 self._articulation_health_fault = f"locomotion controller failed: {error}"
                 self._log_physics_step_error("locomotion controller", error)
@@ -2469,6 +2500,8 @@ class HumanoidExample(BaseSample):
             self._walking_support_anchor = None
             self._walking_runaway_time = 0.0
             return True
+        linear = angular = values = mean = support_motion = None
+        speed = yaw_speed = net_speed = net_yaw_speed = None
         try:
             linear, angular = self.g1.robot.get_velocities()
             linear = [float(v) for v in self._first_pose_value(linear)]
@@ -2544,6 +2577,84 @@ class HumanoidExample(BaseSample):
                 reason += f"; stance excursion {support_motion[2]:.3f} m, {support_motion[3]:.3f} rad"
         except Exception as error:
             reason = f"could not validate walking velocity: {type(error).__name__}: {error}"
+        # Capture before resetting commands, support windows and the stop regulator.
+        # Root/support measurements describe the failing tick. Cached actor,
+        # arm and contact fields precede this tick's updates. Diagnostics never
+        # alter guards or reread physics/contact state.
+        from copy import deepcopy
+        from itertools import islice
+
+        def finite_number(value):
+            """Represent missing or invalid diagnostic numbers as JSON null."""
+            try:
+                number = float(value)
+                return number if math.isfinite(number) else None
+            except Exception:
+                return None
+
+        def finite_vector(value, limit):
+            """Copy at most the expected number of vector components."""
+            try:
+                return [finite_number(component) for component in islice(value, limit)]
+            except Exception:
+                return None
+
+        snapshot = {
+            "reason": reason,
+            "stop_elapsed_s": finite_number(self._walking_stop_elapsed),
+            "raw_command": finite_vector(command, 3),
+            "linear_velocity_world_m_s": finite_vector(linear, 3),
+            "angular_velocity_world_rad_s": finite_vector(angular, 3),
+            "root_speed_m_s": finite_number(speed),
+            "root_yaw_speed_rad_s": finite_number(yaw_speed),
+            "net_velocity_world_xy_yaw": finite_vector(mean, 3),
+            "net_speed_m_s": finite_number(net_speed) if mean is not None else None,
+            "net_yaw_speed_rad_s": finite_number(net_yaw_speed) if mean is not None else None,
+            "support_motion": finite_vector(support_motion, 4),
+            "support_anchor_world_xy_yaw": finite_vector(self._walking_support_anchor, 3),
+            "runaway_time_s": finite_number(self._walking_runaway_time),
+            "residual_motion_time_s": finite_number(self._walking_residual_motion_time),
+            "residual_window_s": finite_number(self._walking_residual_window_time),
+            "arm_sources": {},
+            "contact_health": str(getattr(self, "_contact_health", "unknown")),
+            "cached_teleop_state_phase": "previous_callback",
+            "contact_summary": {},
+            "previous_actor_status": None,
+        }
+        self._last_walking_fault_snapshot = snapshot
+        try:
+            snapshot["arm_sources"] = {
+                side: str(source)[:64]
+                for side in ("left", "right")
+                if (source := self._arm_input_sources.get(side)) is not None
+            }
+            regulator = getattr(self, "_walking_stop_regulator", None)
+            if regulator is not None:
+                snapshot["previous_actor_status"] = deepcopy(regulator.status)
+            for side in ("left", "right"):
+                contacts = self._latest_hand_contacts.get(side, ())
+                sampled = list(islice(contacts, 64))
+                forces = [finite_number(getattr(contact, "normal_force_n", None)) for contact in sampled]
+                finite_forces = [force for force in forces if force is not None]
+                snapshot["contact_summary"][side] = {
+                    "count": len(contacts),
+                    "sampled_count": len(sampled),
+                    "sampled_normal_force_sum_n": finite_number(sum(finite_forces)),
+                    "sampled_normal_force_max_n": max(finite_forces, default=None),
+                    "arm_contact_limited": bool(self._arm_contact_limited.get(side, False)),
+                    "examples": [
+                        {
+                            "object_path": str(getattr(contact, "object_path", ""))[:512],
+                            "normal_force_n": force,
+                            "normal_world": finite_vector(getattr(contact, "normal_world", None), 3),
+                            "eligible_for_grasp": bool(getattr(contact, "eligible_for_grasp", False)),
+                        }
+                        for contact, force in zip(sampled[:8], forces[:8])
+                    ],
+                }
+        except Exception as error:
+            # Optional diagnostic fields cannot prevent command reset and pause.
+            snapshot["diagnostic_error"] = f"{type(error).__name__}: {error}"
         self._articulation_health_fault = reason
         self._reset_gesture_locomotion()
         self._log_physics_step_error("walking velocity", RuntimeError(reason + ". Use Reset before continuing."))
@@ -4046,6 +4157,35 @@ class HumanoidExample(BaseSample):
             )
             alpha = 1.0 - math.exp(-max(float(dt), 0.0) / (release if decelerating else attack))
             current[axis] = current[axis] + (target_axis - current[axis]) * alpha
+
+    def _walking_stop_command(self, dt: float, operator_command):
+        """Correct sustained foot drift through actor inputs, without moving the root.
+
+        Keep the operator and filtered command buffers unchanged for recording,
+        gaze release semantics and the independent motion watchdog. Balance still
+        uses the learned legs/waist actor; hands and contact-limited arms retain
+        their normal update order. Preview, step mode and other input profiles
+        bypass this. Measured feet separate stance travel from normal pelvis sway.
+        """
+        if not self._walking_stop_feedback_enabled:
+            self._walking_stop_regulator.reset()
+            return self._base_command
+        requested = tuple(float(value) for value in operator_command)
+        filtered = tuple(float(value) for value in self._base_command)
+        support_pose, yaw = (0.0, 0.0, 0.0), 0.0
+        if not any(abs(value) > 1e-6 for value in requested):
+            base = self._get_g1_base_pose_for_arms()
+            if base is None:
+                raise RuntimeError("Cannot validate walking stop feedback without a measured base pose")
+            support_pose, yaw = self._read_walking_support_pose(), float(base[1])
+        return self._walking_stop_regulator.update(
+            dt=dt,
+            operator_command=requested,
+            filtered_command=filtered,
+            support_pose=support_pose,
+            yaw=yaw,
+            ready=self._physics_ready and self._articulation_health_fault is None,
+        )
 
     def _get_xr_input_device(self, handle: str):
         """Return an OpenXR input device such as /user/hand/left, if XR is active."""
@@ -7641,6 +7781,10 @@ class HumanoidExample(BaseSample):
                 if command is not None:
                     command[:] = 0.0
         self._gaze_locomotion.reset()
+        self._hybrid_locomotion.reset()
+        self._hybrid_controller_velocity = (0.0, 0.0, 0.0)
+        self._hybrid_display_status = None
+        self._walking_stop_regulator.reset()
         self._gaze_eye_valid = False
         if self._gaze_walking_enabled:
             status = {"state": "fault"} if self._articulation_health_fault else self._gaze_locomotion.command
@@ -8038,6 +8182,89 @@ class HumanoidExample(BaseSample):
             self._base_command[:] = 0.0
         self._navigation_scene.hide()
 
+    def _update_hybrid_locomotion(self, dt: float) -> None:
+        """Select gaze or sticks without mixing commands or reserving either hand.
+
+        Left Y walks forward/backward, left X sidesteps and right X turns. Both
+        tracked sticks must first be centered. Diagonal intent is normalized
+        before directional speed scaling by the existing stick controller. A source
+        handoff clears the old filtered command and cancels gaze selection, but
+        never resets the physical stop watchdog. The gaze selector itself enforces
+        fresh look-away after sticks release or disconnect. Preview always emits
+        zero physical intent, including while its controller preview is active.
+        """
+        devices = tuple(self._get_xr_input_device(f"/user/hand/{side}") for side in ("left", "right"))
+        present = any(self._get_hand_input_kind(device) == "controller" for device in devices)
+        left, right = (self._read_tracked_controller_stick(device) for device in devices)
+        tracker = self._eye_gaze_tracker
+        ready = bool(
+            self._physics_ready
+            and not self._timeline_stopped
+            and self._articulation_health_fault is None
+            and tracker is not None
+            and tracker.control_session_ready()
+        )
+        command = self._controller_locomotion.update(
+            left_x=left[1],
+            left_y=left[2],
+            right_x=right[1],
+            left_valid=bool(ready and left[0]),
+            right_valid=bool(ready and right[0]),
+            now_s=time.perf_counter(),
+        )
+        sticks_deflected = bool(
+            (left[0] and max(abs(left[1]), abs(left[2])) > self._controller_locomotion.deadzone)
+            or (right[0] and abs(right[1]) > self._controller_locomotion.deadzone)
+        )
+        selection = self._hybrid_locomotion.select(
+            controller_present=present,
+            controller_valid=bool(ready and left[0] and right[0]),
+            controller_state=command.state,
+            sticks_deflected=sticks_deflected,
+        )
+        self._controller_walking_status = command.detail
+        config = self._gaze_locomotion.config
+        forward, lateral, yaw = command.velocity
+        self._hybrid_controller_velocity = (
+            forward * (config.forward_speed if forward >= 0 else config.backward_speed),
+            lateral * 0.30,  # Same supported sidestep cap in preview and physical mode.
+            yaw * config.yaw_speed,
+        )
+        self._hybrid_display_status = None
+        if selection.reset_gaze:
+            # Do not let a previous forward command survive a stick turn, and
+            # do not let an accepted gaze step continue after controller takeover.
+            self._base_command[:] = 0.0
+        self._update_gaze_locomotion(dt)
+        if self._articulation_health_fault is not None:
+            self._controller_command[:] = 0.0
+            self._base_command[:] = 0.0
+            return
+        if selection.source == "gaze":
+            return
+        requested = self._hybrid_controller_velocity if selection.source == "controller" else (0.0, 0.0, 0.0)
+        if config.preview:
+            requested = (0.0, 0.0, 0.0)
+        self._keyboard_command[:] = 0.0
+        self._locomotion_brake = False
+        for axis, value in enumerate(requested):
+            self._controller_command[axis] = value
+        if selection.stop_immediately or config.preview or not any(requested):
+            self._base_command[:] = 0.0
+        state = "controller_preview" if config.preview else "controller"
+        if selection.source != "controller":
+            state = "controller_wait" if sticks_deflected else "awaiting_release"
+        self._hybrid_display_status = {
+            "state": state,
+            "target": None,
+            "progress": 0.0,
+            "last_action": None,
+            "detail": selection.detail,
+            "stop_immediately": selection.stop_immediately,
+        }
+        self._navigation_scene.hide()
+        self._gaze_controls.update(self._hybrid_display_status, eye_valid=self._gaze_eye_valid)
+
     def _read_gaze_locomotion_config(self) -> GazeLocomotionConfig:
         """Validate optional gaze settings against the direct walking actor's caps."""
         if not self._gaze_walking_enabled:
@@ -8054,9 +8281,9 @@ class HumanoidExample(BaseSample):
             dwell_s=float(os.environ.get("G1_GAZE_DWELL_S", "0" if control_mode == "hold" else "0.7")),
             distance_m=float(os.environ.get("G1_GAZE_DISTANCE_M", "0.20")),
             turn_degrees=float(os.environ.get("G1_GAZE_TURN_DEG", "10")),
-            forward_speed=float(os.environ.get("G1_GAZE_FORWARD_SPEED", "0.40" if control_mode == "hold" else "0.20")),
+            forward_speed=float(os.environ.get("G1_GAZE_FORWARD_SPEED", "0.60" if control_mode == "hold" else "0.20")),
             backward_speed=float(
-                os.environ.get("G1_GAZE_BACKWARD_SPEED", "0.25" if control_mode == "hold" else "0.15")
+                os.environ.get("G1_GAZE_BACKWARD_SPEED", "0.35" if control_mode == "hold" else "0.15")
             ),
             yaw_speed=float(os.environ.get("G1_GAZE_YAW_SPEED", "0.40" if control_mode == "hold" else "0.25")),
             preview=preview in ("1", "true", "yes", "on"),
@@ -8078,6 +8305,7 @@ class HumanoidExample(BaseSample):
         Motion uses live root pose and velocity; neither grip state nor a held
         box gates it. Normal balance/contact/arm guards remain downstream.
         """
+        inhibited = self._gaze_controller_override_enabled and self._hybrid_locomotion.selection.source != "gaze"
         tracker = self._eye_gaze_tracker
         ray = tracker.read_control_ray() if tracker is not None else None
         self._gaze_eye_valid = ray is not None
@@ -8110,13 +8338,22 @@ class HumanoidExample(BaseSample):
             linear_speed_m_s=linear_speed,
             yaw_speed_rad_s=yaw_speed,
             ready=(
-                self._physics_ready
+                not inhibited
+                and self._physics_ready
                 and not self._timeline_stopped
                 and self._articulation_health_fault is None
                 and tracker is not None
                 and tracker.control_session_ready()
             ),
         )
+        if inhibited:
+            # Update selection/readiness once, but let the owning input publish
+            # buffers and HUD once. Re-zeroing the filter here on every stick tick
+            # would prevent acceleration; publishing both states would flicker.
+            if command.state == "fault":
+                self._articulation_health_fault = f"gaze walking: {command.detail}"
+                self._pause_faulted_articulation()
+            return
         self._keyboard_command[:] = 0.0
         self._locomotion_brake = False
         for axis, value in enumerate(command.velocity):
@@ -8143,7 +8380,7 @@ class HumanoidExample(BaseSample):
         """Report gaze selection and motion without changing input or simulation state."""
         command = self._gaze_locomotion.command
         config = self._gaze_locomotion.config
-        return {
+        status = {
             "enabled": self._gaze_walking_enabled,
             "preview": config.preview,
             "control_mode": config.control_mode,
@@ -8158,6 +8395,9 @@ class HumanoidExample(BaseSample):
             "detail": command.detail,
             "last_stop": self._gaze_locomotion.stop_diagnostics,
             "heading": self._gaze_locomotion.heading_status,
+            "stop_feedback_enabled": self._walking_stop_feedback_enabled,
+            "stop_feedback": self._walking_stop_regulator.status,
+            "last_motion_fault": deepcopy(getattr(self, "_last_walking_fault_snapshot", None)),
             "dwell_s": config.dwell_s,
             "forward_speed": config.forward_speed,
             "backward_speed": config.backward_speed,
@@ -8168,6 +8408,26 @@ class HumanoidExample(BaseSample):
             "robot_locomotion": self._g1_locomotion,
             "fault": self._articulation_health_fault,
         }
+        if self._gaze_controller_override_enabled:
+            selection = self._hybrid_locomotion.selection
+            status["hybrid"] = {
+                "source": selection.source,
+                "detail": selection.detail,
+                "reset_gaze": selection.reset_gaze,
+                "stop_immediately": selection.stop_immediately,
+            }
+            status["controller_requested_velocity"] = self._hybrid_controller_velocity
+            status["gaze_requested_velocity"] = command.velocity
+            if self._hybrid_display_status is not None:
+                status.update(self._hybrid_display_status)
+            status["requested_velocity"] = (
+                tuple(float(value) for value in self._controller_command)
+                if self._controller_command is not None
+                else (0.0, 0.0, 0.0)
+            )
+        else:
+            status["hybrid"] = None
+        return status
 
     def _update_controller_command(self, dt: float) -> None:
         """Poll XR actions and recording inputs, optionally allowing locomotion.
@@ -8184,7 +8444,10 @@ class HumanoidExample(BaseSample):
         if self._gaze_walking_enabled:
             self._update_headset_gait_command(dt)  # Record head motion without using it as intent.
             try:
-                self._update_gaze_locomotion(dt)
+                if self._gaze_controller_override_enabled:
+                    self._update_hybrid_locomotion(dt)
+                else:
+                    self._update_gaze_locomotion(dt)
             except Exception as error:
                 self._articulation_health_fault = f"gaze walking input failed: {error}"
                 self._log_physics_step_error("gaze walking input", error)

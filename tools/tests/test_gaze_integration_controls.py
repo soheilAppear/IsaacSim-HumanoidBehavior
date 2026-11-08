@@ -41,6 +41,7 @@ class TestGazeIntegrationControls(unittest.TestCase):
             "G1_GESTURE_WALKING": "1",
             "G1_GAZE_PREVIEW": "1" if preview else "0",
             "G1_GAZE_MODE": "step",
+            "G1_GAZE_CONTROLLER_OVERRIDE": "0",
             "G1_GAZE_DWELL_S": "0.3",
             "G1_GAZE_DISTANCE_M": "0.2",
             "G1_GAZE_TURN_DEG": "10",
@@ -354,7 +355,7 @@ class TestGazeIntegrationControls(unittest.TestCase):
         self.assertEqual(self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion.config.dwell_s, 0.3)
 
     def test_hold_speed_defaults_are_faster_and_step_speeds_stay_bounded(self) -> None:
-        for mode, speeds in (("hold", (0.4, 0.25, 0.4)), ("step", (0.2, 0.15, 0.25))):
+        for mode, speeds in (("hold", (0.6, 0.35, 0.4)), ("step", (0.2, 0.15, 0.25))):
             with self.subTest(mode=mode), patch.dict(os.environ, {"G1_LOCOMOTION_INPUT": "gaze", "G1_GAZE_MODE": mode}):
                 for name in ("G1_GAZE_FORWARD_SPEED", "G1_GAZE_BACKWARD_SPEED", "G1_GAZE_YAW_SPEED"):
                     os.environ.pop(name, None)
@@ -386,6 +387,53 @@ class TestGazeIntegrationControls(unittest.TestCase):
         example = self.make_example(G1_GAZE_HEADING_HOLD="0")
         self.assertTrue(example._gaze_walking_enabled)
         self.assertFalse(example._gaze_locomotion.config.heading_hold)
+
+    def test_stop_feedback_uses_separate_actor_command_and_preserves_zero_intent(self) -> None:
+        hold = self.make_example(G1_GAZE_MODE="hold")
+        self.ex._gaze_locomotion = hold._gaze_locomotion
+        self.ex._walking_stop_feedback_enabled = hold._walking_stop_feedback_enabled
+        self.ex.g1.robot.get_velocities.return_value = (Array([[0.18, -0.08, 0.0]]), Array([[0.0, 0.0, 0.15]]))
+        self.ex._get_g1_base_pose_for_arms.return_value = (Gf.Vec3d(0, 0, 0.8), 0.0)
+        self.ex._read_walking_support_pose = Mock(side_effect=[(i * 0.009, -i * 0.004, i * 0.0075) for i in range(40)])
+        for _ in range(30):
+            actor = self.ex._walking_stop_command(0.05, self.ex._controller_command)
+        self.assertLess(actor[0], 0)
+        self.assertGreater(actor[1], 0)
+        self.assertLess(actor[2], 0)
+        for command in (self.ex._controller_command, self.ex._base_command):
+            np.testing.assert_array_equal(command.numpy(), (0, 0, 0))
+        self.assertTrue(self.ex.gaze_locomotion_status()["stop_feedback"]["active"])
+        self.ex._reset_gesture_locomotion()
+        self.assertFalse(self.ex._walking_stop_regulator.status["active"])
+
+    def test_nonzero_braking_correction_cannot_reset_zero_intent_motion_guard(self) -> None:
+        hold = self.make_example(G1_GAZE_MODE="hold")
+        self.ex._gaze_locomotion = hold._gaze_locomotion
+        self.ex._walking_stop_feedback_enabled = hold._walking_stop_feedback_enabled
+        self.ex.g1.robot.get_velocities.return_value = (Array([[0.18, 0.0, 0.0]]), Array([[0.0, 0.0, 0.0]]))
+        self.ex._update_walking_support_motion = Mock(return_value=(0.18, 0.0, 0.16, 0.0))
+        self.ex._read_walking_support_pose = Mock(side_effect=[(i * 0.009, 0.0, 0.0) for i in range(50)])
+        corrective = []
+        for _ in range(50):
+            if not self.ex._check_gesture_motion(0.05, self.ex._controller_command):
+                break
+            corrective.append(self.ex._walking_stop_command(0.05, self.ex._controller_command))
+        self.assertTrue(any(command[0] < -0.05 for command in corrective))
+        self.assertIn("walking did not follow", self.ex._articulation_health_fault)
+        self.ex._pause_faulted_articulation.assert_called_once()
+
+    def test_stop_feedback_bypass_keeps_preview_and_other_profiles_unchanged(self) -> None:
+        self.ex._walking_stop_feedback_enabled = False
+        self.ex._base_command[:] = torch.tensor([0.2, 0.0, 0.1])
+        actor = self.ex._walking_stop_command(0.005, self.ex._controller_command)
+        self.assertIs(actor, self.ex._base_command)
+        self.ex.g1.robot.get_velocities.assert_not_called()
+        self.assertTrue(self.make_example(G1_GAZE_MODE="hold")._walking_stop_feedback_enabled)
+        self.assertFalse(self.make_example(preview=True, G1_GAZE_MODE="hold")._walking_stop_feedback_enabled)
+        self.assertFalse(self.make_example(G1_GAZE_MODE="step")._walking_stop_feedback_enabled)
+        self.assertFalse(
+            self.make_example(G1_GAZE_MODE="hold", G1_GAZE_STOP_FEEDBACK="0")._walking_stop_feedback_enabled
+        )
 
     def test_active_gaze_movement_keeps_fingers_and_arms_before_final_motor_efforts(self) -> None:
         self.activate()

@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
-import math
 import json
-from pathlib import Path
+import math
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -1232,6 +1232,76 @@ class TestGestureIntegrationControls(unittest.TestCase):
         for _ in range(14):
             self.assertTrue(self.ex._check_gesture_motion(0.1, [0, 0, 0]))
         self.ex._pause_faulted_articulation.assert_not_called()
+
+    def test_walking_fault_snapshot_keeps_prefault_evidence_through_resets(self) -> None:
+        """A residual-motion fault retains signed evidence after live state is cleared."""
+        self.ex._walking_stop_elapsed = 1.5
+        self.ex._walking_support_anchor = (1.0, 2.0, 0.3)
+        self.ex._update_walking_support_motion.return_value = (0.183, 0.1, 0.151, 0.2)
+        self.ex.g1.robot.get_velocities.return_value = (
+            Array([[-0.18, 0.04, 0.0]]),
+            Array([[0.0, 0.0, -0.289]]),
+        )
+        actor_status = {"state": "braking", "velocity": [0.02, 0.0, -0.01]}
+        self.ex._walking_stop_regulator = Mock(status=actor_status)
+        self.ex._arm_input_sources = {"left": "hand_tracking"}
+        for _ in range(3):
+            self.assertTrue(self.ex._check_gesture_motion(0.1, [0.0, 0.0, 0.0]))
+        self.assertFalse(self.ex._check_gesture_motion(0.1, [0.0, 0.0, 0.0]))
+        snapshot = self.ex._last_walking_fault_snapshot
+        self.assertEqual(snapshot["reason"], self.ex._articulation_health_fault)
+        self.assertAlmostEqual(snapshot["stop_elapsed_s"], 1.9)
+        np.testing.assert_allclose(snapshot["net_velocity_world_xy_yaw"], [-0.18, 0.04, -0.289])
+        np.testing.assert_allclose(snapshot["linear_velocity_world_m_s"], [-0.18, 0.04, 0.0])
+        np.testing.assert_allclose(snapshot["support_motion"], [0.183, 0.1, 0.151, 0.2])
+        np.testing.assert_allclose(snapshot["support_anchor_world_xy_yaw"], [1.0, 2.0, 0.3])
+        self.assertEqual(snapshot["arm_sources"], {"left": "hand_tracking"})
+        self.assertEqual(self.ex._walking_stop_elapsed, 0.0)
+        self.assertIsNone(self.ex._walking_support_anchor)
+        actor_status["velocity"][0] = 99.0
+        self.ex._arm_input_sources["left"] = "changed"
+        self.ex._reset_gesture_locomotion()
+        self.assertIs(self.ex._last_walking_fault_snapshot, snapshot)
+        self.assertAlmostEqual(snapshot["previous_actor_status"]["velocity"][0], 0.02)
+        self.assertEqual(snapshot["arm_sources"]["left"], "hand_tracking")
+        self.ex._pause_faulted_articulation.assert_called_once()
+
+    def test_walking_fault_snapshot_survives_velocity_read_failure(self) -> None:
+        """Unavailable measurements remain missing rather than blocking the original pause."""
+        self.ex.g1.robot.get_velocities.side_effect = RuntimeError("native read failed")
+        self.assertFalse(self.ex._check_gesture_motion(0.005, [0.25, 0.0, -0.1]))
+        snapshot = self.ex._last_walking_fault_snapshot
+        self.assertIn("native read failed", snapshot["reason"])
+        np.testing.assert_allclose(snapshot["raw_command"], [0.25, 0.0, -0.1])
+        self.assertIsNone(snapshot["linear_velocity_world_m_s"])
+        self.assertIsNone(snapshot["net_velocity_world_xy_yaw"])
+        self.assertIsNone(snapshot["support_motion"])
+        json.dumps(snapshot, allow_nan=False)
+        self.ex._pause_faulted_articulation.assert_called_once()
+
+    def test_walking_fault_snapshot_bounds_contacts_and_sanitizes_invalid_numbers(self) -> None:
+        """Contact diagnostics remain bounded and detached even for a malformed native sample."""
+        self.ex.g1.robot.get_velocities.return_value = (Array([[math.nan, 0.0, 0.0]]), Array([[0.0, 0.0, 0.0]]))
+        contact = types.SimpleNamespace(
+            object_path="/World/Boxes/Box_01",
+            normal_force_n=2.0,
+            normal_world=[0.0, 1.0, 0.0],
+            eligible_for_grasp=True,
+        )
+        self.ex._latest_hand_contacts = {"left": [contact] * 80, "right": []}
+        self.ex._arm_contact_limited = {"left": True}
+        self.assertFalse(self.ex._check_gesture_motion(0.005, [0.0, 0.0, 0.0]))
+        snapshot = self.ex._last_walking_fault_snapshot
+        summary = snapshot["contact_summary"]["left"]
+        self.assertEqual((summary["count"], summary["sampled_count"]), (80, 64))
+        self.assertEqual(len(summary["examples"]), 8)
+        self.assertEqual(summary["sampled_normal_force_sum_n"], 128.0)
+        self.assertTrue(summary["arm_contact_limited"])
+        contact.normal_world[1] = -1.0
+        self.assertEqual(summary["examples"][0]["normal_world"], [0.0, 1.0, 0.0])
+        self.assertEqual(snapshot["linear_velocity_world_m_s"], [None, 0.0, 0.0])
+        json.dumps(snapshot, allow_nan=False)
+        self.ex._pause_faulted_articulation.assert_called_once()
 
     def test_motion_watchdog_brief_excursion_does_not_fault_from_window_mean_alone(self) -> None:
         self.ex._walking_stop_elapsed = 1.5

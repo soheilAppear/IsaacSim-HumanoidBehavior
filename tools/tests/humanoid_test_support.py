@@ -21,6 +21,7 @@ import sys
 import time
 import types
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
@@ -99,6 +100,7 @@ def load_source(relative_path, **extra):
         import_module=importlib.import_module,
         dataclass=dataclass,
         deque=deque,
+        deepcopy=deepcopy,
         SimpleNamespace=types.SimpleNamespace,
         **extra,
     )
@@ -145,7 +147,9 @@ POINT_RAY = load_source("interactive/humanoid/point_ray.py", Real=Real)
 OPERATOR_HEAD = load_source("interactive/humanoid/operator_head.py")
 COMFORT_CAMERA = load_source("interactive/humanoid/comfort_camera.py", Real=Real)
 CONTROLLER_LOCOMOTION = load_source("interactive/humanoid/controller_locomotion.py", Real=Real)
+HYBRID_LOCOMOTION = load_source("interactive/humanoid/hybrid_locomotion.py")
 GAZE_LOCOMOTION = load_source("interactive/humanoid/gaze_locomotion.py", Real=Real)
+WALKING_STOP = load_source("interactive/humanoid/walking_stop.py", Real=Real)
 GAZE_CONTROLS_SCENE = load_source("interactive/humanoid/gaze_controls_scene.py")
 _bimanual_spec = importlib.util.spec_from_file_location(
     "humanoid_test_bimanual_grasp", PACKAGE / "interactive/humanoid/bimanual_grasp.py"
@@ -172,8 +176,10 @@ HUMANOID = load_source(
     RobotHeadVisual=OPERATOR_HEAD.RobotHeadVisual,
     compute_level_head_reference=OPERATOR_HEAD.compute_level_head_reference,
     ControllerLocomotion=CONTROLLER_LOCOMOTION.ControllerLocomotion,
+    HybridLocomotion=HYBRID_LOCOMOTION.HybridLocomotion,
     GazeLocomotion=GAZE_LOCOMOTION.GazeLocomotion,
     GazeLocomotionConfig=GAZE_LOCOMOTION.GazeLocomotionConfig,
+    WalkingStopRegulator=WALKING_STOP.WalkingStopRegulator,
     GazeControlsScene=GAZE_CONTROLS_SCENE.GazeControlsScene,
     BimanualGraspMonitor=BIMANUAL_GRASP.BimanualGraspMonitor,
     ComfortCameraFilter=COMFORT_CAMERA.ComfortCameraFilter,

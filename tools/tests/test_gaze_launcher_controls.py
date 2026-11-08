@@ -48,12 +48,11 @@ class TestGazeLauncherControls(unittest.TestCase):
                 forwarded = value
         return result, values, forwarded
 
-    def test_default_overrides_inherited_motion_and_hand_modes(self) -> None:
+    def test_default_overrides_inherited_motion_modes_but_enables_hybrid_hands(self) -> None:
         result, values, forwarded = self._run_launcher(
             overrides={
                 "G1_GAZE_PREVIEW": "0",
                 "G1_LOCOMOTION_INPUT": "controller",
-                "G1_OPTICAL_HANDS_ONLY": "0",
                 "G1_POINTING_NAVIGATION": "1",
             }
         )
@@ -64,8 +63,26 @@ class TestGazeLauncherControls(unittest.TestCase):
         self.assertEqual(values["G1_GAZE_DWELL_S"], "0")
         self.assertEqual(values["G1_GESTURE_WALKING"], "1")
         self.assertEqual(values["G1_LOCOMOTION_INPUT"], "gaze")
-        self.assertEqual(values["G1_OPTICAL_HANDS_ONLY"], "1")
+        self.assertEqual(values["G1_OPTICAL_HANDS_ONLY"], "0")
+        self.assertEqual(values["G1_GAZE_CONTROLLER_OVERRIDE"], "1")
         self.assertEqual(values["G1_POINTING_NAVIGATION"], "0")
+
+    def test_explicit_hand_and_controller_override_settings_are_preserved(self) -> None:
+        """Preview/move opt-in must not erase either independent input opt-out."""
+        for args in ((), ("--move",)):
+            for optical_only, controller_override in (("1", "0"), ("0", "1"), ("1", "1"), ("0", "0")):
+                with self.subTest(args=args, optical_only=optical_only, controller_override=controller_override):
+                    result, values, _ = self._run_launcher(
+                        *args,
+                        overrides={
+                            "G1_OPTICAL_HANDS_ONLY": optical_only,
+                            "G1_GAZE_CONTROLLER_OVERRIDE": controller_override,
+                        },
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(values["G1_OPTICAL_HANDS_ONLY"], optical_only)
+                    self.assertEqual(values["G1_GAZE_CONTROLLER_OVERRIDE"], controller_override)
+                    self.assertEqual(values["G1_LOCOMOTION_INPUT"], "gaze")
 
     def test_first_move_enables_motion_and_preserves_quoted_remaining_arguments(self) -> None:
         result, values, forwarded = self._run_launcher("--move", "--xr-verbose", "--/app/title=two words")
@@ -102,7 +119,7 @@ class TestGazeLauncherControls(unittest.TestCase):
             "G1_GAZE_DWELL_S": "1.2",
             "G1_GAZE_DISTANCE_M": "0.20",
             "G1_GAZE_TURN_DEG": "10",
-            "G1_GAZE_FORWARD_SPEED": "0.40",
+            "G1_GAZE_FORWARD_SPEED": "0.60",
             "G1_GAZE_BACKWARD_SPEED": "0",
             "G1_GAZE_YAW_SPEED": "0.40",
             "G1_GAZE_HEADING_HOLD": "1",
@@ -158,15 +175,16 @@ class TestGazeLauncherControls(unittest.TestCase):
     def test_mode_specific_speeds_and_explicit_overrides_reach_base_launcher(self) -> None:
         """Faster hold defaults preserve legacy steps and all explicit speed values."""
         speed_names = ("G1_GAZE_FORWARD_SPEED", "G1_GAZE_BACKWARD_SPEED", "G1_GAZE_YAW_SPEED")
-        for mode, defaults in (("HOLD", ("0.40", "0.25", "0.40")), ("STEP", ("0.20", "0.15", "0.25"))):
+        for mode, defaults in (("HOLD", ("0.60", "0.35", "0.40")), ("STEP", ("0.20", "0.15", "0.25"))):
             for explicit in (None, ("0.12", "0", "0.18")):
-                with self.subTest(mode=mode, explicit=explicit):
-                    overrides = {"G1_GAZE_MODE": mode}
-                    if explicit is not None:
-                        overrides.update(zip(speed_names, explicit))
-                    result, values, _ = self._run_launcher("--move", overrides=overrides)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(tuple(values[name] for name in speed_names), explicit or defaults)
+                for args in ((), ("--move",)):
+                    with self.subTest(mode=mode, explicit=explicit, args=args):
+                        overrides = {"G1_GAZE_MODE": mode}
+                        if explicit is not None:
+                            overrides.update(zip(speed_names, explicit))
+                        result, values, _ = self._run_launcher(*args, overrides=overrides)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(tuple(values[name] for name in speed_names), explicit or defaults)
 
     def test_base_launcher_failure_is_returned(self) -> None:
         result, _, _ = self._run_launcher("--move", exit_code=23)

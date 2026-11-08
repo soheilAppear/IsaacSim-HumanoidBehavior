@@ -82,7 +82,7 @@ the camera, the base, or joints directly.
 | Webcam process | Unmirrored pose and optional hand landmarks; preview mirroring is display-only; C increments a calibration-request counter |
 | Receiver | Validate protocol version, session, sequence, timestamp, landmark count/range, visibility and presence; drain bounded pending input once per control tick |
 | Calibration | Require both fresh Quest optical palm targets and visible webcam arms; establish anatomical +X forward, +Y left, +Z up; scale and align shoulder-relative arm motion |
-| Input selection | Quest optical first; valid controller grip/trigger fallback in stationary and controller walking profiles unless explicitly optical-only; calibrated webcam fallback when primary input is unavailable |
+| Input selection | Quest optical first; valid controller grip/trigger fallback in stationary, controller walking and hybrid gaze profiles unless explicitly optical-only; calibrated webcam fallback when primary input is unavailable |
 | Arm controller | Quest controls its full arm while valid; only webcam arm fallback enables webcam elbow guidance in remaining IK freedom; existing joint/contact limits |
 | Fingers | Optical curls first; controller trigger mapping only outside optical-only profiles; optional complete webcam landmarks provide fallback curls |
 
@@ -905,8 +905,11 @@ the free base. This is a supported manipulation setup, not a demonstration of ba
 ### Gaze buttons and optical hands
 
 `tools/launch_gaze_walking.bat` selects `G1_LOCOMOTION_INPUT=gaze`, disables
-pointing navigation, and sets `G1_OPTICAL_HANDS_ONLY=1` so both hands remain
-available for manipulation. It defaults `G1_GAZE_MODE=hold` only when unset,
+pointing navigation, and defaults `G1_OPTICAL_HANDS_ONLY=0` and
+`G1_GAZE_CONTROLLER_OVERRIDE=1` only when unset. Optical input remains preferred
+per hand, with current controller grip/trigger fallback for arm/finger control.
+Explicit optical-only manipulation and eye-only locomotion opt-outs are independent.
+It defaults `G1_GAZE_MODE=hold` only when unset,
 preserving an explicit `step` override. Its default `G1_GAZE_PREVIEW=1` is reset
 on every invocation; only a first `--move` changes it to `0`. A first `--preview` explicitly
 retains preview. Remaining raw arguments pass through to `launch_isaac_vr.bat`.
@@ -914,7 +917,7 @@ The base launcher still disables webcam robot input and loads this checkout's
 complete extension. See the [operator procedure](../HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free).
 
 Preview uses the stationary world anchor with the same shelf/carton layout as
-movement. It exercises gaze selection without any base movement. Movement uses
+movement. It exercises gaze and stick selection without any base movement. Movement uses
 the existing physical GR00T scene, 200 Hz physics and 50 Hz actor schedule.
 Changing between them requires exit/relaunch and LOAD because the base topology
 differs. Preview does not validate dynamic balance, braking or carried loads.
@@ -935,10 +938,23 @@ off-all-buttons look-away must rearm it. Invalid tracking requires a subsequent
 valid look-away before activation. There is no fixed travel distance or turn angle in hold
 mode. Both hands continue updating during fixation.
 
+With the controller override enabled, both sticks must be currently tracked and
+centered before they can take movement ownership. Left Y controls forward/reverse,
+left X controls sidestepping up to 0.30 m/s, and right X controls turning. OpenXR
+right-positive axes map to negative body-left/yaw-left intent. The existing
+`ControllerLocomotion` applies the 15% axis deadzone and normalizes simultaneous
+forward/lateral input to unit magnitude before directional speed scaling.
+Forward/reverse/yaw use the gaze configuration; the separate controller profile
+keeps its original caps and layout. Stick takeover cancels a gaze hold or accepted
+step. Release or controller loss requests zero, and gaze requires a fresh valid
+off-all-buttons sample before it can select again. Neutral mixed optical/controller
+input does not block gaze. The HUD exposes STICKS, STICK PREVIEW or CENTER STICKS.
+
 Optional **step** mode starts one measured movement after its default 0.7-second
 dwell. A positive delay displays a progress ring. Its
 accepted command continues after looking away or losing eye tracking, allowing
-the operator to look back at the box; eye loss cancels unfinished dwell. Holding
+the operator to look back at the box; eye loss cancels unfinished dwell. A controller
+override cancels the accepted step. Holding
 the button does not repeat a step, and busy selection is ignored. Both modes
 require look-away to rearm. XR profile/display shutdown and lifecycle/recenter
 transitions cancel and disarm. Eye-driven commands require the combined gaze
@@ -947,7 +963,7 @@ permissions and calibration still determine whether the device supplies usable
 eye data. Application polling times are not hardware capture timestamps.
 
 Defaults are `G1_GAZE_MODE=hold`, `G1_GAZE_DISTANCE_M=0.20`, `G1_GAZE_TURN_DEG=10`,
-`G1_GAZE_FORWARD_SPEED=0.40`, `G1_GAZE_BACKWARD_SPEED=0.25`,
+`G1_GAZE_FORWARD_SPEED=0.60`, `G1_GAZE_BACKWARD_SPEED=0.35`,
 `G1_GAZE_YAW_SPEED=0.40`, and `G1_GAZE_DWELL_S=0` in hold mode. Step mode retains
 forward/backward/yaw defaults of 0.20 m/s, 0.15 m/s and 0.25 rad/s, and defaults
 to `G1_GAZE_DWELL_S=0.7`; explicit speed and dwell overrides are preserved in either mode. A
@@ -962,12 +978,45 @@ loaded transport still requires a separate physical acceptance check. Requested
 speeds are per simulation second; achieved movement per wall second also depends
 on simulation performance and physical gait response.
 
-**Faster-profile validation on 8 November 2026:** all **1,001 offline regressions
+**Current validation:** the 0.60/0.35 m/s hold defaults and hybrid sidestepping passed
+**1,062 offline regressions in 13.613 seconds** and hybrid preview/movement checks.
+Preview had zero sampled root translation/rotation over **1,348** normal input,
+arm and finger updates. Movement ran **18.40 simulation seconds / 3,680 callbacks**;
+0.30 m/s left/right requests yielded **17.11/18.64 cm** in 1.215 seconds. Diagonals
+progressed along both expected axes with normalized caps, and neutral/tracking-loss
+interlocks passed. Final two-second root envelope was **1.44 mm**, peak planar speed
+**0.00370 m/s**; final raw/filtered requests were zero and native speed **0.000718 m/s**.
+Production controller-grip arm IK and trigger-driven fingers ran under synthetic XR
+input with real simulation physics.
+
+The separate faster gaze run passed all four actions with **5,967** normal input,
+arm and finger callbacks. Requested speeds differ from the measured physical means:
+
+| Action | Requested speed | Mean held speed | Hold duration (simulation seconds) |
+| --- | --- | --- | --- |
+| Forward | 0.60 m/s | 0.355480 m/s | 1.530 |
+| Back | 0.35 m/s | 0.275481 m/s | 2.530 |
+| Left turn | 0.40 rad/s | 0.309796 rad/s | 1.525 |
+| Right turn | 0.40 rad/s | 0.358145 rad/s | 1.530 |
+
+Each release was observed for five simulation seconds; maximum final planar speed
+was **0.003395 m/s**. Forward's simulated eye loss cleared requested/filtered
+commands; the others stopped by look-away. At the end of the holds, forward/back
+heading errors were -1.7223°/-0.5557° and cross-track offsets +4.698/-3.258 cm.
+Heading feedback therefore does not imply zero sideways drift. The gaze run used
+synthetic eyes, neutral arms and no payload. Hardware/optical tracking, real wall-time
+gaps and loaded grasping remain unvalidated. Earlier 1,058-test hybrid results
+predate lateral input and the latest speeds.
+
+**Historical faster-profile checkpoint on 8 November 2026:** all **1,001 offline regressions
 passed in 14.852 seconds**. The 0.40/0.25 m/s and 0.40 rad/s configuration was
 applied to the existing live instance after clearing only its base-command state;
 no health fault or callback error was observed at that check. No dedicated
-physical run at these higher speeds was completed, and higher-speed carrying
-remains unvalidated. A single pre-change session observation advanced 0.343
+physical run had been completed at that checkpoint. Subsequent checks at
+0.40/0.25 m/s and 0.40 rad/s passed all four gaze actions with two-second holds
+and five-second release observations, without faults; final planar speed was at
+most 0.0011 m/s per action. Those checks used synthetic eyes and neutral arms;
+carrying remains unvalidated. A single pre-change session observation advanced 0.343
 simulation seconds per wall second; this is an observation, not a guaranteed rate.
 The physical comparisons below used the earlier, slower requests.
 
@@ -995,10 +1044,30 @@ not enter the additional pelvis-settling gate or its four-second timeout when
 looking away. It delegates physical stopping faults to the unchanged support-aware
 unintended-motion, balance/fall and runaway guards.
 
-The reported automatic pause was the duplicate four-second pelvis-settling fault
+An earlier automatic pause was the duplicate four-second pelvis-settling fault
 during active arm movement: the movement command was near zero and the robot
 remained upright. The existing support-aware motion guard remains responsible for persistent
 unintended movement in hold mode.
+
+Physical hold mode also enables `G1_GAZE_STOP_FEEDBACK=1`; `0` disables it for
+diagnostics. After one simulation second of normal braking, `WalkingStopRegulator`
+captures a fixed foot-centroid/mean-sole-heading reference. It combines support
+displacement and signed support-motion feedback with deadbands and smoothing,
+capping the correction at 0.20 m/s planar and 0.30 rad/s yaw. The correction goes
+through the walking actor, without setting root pose, applying external forces,
+changing hand control, or overwriting operator-command buffers. The motion guards
+still inspect raw intent and retain their thresholds. Step mode bypasses this
+feedback. Pelvis sway alone does not request a corrective step.
+
+The later box-contact pause was a distinct support-motion guard fault 9.54 simulation
+seconds after release, with the robot recorded upright. Root/support net speeds were
+0.182/0.183 m/s and stance excursion was 0.151 m. The feedback revision passed
+1,019 offline tests and a 68.75-simulation-second, 13,750-tick recorded-input replay;
+the final two-second root/support envelopes were 3.09 mm / below 0.001 mm.
+Both baseline and candidate passed; the candidate's early support travel was lower.
+The replay did not reproduce the original late Box 20 load/fault, and earlier
+bimanual Box 21 support with a 1.87 cm lift did not establish sustained carrying.
+See the [incident and replay limits](../HUMANOID_VR_CONTROL.md#walking-pauses-after-looking-away-near-a-box).
 
 In step mode, stopping ends
 with exactly zero requested velocity, then waits for measured translation and
@@ -1012,7 +1081,12 @@ guards remain active. Gaze movement does not perform the route/turn-clearance
 checks used by pointing navigation; the operator must leave room for the robot.
 
 Inspect `EX.gaze_locomotion_status()` through `tools/kit_exec.py` for the current
-selection/movement state. Gaze controls supply only base intent: the per-step
+selection/movement state, hybrid input owner, and separate gaze/controller requests.
+Its `stop_feedback` reports correction and effective actor input; `last_motion_fault`
+retains the guard snapshot through Pause/Reset on the same example. Recorded
+`behavior.csv` fields `cmd_forward`, `cmd_lateral` and `cmd_yaw` contain the ordinary
+filtered request and omit the separate stopping correction, so zero values there
+do not establish zero actor input. Gaze controls supply only base intent: the per-step
 health/balance/unintended-motion checks, independent finger and arm updates, and
 final explicit body-effort update retain their ownership. Any UI/log timestamp
 describes application observation rather than proven device freshness. The
@@ -1116,6 +1190,21 @@ $gazeCheck = @(
 
 Use `--control-mode hold` in the two commands to run the sustained-fixation,
 look-away and simulated eye-loss checks instead.
+
+For hybrid checks, reuse the arguments above with the hybrid script and omit
+`--control-mode`:
+
+```powershell
+$hybridCheck = $gazeCheck.Clone()
+$hybridCheck[0] = 'tools\validate_hybrid_walking.py'
+& "$env:ISAAC_DIR\python.bat" @hybridCheck --mode preview
+& "$env:ISAAC_DIR\python.bat" @hybridCheck --mode move
+```
+
+`tools\validate_walking_stop_replay.py` separately accepts a
+`--recording-dir`, `--stop-feedback 0|1` and `--output-dir` plus the same Kit flags;
+its recorded-input replay is approximate and does not guarantee the original
+contact sequence is reproduced.
 
 Each invocation owns and closes its own headless process, disables behavioral
 recording, and retains a unique JSON report and PNGs in the requested output

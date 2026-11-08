@@ -1,5 +1,5 @@
 @echo off
-REM Gaze buttons leave both optical hands free for manipulation.
+REM Gaze buttons leave both hands free; controllers can take over when available.
 REM Default to an anchored preview on every invocation, regardless of inherited
 REM G1_GAZE_PREVIEW. Only a first --move argument enables physical walking.
 REM Preview and movement use different base topology: exit and relaunch to switch.
@@ -8,7 +8,8 @@ setlocal DisableDelayedExpansion
 set "G1_GESTURE_WALKING=1"
 set "G1_LOCOMOTION_INPUT=gaze"
 set "G1_POINTING_NAVIGATION=0"
-set "G1_OPTICAL_HANDS_ONLY=1"
+if not defined G1_OPTICAL_HANDS_ONLY set "G1_OPTICAL_HANDS_ONLY=0"
+if not defined G1_GAZE_CONTROLLER_OVERRIDE set "G1_GAZE_CONTROLLER_OVERRIDE=1"
 set "G1_GAZE_PREVIEW=1"
 if not defined G1_GAZE_MODE set "G1_GAZE_MODE=hold"
 if not defined G1_GAZE_DWELL_S (
@@ -25,8 +26,8 @@ if /i "%G1_GAZE_MODE%"=="step" (
     if not defined G1_GAZE_BACKWARD_SPEED set "G1_GAZE_BACKWARD_SPEED=0.15"
     if not defined G1_GAZE_YAW_SPEED set "G1_GAZE_YAW_SPEED=0.25"
 ) else (
-    if not defined G1_GAZE_FORWARD_SPEED set "G1_GAZE_FORWARD_SPEED=0.40"
-    if not defined G1_GAZE_BACKWARD_SPEED set "G1_GAZE_BACKWARD_SPEED=0.25"
+    if not defined G1_GAZE_FORWARD_SPEED set "G1_GAZE_FORWARD_SPEED=0.60"
+    if not defined G1_GAZE_BACKWARD_SPEED set "G1_GAZE_BACKWARD_SPEED=0.35"
     if not defined G1_GAZE_YAW_SPEED set "G1_GAZE_YAW_SPEED=0.40"
 )
 if not defined G1_GAZE_HEADING_HOLD set "G1_GAZE_HEADING_HOLD=1"

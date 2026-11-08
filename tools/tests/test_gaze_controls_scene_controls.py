@@ -294,11 +294,24 @@ class TestGazeControlsScene(unittest.TestCase):
                 self.assertEqual(self.label(), expected)
                 self.assertEqual(self.progress_faces("forward"), 32 if state != "fault" else 0)
 
+    def test_controller_status_stays_visible_without_eye_tracking(self) -> None:
+        before = self.label_geometry()
+        for state, label in (
+            ("controller", "STICKS"),
+            ("controller_preview", "STICK PREVIEW"),
+            ("controller_wait", "CENTER STICKS"),
+        ):
+            with self.subTest(state=state):
+                self.scene.update({"state": state, "target": "forward", "progress": 1.0}, eye_valid=False)
+                self.assertEqual(self.label(), label)
+                self.assertEqual(self.progress_faces("forward"), 0)
+        self.assertEqual(self.label_geometry(), before)
+
     def test_status_and_feedback_switch_opacity_without_rebuilding_text(self) -> None:
         before = self.label_geometry()
-        self.assertEqual(len(before), 23)  # Nine status/card pairs, four actions, and one prefix.
+        self.assertEqual(len(before), 29)  # Twelve status/card pairs, four actions, and one prefix.
         cards = self.stage.GetPrimAtPath(self.scene.root_path + "/StatusCards").GetChildren()
-        self.assertEqual(len(cards), 9)
+        self.assertEqual(len(cards), 12)
         backing = UsdGeom.Mesh(self.stage.GetPrimAtPath(self.scene.root_path + "/StatusBacking"))
         for card in cards:
             for point, fixed in zip(UsdGeom.Mesh(card).GetPointsAttr().Get(), backing.GetPointsAttr().Get()):
@@ -316,7 +329,7 @@ class TestGazeControlsScene(unittest.TestCase):
             self.assertEqual(shader.GetInput("emissiveColor").Get(), shader.GetInput("diffuseColor").Get())
             self.assertGreater(sum(shader.GetInput("emissiveColor").Get()), 0.0)
             self.assert_mask_translation(prim)
-        self.assertEqual(len(material_paths), 23)
+        self.assertEqual(len(material_paths), 29)
         self.assertEqual(self.visible_labels("Status"), ["NO EYE"])
         self.assertEqual([card.GetName() for card in cards if self.is_drawn(card)], ["no_eye"])
         self.assertEqual(self.visible_labels("FeedbackAction"), [])
@@ -330,6 +343,9 @@ class TestGazeControlsScene(unittest.TestCase):
             "unavailable": "DISABLED",
             "fault": "FAULT",
             "no_eye": "NO EYE",
+            "controller": "STICKS",
+            "controller_preview": "STICK PREVIEW",
+            "controller_wait": "CENTER STICKS",
         }
         for state, label in expected_statuses.items():
             for action, action_label in (

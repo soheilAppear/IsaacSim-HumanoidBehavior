@@ -112,6 +112,9 @@ class GazeControlsScene:
         "unavailable": ("DISABLED", "disabled"),
         "fault": ("FAULT", "fault"),
         "no_eye": ("NO EYE", "no_eye"),
+        "controller": ("STICKS", "active"),
+        "controller_preview": ("STICK PREVIEW", "preview"),
+        "controller_wait": ("CENTER STICKS", "ready"),
     }
     _ACTION_LABELS = {"forward": "FORWARD", "back": "BACK", "turn_left": "TURN LEFT", "turn_right": "TURN RIGHT"}
 
@@ -405,7 +408,14 @@ class GazeControlsScene:
         except (TypeError, ValueError):
             progress = 0.0
         progress = min(1.0, max(0.0, progress)) if math.isfinite(progress) else 0.0
-        if not eye_valid and state not in ("active", "stopping", "fault"):
+        if not eye_valid and state not in (
+            "active",
+            "stopping",
+            "fault",
+            "controller",
+            "controller_preview",
+            "controller_wait",
+        ):
             state, target, progress = "no_eye", None, 0.0
         if target == "back" and not self.backwards_enabled:
             target, progress = None, 0.0

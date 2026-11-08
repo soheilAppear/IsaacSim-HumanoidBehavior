@@ -37,7 +37,8 @@ navigation remains available through the explicit setup below. EEG acquisition
 and the webcam preview are separate host applications and do not drive the robot.
 
 The experimental [gaze-button profile](#gaze-buttons-with-both-hands-free) leaves
-both optical hands available for manipulation. It starts with an anchored preview;
+both hands available for manipulation, with optical/controller fallback and a
+controller-stick movement override. It starts with an anchored preview;
 physical walking requires a separate launch with `--move`.
 
 Use [the operating guide](HUMANOID_VR_CONTROL.md) for launch and controls,
@@ -61,10 +62,10 @@ launcher is an alias for it.
 | Pickup | Experimental physical contact grasping with bounded finger targets; objects must be held by fingers and friction, with no hand-to-object fixed joint |
 | Camera | Stabilized robot frame follows travel; HMD orientation rotates the view and its eye offset around the measured neck. Torso roll/pitch, gait bob, and real-world head translation are excluded |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
-| Gaze buttons | Experimental eye-only controls activate immediately and move forward/backward or turn while the same button remains fixated; look away to stop. Anchored preview is the default, and both optical hands remain free |
+| Gaze buttons | Experimental gaze controls activate immediately and move while fixated; look away to stop. Controller sticks can override gaze, and optical/controller hand input remains available. Anchored preview is the default |
 | Physics | CPU: 100 Hz stationary / 200 Hz walking; rendering requests 90 Hz stationary / 60 Hz walking |
 | Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
-| Experimental walking | Left stick moves forward/backward/sideways; right stick turns. Grip/trigger manipulation and optical hands remain available; controller face buttons/stick clicks are unused, and blue pointing navigation is disabled but retained |
+| Controller walking | Left stick moves forward/backward/sideways; right stick turns. Grip/trigger manipulation and optical hands remain available; controller face buttons/stick clicks are unused, and blue pointing navigation is disabled but retained |
 
 Inspire has six independent hand actuators. Distal knuckles are coupled, so it cannot
 reproduce every human knuckle angle or finger-splay movement separately.
@@ -409,11 +410,14 @@ See the [validation record](docs/validation/isaac-sim-6.1.md#shelf-pickup-attemp
 
 ### Gaze buttons with both hands free
 
+Save your work and close Isaac, then run from this repository's root directory.
 Start with the anchored preview to check actual eye tracking and button placement:
 
 ```powershell
 $env:G1_GAZE_MODE = 'hold'
 $env:G1_GAZE_DWELL_S = '0'
+$env:G1_OPTICAL_HANDS_ONLY = '0'
+$env:G1_GAZE_CONTROLLER_OVERRIDE = '1'
 .\tools\launch_gaze_walking.bat
 ```
 
@@ -425,16 +429,20 @@ Side panels follow the view while leaving its center free. Look
 between the buttons first to arm selection, then look at a button to activate it
 **immediately**. Even a quick glance activates it; there is no dwell ring at the
 default zero delay. Keep looking to sustain the request; look away to end it.
-Preview shows this interaction without moving the anchored base.
-Both hands use optical tracking; controllers and the webcam do not substitute for
-them in this profile. Eye tracking must be enabled, calibrated and exposed by the
-VR runtime; a head-direction fallback cannot activate these controls.
+Preview shows this interaction without moving the anchored base, including when
+using sticks. Each hand prefers optical tracking; when the current input is a
+controller, hold its grip to move the arm and use its trigger to close the fingers.
+Grip release holds the arm while trigger closure remains independent. Webcam input
+does not substitute. Eye tracking must be enabled, calibrated and exposed by the
+VR runtime to select gaze buttons; a head-direction fallback cannot activate them.
 
 After checking the preview, exit Isaac and relaunch for physical movement:
 
 ```powershell
 $env:G1_GAZE_MODE = 'hold'
 $env:G1_GAZE_DWELL_S = '0'
+$env:G1_OPTICAL_HANDS_ONLY = '0'
+$env:G1_GAZE_CONTROLLER_OVERRIDE = '1'
 .\tools\launch_gaze_walking.bat --move
 ```
 
@@ -442,7 +450,7 @@ Load the scene again, click **Play**, and **Start XR** if needed. Look at
 **Forward**, **Back**, **Turn left**, or **Turn right** and keep looking to continue
 that movement. **Look away to stop.** Invalid/lost eye tracking also requests a
 stop; physical braking takes time. The
-default requested hold speeds are **0.40 m/s forward, 0.25 m/s backward, and 0.40 rad/s
+default requested hold speeds are **0.60 m/s forward, 0.35 m/s backward, and 0.40 rad/s
 turning**. Actual speed per wall second depends on simulation performance and gait.
 Step mode retains **0.20/0.15 m/s** forward/backward and **0.25 rad/s** turning;
 explicit environment speed overrides are preserved. Looking outside all buttons rearms the next selection without a separate
@@ -453,9 +461,60 @@ pickup and loaded transport still require validation. See the
 [operating guide](HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free) for
 configuration and the preview/movement distinction.
 
-The faster profile passed **1,001 offline regressions** and was applied to the
-live instance. Dedicated physical checks at these speeds, including carrying,
-remain pending; the measurements below used the earlier speed profile.
+For controller movement, first center both tracked sticks. **Left stick up/down**
+requests forward/backward motion; **left stick left/right** requests sidestepping
+up to **0.30 m/s**; **right stick left/right** turns. Diagonal translation input is
+normalized before applying the directional speed limits. Forward/backward and
+turning use the configured gaze speeds; the separate controller walking profile
+keeps its existing speeds and layout. Sticks
+override/cancel gaze, including an accepted step. Release or tracking loss requests
+zero; before using gaze again, provide a fresh valid look outside all buttons and
+then return to a button. The HUD shows **STICKS**, **STICK PREVIEW**, or **CENTER
+STICKS**. Neutral mixed hand/controller input does not block gaze.
+
+The launcher defaults to `G1_OPTICAL_HANDS_ONLY=0` and
+`G1_GAZE_CONTROLLER_OVERRIDE=1`, preserving explicit overrides. Set the first to
+`1` for optical-only manipulation, or the second to `0` for eye-only locomotion.
+These switches are independent. **The new speeds and hybrid sidestepping passed
+1,062 offline regressions in 13.613 seconds and hybrid preview/movement checks.**
+Preview had zero sampled base translation/rotation. Left/right 0.30 m/s requests
+produced **17.11/18.64 cm** of travel in 1.215 simulation seconds; diagonals moved
+along both expected axes with normalized input. Neutral/tracking-loss interlocks,
+controller-grip arm IK and trigger-driven fingers passed. The final two-second
+root-position envelope was **1.44 mm**. The separate faster gaze check also passed
+all four directions: mean held speeds were **0.355/0.275 m/s forward/backward**
+and **0.310/0.358 rad/s left/right**, below the nominal **0.60/0.35 m/s** and
+**0.40 rad/s** requests. Each release was observed for five simulation seconds;
+maximum final planar speed was **0.0034 m/s**. Forward eye loss cleared requested
+and filtered commands. These checks used synthetic XR devices and real simulation
+physics; the gaze run used neutral arms and no payload. They do not validate
+hardware/optical tracking, wall-time input gaps, loaded grasping or perfectly straight travel.
+The results below predate hybrid input.
+
+Physical hold mode now uses bounded foot-support feedback after a stop request:
+after one simulation second of normal braking, a fixed foot-centroid/sole-heading
+reference helps correct subsequent stance drift through the walking actor. Normal
+pelvis sway alone does not request corrective steps. Both hands remain independent,
+and the existing motion/fall guards still supervise the original operator request.
+`G1_GAZE_STOP_FEEDBACK=0` disables this experimental assistance for diagnostics.
+The latest residual-motion incident was real foot drift during a box interaction,
+not the earlier removed gaze settling timer; see the
+[pause diagnosis](HUMANOID_VR_CONTROL.md#walking-pauses-after-looking-away-near-a-box).
+
+Before hybrid input, the stopping change passed **1,019 offline regressions** and a **68.75-second
+simulation-time replay** of recorded walking/hand inputs with real physics and
+contacts. The final two-second foot-position envelope was below 0.001 mm, with a
+3.09 mm root envelope. The approximate replay did **not** reproduce the original
+late two-handed box load or pause; it is bounded-stopping coverage, not confirmation
+that the original loaded failure is resolved. Hardware box handling remains an
+acceptance check.
+
+Those earlier four gaze controls also passed physical checks at the faster **0.40/0.25 m/s and
+0.40 rad/s** requested speeds with stopping feedback enabled: two-second holds,
+five-second release observations, and simulated Forward eye loss. Final planar
+speed was at most **0.0011 m/s** after each release. These checks used synthetic
+eyes and neutral arms; carrying at these speeds remains unvalidated. The older
+heading-comparison measurements below used the earlier speed profile.
 
 Forward and Back capture the robot's heading when each movement starts and request
 bounded corrective turning while active. This uses the existing physical walking
@@ -470,7 +529,8 @@ dwell, such as `$env:G1_GAZE_DWELL_S='0.7'`, restores the delay and progress rin
 Set `$env:G1_GAZE_MODE='step'` and `$env:G1_GAZE_DWELL_S='0.7'` before launching
 to retain one **0.20 m movement** or **10° turn** per selection with a
 **0.7-second dwell**; in that
-optional mode, the accepted movement finishes even after looking away. Distance
+optional mode, the accepted movement finishes even after looking away, unless a
+controller-stick override cancels it. Distance
 and angle settings apply only to step mode. An explicit dwell override applies
 to either mode.
 

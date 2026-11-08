@@ -1,5 +1,85 @@
 # Changelog
 
+## HumanoidBehavior faster hybrid walking and sidestepping — 2026-11-08
+
+- Increase default hold requests to 0.60 m/s forward and 0.35 m/s backward, keeping
+  0.40 rad/s turning. Preserve explicit environment overrides and the existing
+  step-mode defaults of 0.20/0.15 m/s and 0.25 rad/s.
+- Enable hybrid left-stick X for sidestepping up to 0.30 m/s, alongside left Y
+  forward/backward and right X turning. Normalize diagonal translation input before
+  applying directional limits. Keep the separate controller profile unchanged.
+- Retain centered-stick arming, gaze/stick handover interlocks, anchored preview,
+  hand/controller fallback, stopping feedback and existing physics guards.
+- Pass 1,062 offline regressions in 13.613 seconds plus hybrid preview/movement
+  checks. Preview has zero sampled base movement and 1,348 input/arm/finger updates.
+  Movement runs 18.40 simulation seconds / 3,680 callbacks; 0.30 m/s left/right
+  requests yield 17.11/18.64 cm in 1.215 seconds. Diagonals progress along both
+  expected axes with normalized caps; neutral/tracking-loss interlocks pass.
+  Final two-second root envelope is 1.44 mm, with final native speed 0.000718 m/s
+  and zero raw/filtered requests.
+- Exercise production controller-grip arm IK and trigger-driven fingers using
+  synthetic XR devices and real simulation physics. Hardware/optical tracking,
+  real wall-time input gaps and loaded grasping remain unvalidated.
+- Pass the separate faster gaze check in all four directions with 5,967 normal
+  input/arm/finger callbacks. Mean held forward/backward speeds are 0.355/0.275 m/s
+  against 0.60/0.35 m/s requests; left/right means are 0.310/0.358 rad/s against
+  0.40 rad/s requests. Back holds for 2.530 simulation seconds, others 1.525–1.530;
+  every release is observed for five seconds, with final planar speed at most
+  0.003395 m/s. Forward eye loss clears requested/filtered commands; others use
+  look-away. Inputs are synthetic, arms neutral and no payload is carried; the
+  measured sideways offsets do not establish a perfectly straight path.
+  Earlier entries describe prior configurations.
+
+## HumanoidBehavior hybrid gaze and controller input — 2026-11-08
+
+- Keep gaze locomotion while allowing tracked controller sticks to override it:
+  left Y controls forward/backward, right X controls turning, and left X is ignored.
+  Use configured gaze speed limits; retain sidestepping in the separate controller
+  walking profile. Require both tracked sticks to center before stick movement.
+- Cancel gaze, including an accepted step, when sticks take ownership. Release or
+  controller tracking loss requests zero; gaze requires a fresh valid look outside
+  all buttons before selection resumes. Show STICKS, STICK PREVIEW or CENTER STICKS
+  in the HUD. Anchored preview never moves from stick input.
+- Default `G1_GAZE_CONTROLLER_OVERRIDE=1` and launcher `G1_OPTICAL_HANDS_ONLY=0`,
+  preserving explicit opt-outs. Each hand prefers optical tracking, with current
+  controller grip/trigger fallback for arm motion and independent finger closure.
+  Neutral mixed hand/controller input does not block gaze. Retain stopping feedback
+  and existing motion/fall guards.
+- Pass 1,058 offline regressions in 13.331 seconds and separate hybrid preview and
+  movement simulation checks. Preview has zero root translation/rotation with 686
+  normal arm and finger updates. Both modes verify grip-controlled arm IK,
+  trigger-driven fingers, gaze/stick handover interlocks and ignored left X.
+  Inputs are synthetic XR devices; simulation physics and production hand controls
+  are real. Hardware use and loaded grasping remain acceptance checks. Prior entries
+  below describe the earlier input configuration.
+
+## HumanoidBehavior support-based stopping feedback — 2026-11-08
+
+- Investigate a support-aware motion-guard pause 9.54 simulation seconds after
+  release, with the robot upright and box contact active: root/support net speeds
+  were 0.182/0.183 m/s and stance excursion was 0.151 m. Retain the fault snapshot
+  through Pause/Reset; the recording does not establish the source of the drift.
+- Add physical hold-mode feedback that captures foot-centroid position and sole
+  heading after one simulation second of normal braking. Apply deadbands and
+  smoothing, with correction caps of 0.20 m/s and 0.30 rad/s through the walking
+  actor. Preserve root pose/force behavior, hand control and operator buffers;
+  existing motion guards still see raw intent and retain their thresholds.
+  `G1_GAZE_STOP_FEEDBACK=0` disables feedback for diagnostics.
+- Pass 1,019 offline regressions in 12.521 seconds and a 68.75-simulation-second,
+  13,750-tick recorded-input replay. Final two-second root/support envelopes are
+  3.09 mm / below 0.001 mm, with final native root speed 0.00438 m/s. Early support
+  travel at 1.4 seconds after zero is 2.15 cm versus baseline 7.18 cm; both pass.
+- The replay includes earlier bimanual Box 21 support and a 1.87 cm lift, but late
+  contacts are shelf-only. It does not reproduce the original late Box 20 fault or
+  validate sustained carrying. Recorded `cmd_*` fields omit separate corrective actor input;
+  inspect `gaze_locomotion_status()['stop_feedback']` for it.
+- Pass all four faster physical directions with two-second holds and five-second
+  release observations, without faults. At requested 0.40/0.25 m/s and 0.40 rad/s,
+  mean held speeds are 0.252/0.178 m/s forward/back and 0.320/0.374 rad/s left/right;
+  final native planar speed is at most 0.0011 m/s per action. Use real gaze geometry
+  with synthetic eyes and neutral arms; Forward eye loss clears intent. Hardware
+  gaze and higher-speed loaded carrying remain unvalidated.
+
 ## HumanoidBehavior faster continuous gaze movement — 2026-11-08
 
 - Increase requested hold-mode defaults to 0.40 m/s forward, 0.25 m/s backward and
