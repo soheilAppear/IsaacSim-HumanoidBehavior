@@ -26,6 +26,9 @@ Launch configuration selects the control profile before the scene is built:
   Optional `step` mode retains a 0.7-second dwell and bounded steps/turns that finish
   without fixation. An explicit positive `G1_GAZE_DWELL_S` adds a delay/progress ring
   to either mode; the default zero-delay hold mode has no dwell ring.
+  Forward/Back capture the robot's initial heading and request bounded corrective
+  yaw through the walking controller while active. Turns are unchanged; heading
+  feedback does not regulate sideways drift or guarantee a straight path.
 
 These profiles share the arm, finger, contact, and recording pipeline; switching
 between anchored and walking configurations requires rebuilding the scene. They

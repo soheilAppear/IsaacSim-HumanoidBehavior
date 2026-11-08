@@ -66,6 +66,7 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.assertTrue(config.preview)
         self.assertEqual(config.control_mode, "step")
         self.assertEqual((config.dwell_s, config.distance_m, config.turn_degrees), (0.7, 0.2, 10))
+        self.assertEqual((config.heading_hold, config.heading_gain, config.heading_max_yaw_speed), (True, 3.0, 0.15))
         self.assertEqual(GAZE.GazeLocomotion().command.velocity, (0, 0, 0))
 
     def test_configuration_rejects_nonfinite_boolean_and_out_of_range_values(self) -> None:
@@ -77,6 +78,8 @@ class TestGazeLocomotionControls(unittest.TestCase):
             "backward_speed": (-0.01, 1.01),
             "yaw_speed": (0, 1.51),
             "max_gaze_gap_s": (0.049, 1.01),
+            "heading_gain": (-0.01, 5.01),
+            "heading_max_yaw_speed": (-0.01, 0.401),
         }
         for field, invalid in ranges.items():
             for value in (*invalid, math.nan, math.inf, -math.inf, True, False, None, "1"):
@@ -85,6 +88,8 @@ class TestGazeLocomotionControls(unittest.TestCase):
         for value in (0, 1, "false", None):
             with self.subTest(preview=value), self.assertRaises(ValueError):
                 replace(self.config, preview=value)
+            with self.subTest(heading_hold=value), self.assertRaises(ValueError):
+                replace(self.config, heading_hold=value)
         for value in (None, True, 0, "continuous", "HOLD", ""):
             with self.subTest(control_mode=value), self.assertRaises(ValueError):
                 replace(self.config, control_mode=value)
@@ -363,12 +368,115 @@ class TestGazeLocomotionControls(unittest.TestCase):
                 result = self.fire(action)
                 expected_velocity = result.velocity
                 for index in range(150):
-                    self.pose = (index * 0.02, 0.0, index * 0.03)
+                    self.pose = (index * 0.02, 0.0, index * 0.03 if action.startswith("turn_") else 0.0)
                     result = self.tick(action, dt=0.1)
                     self.assertEqual((result.state, result.velocity), ("active", expected_velocity))
                     self.assertEqual((result.activation_count, result.progress), (1, 1.0))
                     self.assertIsNone(result.activated_action)
                 self.assertIn("while looking", result.detail)
+
+    def test_heading_feedback_corrects_both_directions_and_translation_modes_with_a_cap(self) -> None:
+        for mode in ("step", "hold"):
+            for action in ("forward", "back"):
+                for drift in (-0.5, 0.5):
+                    with self.subTest(mode=mode, action=action, drift=drift):
+                        self.setUp()
+                        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode=mode))
+                        initial = self.fire(action)
+                        self.assertEqual(initial.velocity[2], 0.0)
+                        self.pose = (0.0, 0.0, drift)
+                        for _ in range(8):
+                            result = self.tick(action)
+                        self.assertEqual(result.velocity[:2], initial.velocity[:2])
+                        self.assertAlmostEqual(result.velocity[2], math.copysign(0.15, -drift))
+                        status = self.controller.heading_status
+                        self.assertTrue(status["active"])
+                        self.assertEqual(status["target_yaw_rad"], 0.0)
+                        self.assertAlmostEqual(status["error_rad"], -drift)
+                        self.assertEqual(status["correction_rad_s"], result.velocity[2])
+                        status["correction_rad_s"] = 9.0
+                        self.assertEqual(self.controller.heading_status["correction_rad_s"], result.velocity[2])
+
+    def test_heading_feedback_wraps_across_pi_using_the_short_direction(self) -> None:
+        for sign in (-1, 1):
+            with self.subTest(sign=sign):
+                self.setUp()
+                self.pose = (0.0, 0.0, sign * math.radians(179))
+                self.fire()
+                self.pose = (0.0, 0.0, -sign * math.radians(179))
+                for _ in range(8):
+                    result = self.tick("forward")
+                self.assertAlmostEqual(self.controller.heading_status["error_rad"], -sign * math.radians(2))
+                self.assertLess(result.velocity[2] * sign, 0.0)
+                self.assertLess(abs(result.velocity[2]), self.config.heading_gain * math.radians(2))
+
+    def test_heading_feedback_deadband_and_disabled_configuration_request_no_yaw(self) -> None:
+        for config, drift in (
+            (self.config, math.radians(0.25)),
+            (replace(self.config, heading_hold=False), 0.5),
+            (replace(self.config, heading_gain=0.0), 0.5),
+            (replace(self.config, heading_max_yaw_speed=0.0), 0.5),
+        ):
+            with self.subTest(config=config, drift=drift):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(config)
+                self.fire()
+                self.pose = (0.0, 0.0, drift)
+                for _ in range(10):
+                    self.assertEqual(self.tick("forward").velocity, (0.2, 0.0, 0.0))
+                if not config.heading_hold:
+                    self.assertFalse(self.controller.heading_status["active"])
+
+    def test_heading_filter_uses_simulation_time_independently_of_wall_time(self) -> None:
+        results = {}
+        for wall_dt, physics_dt in ((0.01, 0.05), (0.20, 0.05), (0.01, 0.15)):
+            self.setUp()
+            self.fire()
+            self.pose = (0.0, 0.0, -0.1)
+            results[wall_dt, physics_dt] = self.tick("forward", wall_dt=wall_dt, dt=physics_dt).velocity[2]
+        self.assertGreater(results[0.01, 0.05], 0.0)
+        self.assertAlmostEqual(results[0.01, 0.05], results[0.20, 0.05])
+        self.assertGreater(results[0.01, 0.15], results[0.01, 0.05])
+
+    def test_heading_feedback_clears_on_hold_release_loss_fault_and_reset_then_reanchors(self) -> None:
+        for release in ({"target": None}, {"eye_valid": False}, {"target": "occluded"}, {"pose": None}):
+            with self.subTest(release=release):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+                self.fire()
+                self.pose = (0.0, 0.0, -0.2)
+                self.assertGreater(self.tick("forward").velocity[2], 0.0)
+                values = {"target": "forward", **release}
+                self.assertEqual(self.tick(**values).velocity, (0.0, 0.0, 0.0))
+                self.assertFalse(self.controller.heading_status["active"])
+                self.assertEqual(self.controller.heading_status["correction_rad_s"], 0.0)
+                self.controller.reset()
+                self.assertIsNone(self.controller.heading_status["target_yaw_rad"])
+                self.assertEqual(self.fire().velocity[2], 0.0)
+                self.assertEqual(self.controller.heading_status["target_yaw_rad"], -0.2)
+
+    def test_heading_feedback_preserves_turns_preview_and_step_completion(self) -> None:
+        for action, expected in (("turn_left", 0.25), ("turn_right", -0.25)):
+            self.setUp()
+            self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+            self.fire(action)
+            self.pose = (0.0, 0.0, 0.4)
+            self.assertEqual(self.tick(action).velocity, (0.0, 0.0, expected))
+            self.assertFalse(self.controller.heading_status["active"])
+        self.setUp()
+        self.controller = GAZE.GazeLocomotion(replace(self.config, preview=True))
+        self.assertEqual(self.fire().velocity, (0.0, 0.0, 0.0))
+        self.assertFalse(self.controller.heading_status["active"])
+        self.setUp()
+        self.fire()
+        self.pose = (0.1, 0.0, -0.2)
+        result = self.tick(eye_valid=False)  # Accepted steps still own heading after eye loss.
+        self.assertAlmostEqual(result.progress, 0.5)
+        self.assertGreater(result.velocity[2], 0.0)
+        self.pose = (0.2, 0.0, -0.2)
+        result = self.tick()
+        self.assertEqual((result.state, result.velocity), ("stopping", (0.0, 0.0, 0.0)))
+        self.assertFalse(self.controller.heading_status["active"])
 
     def test_hold_look_away_or_other_button_requests_normal_stop_without_switching(self) -> None:
         for target in (None, "turn_left"):

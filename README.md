@@ -451,6 +451,14 @@ pickup and loaded transport still require validation. See the
 [operating guide](HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free) for
 configuration and the preview/movement distinction.
 
+Forward and Back capture the robot's heading when each movement starts and request
+bounded corrective turning while active. This uses the existing physical walking
+controller; explicit turns keep their normal behavior. With the default gain of
+3.0/s, a paired synthetic-eye run reduced Forward's heading error from 3.20° right
+to 1.31° right. Back's heading error also decreased, while its sideways drift was
+essentially unchanged. **999 offline regressions passed** with the final default.
+Heading hold does not guarantee a straight path.
+
 The default is `G1_GAZE_MODE=hold` with `G1_GAZE_DWELL_S=0`. An explicit positive
 dwell, such as `$env:G1_GAZE_DWELL_S='0.7'`, restores the delay and progress ring.
 Set `$env:G1_GAZE_MODE='step'` and `$env:G1_GAZE_DWELL_S='0.7'` before launching
@@ -460,7 +468,7 @@ optional mode, the accepted movement finishes even after looking away. Distance
 and angle settings apply only to step mode. An explicit dwell override applies
 to either mode.
 
-**990 offline regressions passed.** The actual-scene preview passed immediate
+**Before heading feedback, 990 offline regressions passed.** The actual-scene preview passed immediate
 activation, and all four physical directions passed with synthetic eyes. Each
 release was observed for five simulation seconds without a fault; simulated eye
 loss immediately cleared Forward's command. Arm/finger updates continued. Live

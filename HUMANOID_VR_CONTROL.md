@@ -502,6 +502,14 @@ The reported automatic pause came from the duplicate four-second pelvis-settling
 check during arm movement, with a near-zero movement command and an upright robot.
 Removing that hold-mode check leaves the existing support-aware motion guard active.
 
+Forward and Back capture the robot's heading at activation and use bounded yaw
+feedback to reduce turning away from that heading. This applies to both hold and
+step translations; Turn left/right keep their existing behavior. In hold mode,
+looking away or losing eye tracking ends the correction with the movement request.
+Heading control sends commands through the existing walking controller; it does
+not pin or teleport the robot or alter the camera to conceal drift. It does not
+correct sideways displacement or guarantee a straight path.
+
 To retain the previous bounded interaction, set `$env:G1_GAZE_MODE='step'` and
 `$env:G1_GAZE_DWELL_S='0.7'` before launching, replacing the zero delay above.
 The **0.7-second dwell** requests one **0.20 m** forward/backward move
@@ -529,6 +537,9 @@ an explicit `step` override. Supply settings in the environment before starting 
 | `G1_GAZE_FORWARD_SPEED` | `0.20` | Forward command speed, in m/s |
 | `G1_GAZE_BACKWARD_SPEED` | `0.15` | Backward command speed, in m/s |
 | `G1_GAZE_YAW_SPEED` | `0.25` | Turn command speed, in rad/s |
+| `G1_GAZE_HEADING_HOLD` | `1` | Enable heading feedback during Forward/Back; `0` disables it |
+| `G1_GAZE_HEADING_GAIN` | `3.0` | Corrective yaw speed per radian of heading error, in 1/s |
+| `G1_GAZE_HEADING_MAX_YAW_SPEED` | `0.15` | Maximum heading-correction magnitude, in rad/s |
 
 Set `G1_GAZE_BACKWARD_SPEED=0` to disable backward selection. The default enables
 it. A positive override such as `$env:G1_GAZE_DWELL_S='0.7'` restores a fixation
@@ -541,12 +552,17 @@ slow simulation changes actual movement per wall second.
 
 The directional speed settings remain bounded by the existing physical profile's
 0.65 m/s forward, 0.35 m/s backward and 0.40 rad/s yaw caps. The source supports
-backward walking. **990 offline regressions passed**, and the actual-scene
+backward walking. **Before heading feedback, 990 offline regressions passed**, and the actual-scene
 preview and physical runs passed all four controls with synthetic eyes. Physical
 movement continued during a three-second hold beyond the old step/turn limits.
 Each release was observed for five simulation seconds without a fault, including
 immediate command clearing on Forward's simulated eye loss. Arm/finger updates
-continued. These checks do not establish hardware eye tracking or loaded grasping.
+continued. A subsequent paired run with heading feedback at gain 3.0/s passed
+all four physical actions without faults. Forward's heading error decreased from
+3.20° to 1.31° right; Back's decreased from 2.31° to 0.47° right, while Back's
+sideways drift remained about 3.6 cm. These synthetic-eye, neutral-arm checks do
+not establish hardware eye tracking, active-arm performance or loaded grasping.
+The final gain-3.0 default passed **999 offline regressions**.
 Preview checks selection and
 hand availability, not balance,
 gait, braking, shelf pickup or loaded transport. A displayed selection is an

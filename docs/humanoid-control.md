@@ -958,6 +958,24 @@ Forward/reverse/yaw requests remain bounded by the direct-control caps
 0.65/0.35 m/s and 0.40 rad/s. These are requested targets, not guaranteed physical
 travel or stopping distances. The existing actor supports reverse movement;
 loaded transport still requires a separate physical acceptance check.
+
+Forward/Back translations in both gaze modes capture measured robot yaw at
+activation and request corrective yaw toward that reference while active. The
+default `G1_GAZE_HEADING_HOLD=1` enables this feedback; `0` disables it. The
+proportional gain `G1_GAZE_HEADING_GAIN=3.0` has units of 1/s (rad/s per radian of
+heading error), with a fixed 0.5-degree deadband and a 0.15-second simulation-time
+error filter. `G1_GAZE_HEADING_MAX_YAW_SPEED=0.15` bounds the correction in rad/s.
+The resulting yaw request passes through the existing base-command filter and
+walking controller. Explicit Turn left/right commands keep their existing speed
+and behavior. Ending a hold request, including eye loss, stops generating heading
+correction; an accepted step retains feedback until that step ends. Reset and a
+new activation discard the old heading reference.
+
+This is yaw feedback, not a world-pose constraint: it does not pin or teleport the
+base or change the camera to hide veering. It does not regulate cross-track
+position. Heading error and sideways displacement must be measured separately;
+heading stability alone does not establish straight-line travel.
+
 Setting `G1_GAZE_BACKWARD_SPEED=0` disables reverse selection. Dwell uses wall time;
 step-mode progress and settling use simulation time, with measured planar pose and
 speed determining completion rather than elapsed wall time alone. Hold mode does
@@ -989,7 +1007,25 @@ describes application observation rather than proven device freshness. The
 existing `gaze.csv` distinguishes eye tracking from HMD fallback; a ray hit alone
 does not establish selection or human intent.
 
-**Immediate-hold validation on 8 November 2026:** all **990 offline regressions
+**Heading-feedback validation on 8 November 2026:** paired actual-scene runs with
+feedback disabled and with gain 3.0/s passed all four actions. Each used a
+three-second hold and five simulation seconds of observation after release,
+with the physical guards active and no latched fault. Measurements below are at
+the end of the translation hold, relative to its captured starting heading:
+
+| Action | Heading error, feedback off | Heading error, gain 3.0/s | Sideways drift, feedback off | Sideways drift, gain 3.0/s |
+| --- | --- | --- | --- | --- |
+| Forward | 3.20° right | 1.31° right | 1.33 cm right | 0.73 cm right |
+| Back | 2.31° right | 0.47° right | 3.63 cm right | 3.62 cm right |
+
+Forward's largest sampled heading error with feedback was 2.30°. Heading drift
+decreased in these runs; reverse sideways drift was essentially unchanged. The
+gain-3.0 run retained 6,974 arm updates and 6,974 finger updates. These checks used
+synthetic eyes and neutral arms, not hardware tracking, active-arm manipulation or
+a carried payload. The final gain-3.0 default passed **999 offline regressions in
+12.405 seconds**.
+
+**Immediate-hold validation before heading feedback on 8 November 2026:** all **990 offline regressions
 passed**, and the actual-scene anchored preview passed immediate activation for
 all four controls with synthetic eyes. The physical run also passed all four
 directions, holding each for three seconds and continuing beyond the former

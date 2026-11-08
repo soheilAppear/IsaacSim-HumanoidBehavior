@@ -48,6 +48,9 @@ class TestGazeIntegrationControls(unittest.TestCase):
             "G1_GAZE_BACKWARD_SPEED": "0.15",
             "G1_GAZE_YAW_SPEED": "0.25",
             "G1_GAZE_MAX_GAP_S": "0.25",
+            "G1_GAZE_HEADING_HOLD": "1",
+            "G1_GAZE_HEADING_GAIN": "3.0",
+            "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.15",
             "G1_OPTICAL_HANDS_ONLY": "0",
             "G1_GRASP_MODE": "physical",
             "G1_WEBCAM_ENABLED": "0",
@@ -178,6 +181,9 @@ class TestGazeIntegrationControls(unittest.TestCase):
             ("G1_GAZE_YAW_SPEED", "0.41"),
             ("G1_GAZE_PREVIEW", "maybe"),
             ("G1_GAZE_MODE", "toggle"),
+            ("G1_GAZE_HEADING_HOLD", "maybe"),
+            ("G1_GAZE_HEADING_GAIN", "nan"),
+            ("G1_GAZE_HEADING_MAX_YAW_SPEED", "0.41"),
         ):
             with self.subTest(variable=variable), self.assertRaises(ValueError):
                 self.make_example(**{variable: value})
@@ -346,6 +352,30 @@ class TestGazeIntegrationControls(unittest.TestCase):
             example = HUMANOID.HumanoidExample()
         self.assertEqual(example._gaze_locomotion.config.dwell_s, 0.7)
         self.assertEqual(self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion.config.dwell_s, 0.3)
+
+    def test_forward_heading_correction_reaches_base_and_eye_loss_clears_it(self) -> None:
+        self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold", G1_GAZE_DWELL_S="0")._gaze_locomotion
+        self.tick()
+        self.tick("forward")
+        self.ex._get_g1_base_pose_for_arms.return_value = (Gf.Vec3d(0.1, 0, 0.8), -0.15)
+        for _ in range(20):
+            result = self.tick("forward", dt=0.01)
+        self.assertEqual(result.velocity[:2], (0.2, 0))
+        self.assertGreater(float(self.ex._controller_command[2]), 0)
+        self.assertLessEqual(float(self.ex._controller_command[2]), 0.150001)
+        status = self.ex.gaze_locomotion_status()["heading"]
+        self.assertTrue(status["active"])
+        self.ex._base_command[:] = self.ex._controller_command
+        self.ex._eye_gaze_tracker.read_control_ray.return_value = None
+        self.tick("forward")
+        for command in (self.ex._base_command, self.ex._controller_command):
+            np.testing.assert_array_equal(command.numpy(), (0, 0, 0))
+        self.assertFalse(self.ex.gaze_locomotion_status()["heading"]["active"])
+
+    def test_heading_feedback_can_be_disabled_without_disabling_gaze(self) -> None:
+        example = self.make_example(G1_GAZE_HEADING_HOLD="0")
+        self.assertTrue(example._gaze_walking_enabled)
+        self.assertFalse(example._gaze_locomotion.config.heading_hold)
 
     def test_active_gaze_movement_keeps_fingers_and_arms_before_final_motor_efforts(self) -> None:
         self.activate()

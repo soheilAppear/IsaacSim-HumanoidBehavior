@@ -105,6 +105,9 @@ class TestGazeLauncherControls(unittest.TestCase):
             "G1_GAZE_FORWARD_SPEED": "0.20",
             "G1_GAZE_BACKWARD_SPEED": "0",
             "G1_GAZE_YAW_SPEED": "0.25",
+            "G1_GAZE_HEADING_HOLD": "1",
+            "G1_GAZE_HEADING_GAIN": "3.0",
+            "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.15",
         }.items():
             self.assertEqual(values[key], value)
 
@@ -137,6 +140,20 @@ class TestGazeLauncherControls(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(values["G1_GAZE_MODE"], mode)
                 self.assertEqual(values["G1_GAZE_DWELL_S"], expected)
+
+    def test_explicit_heading_feedback_settings_are_preserved(self) -> None:
+        """Forward heading-feedback opt-out and tuning survive either launch profile."""
+        overrides = {
+            "G1_GAZE_HEADING_HOLD": "0",
+            "G1_GAZE_HEADING_GAIN": "2.0",
+            "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.10",
+        }
+        for args in ((), ("--move",)):
+            with self.subTest(args=args):
+                result, values, _ = self._run_launcher(*args, overrides=overrides)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for name, value in overrides.items():
+                    self.assertEqual(values[name], value)
 
     def test_base_launcher_failure_is_returned(self) -> None:
         result, _, _ = self._run_launcher("--move", exit_code=23)

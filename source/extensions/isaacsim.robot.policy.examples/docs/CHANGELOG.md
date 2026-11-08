@@ -1,5 +1,21 @@
 # Changelog
 
+## HumanoidBehavior gaze translation heading feedback — 2026-11-08
+
+- Capture robot yaw at the start of Forward/Back in both gaze modes and request
+  bounded corrective yaw through the existing walking controller while active.
+  Keep explicit turns unchanged; hold release/eye loss ends the correction with
+  the movement request. Do not pin/teleport the robot or change camera pose.
+- Default heading feedback to enabled, with gain 3.0/s and a 0.15 rad/s correction
+  cap; preserve explicit environment overrides. Filter heading error over 0.15
+  simulation seconds and apply a 0.5-degree deadband.
+- Paired physical checks pass all four actions with feedback off and gain 3.0/s,
+  observing each release for five simulation seconds without faults. Forward
+  heading error decreases from 3.20° to 1.31° right; reverse sideways drift remains
+  about 3.6 cm despite improved heading. Inputs are synthetic, arms neutral and
+  no payload is carried. Pass 999 offline regressions with the final gain-3.0
+  default, including launcher default/override coverage. Earlier results predate feedback.
+
 ## HumanoidBehavior immediate gaze activation — 2026-11-08
 
 - Default hold mode to zero activation delay: the first valid tracked button hit

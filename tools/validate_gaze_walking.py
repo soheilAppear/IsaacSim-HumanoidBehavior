@@ -432,6 +432,10 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                     held_dy = held["position_m"][1] - start["position_m"][1]
                     held_forward = held_dx * math.cos(start["yaw_rad"]) + held_dy * math.sin(start["yaw_rad"])
                     held_yaw = (held["yaw_rad"] - start["yaw_rad"] + math.pi) % (2 * math.pi) - math.pi
+                    entry["held_heading_error_degrees"] = math.degrees(held_yaw)
+                    entry["held_cross_track_m"] = -held_dx * math.sin(start["yaw_rad"]) + held_dy * math.cos(
+                        start["yaw_rad"]
+                    )
                     entry["signed_held_progress"] = {
                         "forward": held_forward,
                         "back": -held_forward,
@@ -444,6 +448,31 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                         else math.radians(example._gaze_locomotion.config.turn_degrees)
                     )
                     _require(entry["signed_held_progress"] > old_goal, "Held movement stopped at the old step limit")
+                    if action in ("forward", "back"):
+                        active_samples = [
+                            sample
+                            for sample in report["motion_samples"]
+                            if start["control_sim_time_s"] <= sample["control_sim_time_s"] <= held["control_sim_time_s"]
+                        ]
+                        active_samples.extend((start, held))
+                        entry["max_sampled_heading_error_degrees"] = max(
+                            abs(
+                                math.degrees((sample["yaw_rad"] - start["yaw_rad"] + math.pi) % (2 * math.pi) - math.pi)
+                            )
+                            for sample in active_samples
+                        )
+                        entry["max_sampled_heading_correction_rad_s"] = max(
+                            abs(sample["status"]["heading"]["correction_rad_s"]) for sample in active_samples
+                        )
+                        if report["heading_hold"]:
+                            _require(
+                                abs(entry["held_heading_error_degrees"]) <= 3.0,
+                                "Translation finished its held interval more than 3 degrees from the starting heading",
+                            )
+                            _require(
+                                entry["max_sampled_heading_error_degrees"] <= 6.0,
+                                "Translation exceeded the 6 degree sampled heading envelope",
+                            )
                 _require(entry["planar_displacement_m"] < 1.0, "Short-action fixture exceeded one meter of travel")
             entry["passed"] = True
             print(f"Gaze validation: {action} passed ({fixture['elapsed_s']:.2f} simulated seconds)", flush=True)
@@ -511,6 +540,8 @@ def main() -> int:
     parser.add_argument("--mode", choices=("preview", "move"), default="preview")
     parser.add_argument("--control-mode", choices=("step", "hold"), default="step")
     parser.add_argument("--dwell-s", type=float, default=None, help="Default: 0 for hold, 0.7 for step")
+    parser.add_argument("--heading-hold", choices=("0", "1"), default="1", help="Use 0 for an unassisted baseline")
+    parser.add_argument("--heading-gain", type=float, default=3.0, help="Heading feedback gain in 1/s")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--load-timeout", type=float, default=180.0)
     parser.add_argument("--test-timeout", type=float, default=180.0)
@@ -519,6 +550,8 @@ def main() -> int:
         args.dwell_s = 0.0 if args.control_mode == "hold" else 0.7
     if not math.isfinite(args.dwell_s) or not 0 <= args.dwell_s <= 5:
         parser.error("--dwell-s must be finite and between 0 and 5")
+    if not math.isfinite(args.heading_gain) or not 0 <= args.heading_gain <= 5:
+        parser.error("--heading-gain must be finite and between 0 and 5")
     for name in ("load_timeout", "test_timeout"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be finite and positive")
@@ -532,6 +565,8 @@ def main() -> int:
         "mode": args.mode,
         "control_mode": args.control_mode,
         "dwell_s": args.dwell_s,
+        "heading_hold": args.heading_hold == "1",
+        "heading_gain": args.heading_gain,
         "run_id": run_id,
         "fixture": "Real warehouse/robot/actor; synthetic tracked eye descriptors; no injected hands or payload",
         "dwell_clock": "Synthetic monotonic selection time advanced by physics dt only inside gaze update",
@@ -557,6 +592,9 @@ def main() -> int:
             "G1_GAZE_PREVIEW": "1" if args.mode == "preview" else "0",
             "G1_GAZE_MODE": args.control_mode,
             "G1_GAZE_DWELL_S": str(args.dwell_s),
+            "G1_GAZE_HEADING_HOLD": args.heading_hold,
+            "G1_GAZE_HEADING_GAIN": str(args.heading_gain),
+            "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.15",
             "G1_GAZE_DISTANCE_M": "0.20",
             "G1_GAZE_TURN_DEG": "10",
             "G1_GAZE_FORWARD_SPEED": "0.20",

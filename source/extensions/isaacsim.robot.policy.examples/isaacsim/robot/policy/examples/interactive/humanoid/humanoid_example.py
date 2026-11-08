@@ -8045,6 +8045,9 @@ class HumanoidExample(BaseSample):
         preview = os.environ.get("G1_GAZE_PREVIEW", "1").strip().lower()
         if preview not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
             raise ValueError("G1_GAZE_PREVIEW must be a boolean (1 for preview, 0 for movement)")
+        heading_hold = os.environ.get("G1_GAZE_HEADING_HOLD", "1").strip().lower()
+        if heading_hold not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
+            raise ValueError("G1_GAZE_HEADING_HOLD must be a boolean")
         control_mode = os.environ.get("G1_GAZE_MODE", "hold").strip().lower()
         config = GazeLocomotionConfig(
             control_mode=control_mode,
@@ -8056,6 +8059,9 @@ class HumanoidExample(BaseSample):
             yaw_speed=float(os.environ.get("G1_GAZE_YAW_SPEED", "0.25")),
             preview=preview in ("1", "true", "yes", "on"),
             max_gaze_gap_s=float(os.environ.get("G1_GAZE_MAX_GAP_S", "0.25")),
+            heading_hold=heading_hold in ("1", "true", "yes", "on"),
+            heading_gain=float(os.environ.get("G1_GAZE_HEADING_GAIN", "3.0")),
+            heading_max_yaw_speed=float(os.environ.get("G1_GAZE_HEADING_MAX_YAW_SPEED", "0.15")),
         )
         if config.forward_speed > 0.65 or config.backward_speed > 0.35 or config.yaw_speed > 0.40:
             raise ValueError("Gaze speeds exceed supported caps: forward 0.65 m/s, back 0.35 m/s, yaw 0.40 rad/s")
@@ -8149,6 +8155,7 @@ class HumanoidExample(BaseSample):
             "stop_immediately": command.stop_immediately,
             "detail": command.detail,
             "last_stop": self._gaze_locomotion.stop_diagnostics,
+            "heading": self._gaze_locomotion.heading_status,
             "dwell_s": config.dwell_s,
             "distance_m": config.distance_m,
             "turn_degrees": config.turn_degrees,

@@ -45,6 +45,9 @@ class GazeLocomotionConfig:
         preview: Emit selection events and status while keeping every velocity zero.
         max_gaze_gap_s: Largest permitted wall-time gap within a dwell, from 0.05 to 1 second.
         control_mode: ``step`` finishes a measured distance/angle; ``hold`` requires continued fixation.
+        heading_hold: Correct measured heading drift during live forward/back translation.
+        heading_gain: Proportional heading-error gain, from 0 to 5 inverse seconds.
+        heading_max_yaw_speed: Correction cap, from 0 to 0.4 radians per second.
 
     Raises:
         ValueError: A setting is nonfinite, has the wrong type, or is outside its range.
@@ -59,6 +62,9 @@ class GazeLocomotionConfig:
     preview: bool = True
     max_gaze_gap_s: float = 0.25
     control_mode: str = "step"
+    heading_hold: bool = True
+    heading_gain: float = 3.0
+    heading_max_yaw_speed: float = 0.15
 
     def __post_init__(self) -> None:
         """Reject invalid configuration before any input can produce a command."""
@@ -70,12 +76,16 @@ class GazeLocomotionConfig:
             ("backward_speed", 0.0, 1.0),
             ("yaw_speed", 0.01, 1.5),
             ("max_gaze_gap_s", 0.05, 1.0),
+            ("heading_gain", 0.0, 5.0),
+            ("heading_max_yaw_speed", 0.0, 0.4),
         ):
             value = getattr(self, name)
             if not _finite(value) or not lower <= value <= upper:
                 raise ValueError(f"{name} must be finite and in [{lower}, {upper}]")
         if type(self.preview) is not bool:
             raise ValueError("preview must be a boolean")
+        if type(self.heading_hold) is not bool:
+            raise ValueError("heading_hold must be a boolean")
         if not isinstance(self.control_mode, str) or self.control_mode not in ("step", "hold"):
             raise ValueError("control_mode must be 'step' or 'hold'")
 
@@ -132,6 +142,8 @@ class GazeLocomotion:
     SETTLE_YAW_DRIFT_RAD_S = 0.04
     SETTLE_PEAK_LINEAR_SPEED_M_S = 0.15
     SETTLE_PEAK_YAW_SPEED_RAD_S = 0.30
+    HEADING_DEADBAND_RAD = math.radians(0.5)
+    HEADING_FILTER_S = 0.15
 
     def __init__(self, config: GazeLocomotionConfig | None = None) -> None:
         if config is not None and not isinstance(config, GazeLocomotionConfig):
@@ -163,7 +175,25 @@ class GazeLocomotion:
         self._last_action: str | None = None
         self._activation_count = 0
         self._stop_diagnostics = getattr(self, "_stop_diagnostics", {})
+        self._clear_heading()
         self.command = GazeLocomotionCommand()
+
+    @property
+    def heading_status(self) -> dict:
+        """Return current translation feedback; this never changes a root pose."""
+        return dict(self._heading_status)
+
+    def _clear_heading(self) -> None:
+        """Discard the filter and correction when no translation owns heading."""
+        self._filtered_heading_error = 0.0
+        self._heading_status = {
+            "enabled": self.config.heading_hold,
+            "active": False,
+            "target_yaw_rad": None,
+            "error_rad": 0.0,
+            "filtered_error_rad": 0.0,
+            "correction_rad_s": 0.0,
+        }
 
     @property
     def stop_diagnostics(self) -> dict:
@@ -197,6 +227,8 @@ class GazeLocomotion:
         stop_immediately: bool = False,
     ) -> GazeLocomotionCommand:
         """Publish immutable status, enforcing the preview zero-velocity invariant."""
+        if state != "active":
+            self._clear_heading()
         self.command = GazeLocomotionCommand(
             state=state,
             target=target,
@@ -228,6 +260,39 @@ class GazeLocomotion:
             "turn_right": (0.0, 0.0, -self.config.yaw_speed),
         }[action]
 
+    def _active_velocity(self, action: str, pose: tuple[float, float, float], dt: float) -> tuple[float, float, float]:
+        """Steer translation toward its starting yaw through bounded actor input.
+
+        Filter wrapped error in simulation time to suppress gait oscillation.
+        The small continuous deadband avoids correcting normal heading noise.
+        Reverse keeps the same yaw-error sign; explicit turns own their own yaw.
+        """
+        velocity = self._velocity(action)
+        if not self.config.heading_hold or action not in ("forward", "back") or self.config.preview:
+            self._clear_heading()
+            return velocity
+        target_yaw = self._start_pose[2]
+        error = (target_yaw - pose[2] + math.pi) % (2.0 * math.pi) - math.pi
+        increment = (error - self._filtered_heading_error + math.pi) % (2.0 * math.pi) - math.pi
+        alpha = -math.expm1(-dt / self.HEADING_FILTER_S)
+        self._filtered_heading_error = (self._filtered_heading_error + alpha * increment + math.pi) % (
+            2.0 * math.pi
+        ) - math.pi
+        outside_deadband = math.copysign(
+            max(0.0, abs(self._filtered_heading_error) - self.HEADING_DEADBAND_RAD), self._filtered_heading_error
+        )
+        cap = self.config.heading_max_yaw_speed
+        correction = max(-cap, min(cap, self.config.heading_gain * outside_deadband))
+        self._heading_status = {
+            "enabled": True,
+            "active": True,
+            "target_yaw_rad": target_yaw,
+            "error_rad": error,
+            "filtered_error_rad": self._filtered_heading_error,
+            "correction_rad_s": correction,
+        }
+        return velocity[0], velocity[1], correction
+
     def _description(self, action: str) -> str:
         """Describe the selected action and its mode-specific stopping rule."""
         if action in ("forward", "back"):
@@ -246,6 +311,7 @@ class GazeLocomotion:
         self._candidate = self._dwell_start_s = None
         self._last_action = action
         self._activation_count += 1
+        self._clear_heading()
         if self.config.preview:
             return self._publish(
                 "preview",
@@ -260,7 +326,7 @@ class GazeLocomotion:
         self._yaw_travel = self._move_elapsed_s = self._motion_progress = 0.0
         if self.config.control_mode == "hold":
             self._motion_progress = 1.0
-        velocity = self._velocity(action)
+        velocity = self._active_velocity(action, pose, 0.0)
         nominal_time = (
             self.config.distance_m / abs(velocity[0])
             if action in ("forward", "back")
@@ -444,7 +510,7 @@ class GazeLocomotion:
                 f"Requested {self._description(action)}",
                 target=action,
                 progress=1.0,
-                velocity=self._velocity(action),
+                velocity=self._active_velocity(action, pose, dt),
             )
 
         self._move_elapsed_s += dt
@@ -472,7 +538,7 @@ class GazeLocomotion:
             f"Requested {self._description(action)}",
             target=action,
             progress=self._motion_progress,
-            velocity=self._velocity(action),
+            velocity=self._active_velocity(action, pose, dt),
         )
 
     def update(
