@@ -56,7 +56,11 @@ class HumanoidExampleExtension(omni.ext.IExt):
         if sample._gaze_walking_enabled:
             config = sample._gaze_locomotion.config
             overview = "Eye-gaze preview: the base is anchored. " if config.preview else "Eye-gaze walking: "
-            overview += f"Look between the side buttons first, then dwell for {config.dwell_s:g} seconds. "
+            overview += "Look between the side buttons first. "
+            if config.dwell_s > 0:
+                overview += f"Then dwell for {config.dwell_s:g} seconds; the ring shows selection progress. "
+            else:
+                overview += "Looking at a button activates it immediately, including a quick glance; no dwell ring. "
             if config.control_mode == "hold":
                 overview += "Keep looking at the same button to continue moving; look away to stop. "
                 overview += "Loss of valid eye tracking also stops movement. "
@@ -65,7 +69,7 @@ class HumanoidExampleExtension(omni.ext.IExt):
                     f"Forward/Back request {config.distance_m:g} m; turns request {config.turn_degrees:g} degrees. "
                 )
                 overview += "Look back at your box after selection; the short action finishes and stops automatically. "
-            overview += "The ring shows selection progress. Wait for the robot to stop before selecting again. "
+                overview += "Wait for the robot to stop before selecting again. "
             overview += "Look away and return for another action. Only tracked eyes select; head direction cannot. "
             if config.backward_speed == 0.0:
                 overview += "Back is disabled because the configured reverse speed is zero. "

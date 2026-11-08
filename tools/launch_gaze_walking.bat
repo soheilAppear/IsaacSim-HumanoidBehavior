@@ -3,7 +3,7 @@ REM Gaze buttons leave both optical hands free for manipulation.
 REM Default to an anchored preview on every invocation, regardless of inherited
 REM G1_GAZE_PREVIEW. Only a first --move argument enables physical walking.
 REM Preview and movement use different base topology: exit and relaunch to switch.
-REM Hold-to-move is the default; G1_GAZE_MODE=step retains bounded steps/turns.
+REM Hold activates immediately by default; step retains bounded steps/turns and dwell.
 setlocal DisableDelayedExpansion
 set "G1_GESTURE_WALKING=1"
 set "G1_LOCOMOTION_INPUT=gaze"
@@ -11,7 +11,13 @@ set "G1_POINTING_NAVIGATION=0"
 set "G1_OPTICAL_HANDS_ONLY=1"
 set "G1_GAZE_PREVIEW=1"
 if not defined G1_GAZE_MODE set "G1_GAZE_MODE=hold"
-if not defined G1_GAZE_DWELL_S set "G1_GAZE_DWELL_S=0.7"
+if not defined G1_GAZE_DWELL_S (
+    if /i "%G1_GAZE_MODE%"=="step" (
+        set "G1_GAZE_DWELL_S=0.7"
+    ) else (
+        set "G1_GAZE_DWELL_S=0"
+    )
+)
 if not defined G1_GAZE_DISTANCE_M set "G1_GAZE_DISTANCE_M=0.20"
 if not defined G1_GAZE_TURN_DEG set "G1_GAZE_TURN_DEG=10"
 if not defined G1_GAZE_FORWARD_SPEED set "G1_GAZE_FORWARD_SPEED=0.20"

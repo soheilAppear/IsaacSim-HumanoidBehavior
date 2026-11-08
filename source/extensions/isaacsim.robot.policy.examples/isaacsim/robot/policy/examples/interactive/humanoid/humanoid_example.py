@@ -8045,9 +8045,10 @@ class HumanoidExample(BaseSample):
         preview = os.environ.get("G1_GAZE_PREVIEW", "1").strip().lower()
         if preview not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
             raise ValueError("G1_GAZE_PREVIEW must be a boolean (1 for preview, 0 for movement)")
+        control_mode = os.environ.get("G1_GAZE_MODE", "hold").strip().lower()
         config = GazeLocomotionConfig(
-            control_mode=os.environ.get("G1_GAZE_MODE", "hold").strip().lower(),
-            dwell_s=float(os.environ.get("G1_GAZE_DWELL_S", "0.7")),
+            control_mode=control_mode,
+            dwell_s=float(os.environ.get("G1_GAZE_DWELL_S", "0" if control_mode == "hold" else "0.7")),
             distance_m=float(os.environ.get("G1_GAZE_DISTANCE_M", "0.20")),
             turn_degrees=float(os.environ.get("G1_GAZE_TURN_DEG", "10")),
             forward_speed=float(os.environ.get("G1_GAZE_FORWARD_SPEED", "0.20")),
@@ -8114,12 +8115,12 @@ class HumanoidExample(BaseSample):
             self._controller_command[axis] = value
         smooth_release = (
             self._gaze_locomotion.config.control_mode == "hold"
-            and command.state == "stopping"
+            and not self._gaze_locomotion.config.preview
             and not command.stop_immediately
         )
         if not any(command.velocity) and not smooth_release:
             # Ordinary hold release uses the existing fast release filter.
-            # Tracking/session failures, faults, preview and completed stops
+            # Tracking/session failures, faults and preview
             # clear the filter immediately. Standing still retains balance control.
             self._base_command[:] = 0.0
         self._navigation_scene.hide()
@@ -8147,6 +8148,7 @@ class HumanoidExample(BaseSample):
             "requested_velocity": command.velocity,
             "stop_immediately": command.stop_immediately,
             "detail": command.detail,
+            "last_stop": self._gaze_locomotion.stop_diagnostics,
             "dwell_s": config.dwell_s,
             "distance_m": config.distance_m,
             "turn_degrees": config.turn_degrees,

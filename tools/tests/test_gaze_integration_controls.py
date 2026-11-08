@@ -293,19 +293,22 @@ class TestGazeIntegrationControls(unittest.TestCase):
         self.activate()
         self.ex._base_command[:] = torch.tensor([0.2, 0, 0])
         result = self.tick(None)
-        self.assertEqual(result.state, "stopping")
+        self.assertEqual(result.state, "idle")
         self.assertFalse(result.stop_immediately)
         np.testing.assert_allclose(self.ex._base_command.numpy(), (0.2, 0, 0))
         np.testing.assert_array_equal(self.ex._controller_command.numpy(), (0, 0, 0))
         self.ex._teleop_input_dt = 0.02
         values = []
         for _ in range(10):
+            self.tick(None)
             self.ex._smooth_base_command(self.ex._controller_command, 0.005)
             values.append(float(self.ex._base_command[0]))
         self.assertTrue(all(a > b > 0 for a, b in zip([0.2, *values], values)))
         self.assertLess(values[-1], 0.01)
-        for _ in range(8):
-            self.assertEqual(self.tick("turn_left").activation_count, 1)
+        for _ in range(4):
+            result = self.tick("turn_left")
+        self.assertEqual(result.activation_count, 2)
+        self.assertEqual(result.activated_action, "turn_left")
 
     def test_hold_tracking_loss_bypasses_release_filter_immediately(self) -> None:
         self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion
@@ -313,7 +316,7 @@ class TestGazeIntegrationControls(unittest.TestCase):
         self.ex._base_command[:] = torch.tensor([0.2, 0, 0])
         self.ex._eye_gaze_tracker.read_control_ray.return_value = None
         result = self.tick("forward")
-        self.assertEqual(result.state, "stopping")
+        self.assertEqual(result.state, "unavailable")
         self.assertTrue(result.stop_immediately)
         for commands in (self.ex._base_command, self.ex._controller_command, self.ex._keyboard_command):
             np.testing.assert_array_equal(commands.numpy(), (0, 0, 0))
@@ -321,9 +324,28 @@ class TestGazeIntegrationControls(unittest.TestCase):
     def test_gaze_profile_defaults_to_hold_and_retains_explicit_step(self) -> None:
         with patch.dict(os.environ, {"G1_LOCOMOTION_INPUT": "gaze"}):
             os.environ.pop("G1_GAZE_MODE", None)
+            os.environ.pop("G1_GAZE_DWELL_S", None)
             example = HUMANOID.HumanoidExample()
         self.assertEqual(example._gaze_locomotion.config.control_mode, "hold")
+        self.assertEqual(example._gaze_locomotion.config.dwell_s, 0)
         self.assertEqual(self.ex._gaze_locomotion.config.control_mode, "step")
+
+    def test_zero_dwell_requests_movement_on_first_valid_button_sample(self) -> None:
+        self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold", G1_GAZE_DWELL_S="0")._gaze_locomotion
+        self.tick()
+        result = self.tick("forward")
+        self.assertEqual((result.state, result.activated_action), ("active", "forward"))
+        self.assertGreater(float(self.ex._controller_command[0]), 0)
+        self.tick()
+        result = self.tick("turn_left")
+        self.assertEqual((result.state, result.activated_action, result.activation_count), ("active", "turn_left", 2))
+
+    def test_step_retains_dwell_default_and_hold_accepts_positive_override(self) -> None:
+        with patch.dict(os.environ, {"G1_LOCOMOTION_INPUT": "gaze", "G1_GAZE_MODE": "step"}):
+            os.environ.pop("G1_GAZE_DWELL_S", None)
+            example = HUMANOID.HumanoidExample()
+        self.assertEqual(example._gaze_locomotion.config.dwell_s, 0.7)
+        self.assertEqual(self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion.config.dwell_s, 0.3)
 
     def test_active_gaze_movement_keeps_fingers_and_arms_before_final_motor_efforts(self) -> None:
         self.activate()

@@ -61,6 +61,7 @@ class TestGazeLauncherControls(unittest.TestCase):
         self.assertEqual(forwarded, "")
         self.assertEqual(values["G1_GAZE_PREVIEW"], "1")
         self.assertEqual(values["G1_GAZE_MODE"], "hold")
+        self.assertEqual(values["G1_GAZE_DWELL_S"], "0")
         self.assertEqual(values["G1_GESTURE_WALKING"], "1")
         self.assertEqual(values["G1_LOCOMOTION_INPUT"], "gaze")
         self.assertEqual(values["G1_OPTICAL_HANDS_ONLY"], "1")
@@ -71,6 +72,7 @@ class TestGazeLauncherControls(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(values["G1_GAZE_PREVIEW"], "0")
         self.assertEqual(values["G1_GAZE_MODE"], "hold")
+        self.assertEqual(values["G1_GAZE_DWELL_S"], "0")
         self.assertEqual(forwarded, '--xr-verbose "--/app/title=two words"')
 
     def test_explicit_preview_is_case_insensitive_and_only_first_flag_is_consumed(self) -> None:
@@ -115,7 +117,26 @@ class TestGazeLauncherControls(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(values["G1_GAZE_MODE"], "step")
+                self.assertEqual(values["G1_GAZE_DWELL_S"], "0.7")
                 self.assertEqual(values["G1_GAZE_PREVIEW"], preview)
+
+    def test_mode_defaults_and_explicit_dwell_overrides_reach_base_launcher(self) -> None:
+        """Mode defaults never replace an explicit zero or positive activation delay."""
+        for mode, dwell, expected in (
+            ("HOLD", None, "0"),
+            ("STEP", None, "0.7"),
+            ("hold", "0.4", "0.4"),
+            ("step", "0", "0"),
+            ("step", "1.2", "1.2"),
+        ):
+            with self.subTest(mode=mode, dwell=dwell):
+                overrides = {"G1_GAZE_MODE": mode}
+                if dwell is not None:
+                    overrides["G1_GAZE_DWELL_S"] = dwell
+                result, values, _ = self._run_launcher("--move", overrides=overrides)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values["G1_GAZE_MODE"], mode)
+                self.assertEqual(values["G1_GAZE_DWELL_S"], expected)
 
     def test_base_launcher_failure_is_returned(self) -> None:
         result, _, _ = self._run_launcher("--move", exit_code=23)

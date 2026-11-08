@@ -70,7 +70,7 @@ class TestGazeLocomotionControls(unittest.TestCase):
 
     def test_configuration_rejects_nonfinite_boolean_and_out_of_range_values(self) -> None:
         ranges = {
-            "dwell_s": (0.09, 5.01),
+            "dwell_s": (-0.01, 5.01),
             "distance_m": (0.009, 1.01),
             "turn_degrees": (0.99, 90.01),
             "forward_speed": (0, 1.01),
@@ -377,16 +377,20 @@ class TestGazeLocomotionControls(unittest.TestCase):
                 self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
                 self.fire()
                 result = self.tick(target, linear_speed_m_s=0.2)
-                self.assertEqual((result.state, result.target, result.velocity), ("stopping", "forward", (0, 0, 0)))
+                expected_state = "idle" if target is None else "awaiting_release"
+                self.assertEqual((result.state, result.target, result.velocity), (expected_state, None, (0, 0, 0)))
                 self.assertFalse(result.stop_immediately)
-                result = self.tick("forward", linear_speed_m_s=0.1)
-                self.assertEqual((result.state, result.activation_count), ("stopping", 1))
-                self.assertEqual(result.velocity, (0, 0, 0))
-                self.assertEqual(self.settle("turn_left").state, "awaiting_release")
-                for _ in range(5):
-                    result = self.tick("turn_left")
-                    self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
-                self.assertEqual(self.fire("turn_left").activation_count, 2)
+                self.assertIsNone(self.controller._action)
+                if target is not None:
+                    for _ in range(5):
+                        result = self.tick(target)
+                        self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
+                    self.tick()
+                # Only selection dwell remains; no zero-speed/settling interval
+                # is imposed by hold. Physical motion supervision is external.
+                for _ in range(4):
+                    result = self.tick("turn_left", linear_speed_m_s=0.08)
+                self.assertEqual((result.state, result.activation_count), ("active", 2))
 
     def test_hold_tracking_gaps_occlusion_and_readiness_loss_stop_immediately(self) -> None:
         cases = (
@@ -404,31 +408,61 @@ class TestGazeLocomotionControls(unittest.TestCase):
                 values = dict(target="forward", linear_speed_m_s=0.1)
                 values.update(invalid)
                 result = self.tick(**values)
-                self.assertEqual((result.state, result.velocity), ("stopping", (0, 0, 0)))
+                self.assertEqual((result.state, result.velocity), ("unavailable", (0, 0, 0)))
                 self.assertTrue(result.stop_immediately)
-                result = self.tick("forward", linear_speed_m_s=0.1)
-                self.assertEqual(result.state, "stopping")
-                self.assertTrue(result.stop_immediately)
-                self.assertEqual(self.settle("forward").state, "awaiting_release")
-                self.assertEqual(self.tick("forward").activation_count, 1)
+                for _ in range(5):
+                    result = self.tick("forward", linear_speed_m_s=0.1)
+                    self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
+                    self.assertEqual(result.velocity, (0, 0, 0))
                 self.assertEqual(self.fire("back").activation_count, 2)
 
-    def test_hold_tracking_loss_during_normal_stop_escalates_and_remains_immediate(self) -> None:
+    def test_hold_tracking_loss_after_normal_release_requests_immediate_zero_and_disarms(self) -> None:
         self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
         self.fire()
         self.assertFalse(self.tick(linear_speed_m_s=0.1).stop_immediately)
         self.assertTrue(self.tick(eye_valid=False, linear_speed_m_s=0.1).stop_immediately)
-        self.assertTrue(self.tick(linear_speed_m_s=0.1).stop_immediately)
+        self.assertTrue(self.tick(eye_valid=False, linear_speed_m_s=0.1).stop_immediately)
+        for _ in range(5):
+            self.assertEqual(self.tick("forward").state, "awaiting_release")
+        self.assertEqual(self.fire().activation_count, 2)
 
-    def test_hold_no_look_away_during_stopping_can_queue_another_activation(self) -> None:
+    def test_hold_release_does_not_fault_or_claim_settled_after_long_balance_motion(self) -> None:
         self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
         self.fire()
-        self.tick()
-        self.assertEqual(self.settle().state, "awaiting_release")
-        for _ in range(8):
-            result = self.tick("forward")
-            self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
+        self.assertEqual(self.tick(linear_speed_m_s=0.08).state, "idle")
+        # This would exceed the former hold deadline and its strict pelvis-only
+        # envelope. The caller's foot-support/runaway guards still own whether
+        # physical residual motion is acceptable; this controller claims no rest.
+        for index in range(160):
+            self.pose = (0.03 * math.sin(index * 0.2), 0.03 * math.cos(index * 0.2), 0.03 * math.sin(index * 0.2))
+            result = self.tick(linear_speed_m_s=0.08, yaw_speed_rad_s=0.12)
+            self.assertEqual((result.state, result.velocity, result.activation_count), ("idle", (0, 0, 0), 1))
+        self.assertFalse(self.controller.stop_diagnostics["settling_evaluated"])
+        self.assertNotIn("settled", result.detail.lower())
         self.assertEqual(self.fire().activation_count, 2)
+
+    def test_hold_stop_diagnostics_survive_reset_and_cannot_be_mutated_by_caller(self) -> None:
+        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+        self.assertEqual(self.controller.stop_diagnostics, {})
+        self.fire()
+        self.pose = (0.2, -0.1, 0.3)
+        self.tick(eye_valid=False, linear_speed_m_s=0.08, yaw_speed_rad_s=-0.12)
+        diagnostics = self.controller.stop_diagnostics
+        self.assertEqual(diagnostics["action"], "forward")
+        self.assertEqual(diagnostics["pose"], self.pose)
+        self.assertEqual((diagnostics["linear_speed_m_s"], diagnostics["yaw_speed_rad_s"]), (0.08, 0.12))
+        self.assertTrue(diagnostics["stop_immediately"])
+        self.assertFalse(diagnostics["verified_outside"])
+        self.assertFalse(diagnostics["settling_evaluated"])
+        diagnostics["reason"] = "caller mutation"
+        self.assertEqual(self.controller.stop_diagnostics["reason"], "Eye tracking lost")
+        retained = self.controller.stop_diagnostics
+        self.controller.reset()
+        self.assertEqual(self.controller.stop_diagnostics, retained)
+        self.fire("back")
+        self.tick()
+        self.assertEqual(self.controller.stop_diagnostics["action"], "back")
+        self.assertTrue(self.controller.stop_diagnostics["verified_outside"])
 
     def test_hold_preview_is_zero_and_one_activation_per_released_fixation(self) -> None:
         self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold", preview=True))
@@ -539,6 +573,26 @@ class TestGazeLocomotionControls(unittest.TestCase):
             self.pose = (0.2 + 0.005 * index, 0, 0)
             result = self.tick(linear_speed_m_s=0.2)
         self.assertEqual(result.state, "fault")
+
+    def test_step_timeout_retains_failed_window_metrics_after_fault_and_reset(self) -> None:
+        self.fire()
+        self.pose = (0.2, 0, 0)
+        self.tick()
+        for index in range(1, 81):
+            self.pose = (0.2 + 0.005 * index, 0, 0)
+            result = self.tick(linear_speed_m_s=0.1)
+        self.assertEqual(result.state, "fault")
+        self.assertFalse(self.controller._stop_window)
+        diagnostics = self.controller.stop_diagnostics
+        self.assertEqual(diagnostics["decision"], "step_settle_timeout_fault")
+        self.assertIn("position_envelope_m", diagnostics["failed_checks"])
+        self.assertIn("endpoint_drift_m_s", diagnostics["failed_checks"])
+        self.assertIn("fitted_drift_m_s", diagnostics["failed_checks"])
+        self.assertAlmostEqual(diagnostics["elapsed_s"], 4.0)
+        self.assertAlmostEqual(diagnostics["endpoint_drift_m_s"], 0.1)
+        self.assertAlmostEqual(diagnostics["fitted_drift_m_s"], 0.1)
+        self.controller.reset()
+        self.assertEqual(self.controller.stop_diagnostics, diagnostics)
 
 
 if __name__ == "__main__":

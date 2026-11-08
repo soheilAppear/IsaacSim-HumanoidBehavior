@@ -126,6 +126,7 @@ async def _validate(example: object, module: object, report: dict, output: Path,
     _require(example._optical_hands_only, "The gaze fixture must leave both hands optical-only")
     preview = report["mode"] == "preview"
     hold = report["control_mode"] == "hold"
+    dwell_s = example._gaze_locomotion.config.dwell_s
     _require(example._gaze_locomotion.config.preview is preview, "Unexpected preview configuration")
     _require(example._gaze_locomotion.config.control_mode == report["control_mode"], "Wrong gaze control mode")
     _require(example._g1_locomotion == ("stationary" if preview else "policy"), "Wrong robot base topology")
@@ -152,7 +153,7 @@ async def _validate(example: object, module: object, report: dict, output: Path,
     def snapshot() -> dict:
         positions, quaternions = example.g1.robot.get_world_poses()
         linear, angular = example.g1.robot.get_velocities()
-        p, q, v, w = vector(positions, 3), vector(quaternions, 4), vector(linear, 3), vector(angular, 3)
+        p, q, v, w = (vector(positions, 3), vector(quaternions, 4), vector(linear, 3), vector(angular, 3))
         norm = math.sqrt(sum(component * component for component in q))
         _require(norm > 1e-6, "Invalid measured root quaternion")
         qw, qx, qy, qz = (component / norm for component in q)
@@ -310,23 +311,27 @@ async def _validate(example: object, module: object, report: dict, output: Path,
             _require(example._gaze_locomotion.command.state == "idle", "Valid look-away did not arm selection")
 
             fixture["target"] = action
-            await wait_sim(0.30)
-            _require(
-                example._gaze_locomotion.command.activation_count == baseline_count, "A short glance activated motion"
-            )
-            entry["short_glance"] = snapshot()
-            fixture["target"] = None
-            await wait_sim(0.10)
-            fixture["target"] = action
             transition_start = len(report["state_transitions"])
-            await wait_sim(0.80)
+            if dwell_s > 0:
+                await wait_sim(dwell_s * 0.4)
+                _require(
+                    example._gaze_locomotion.command.activation_count == baseline_count,
+                    "A short glance bypassed the configured dwell",
+                )
+                entry["short_glance"] = snapshot()
+                fixture["target"] = None
+                await wait_sim(0.10)
+                fixture["target"] = action
+                await wait_sim(dwell_s + 0.10)
+            else:
+                await advance()
             command = example._gaze_locomotion.command
             _require(
                 command.activation_count == baseline_count + 1 and command.last_action == action,
-                "A full dwell did not select exactly the intended action; inspect occlusion/tracking status",
+                "Selection did not fire exactly once at the configured delay; inspect occlusion/tracking status",
             )
             entry["activated"] = snapshot()
-            await wait_sim(2.0 if hold else 1.0)
+            await wait_sim(3.0 if hold else 1.0)
             _require(
                 example._gaze_locomotion.command.activation_count == baseline_count + 1,
                 "Holding a gaze button repeated the action",
@@ -353,17 +358,22 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                 _require(fixture["elapsed_s"] < end_sim, "Movement failed to finish before the fixture deadline")
                 await advance()
             fixture["eye_valid"] = True
-            await wait_sim(0.10)
+            # Hold release is an input event, not proof that the pelvis settled.
+            # Continue real physics beyond the former four-second pause deadline
+            # while the independent balance, foot-support drift and runaway guards run.
+            await wait_sim(5.0 if hold and not preview else 0.10)
             entry["end"] = snapshot()
             transitions = report["state_transitions"][transition_start:]
             entry["states"] = [sample["status"]["state"] for sample in transitions]
             _require(not any(example._gaze_locomotion.command.velocity), "Finished action retained a movement request")
             _require(
-                not any(float(value) for value in example._base_command), "Finished action retained filtered movement"
+                max(abs(float(value)) for value in example._base_command) < 1e-5,
+                "Finished action retained meaningful filtered movement",
             )
             if not preview:
                 _require(
-                    "active" in entry["states"] and "stopping" in entry["states"], "Missing physical action/stop states"
+                    "active" in entry["states"] and (hold or "stopping" in entry["states"]),
+                    "Missing physical action/stop states",
                 )
                 if not hold:
                     _require(
@@ -387,11 +397,21 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                         sample
                         for sample in transitions
                         if sample["status"]["state"] == "awaiting_release"
-                        and (hold or "Movement target reached" in sample["status"]["detail"])
+                        and "Movement target reached" in sample["status"]["detail"]
                     ),
                     None,
                 )
-                _require(entry["settled_sample"] is not None, "No measured settling completion was observed")
+                if not hold:
+                    _require(entry["settled_sample"] is not None, "No measured settling completion was observed")
+                else:
+                    stop = entry["end"]["status"]["last_stop"]
+                    _require(
+                        stop.get("mode") == "hold"
+                        and stop.get("action") == action
+                        and stop.get("decision") == "zero_requested_external_motion_guard_active"
+                        and stop.get("settling_evaluated") is False,
+                        "Current hold stop diagnostics were lost or incorrectly claim measured settling",
+                    )
                 start, end = entry["motion_origin"], entry["end"]
                 dx = end["position_m"][0] - start["position_m"][0]
                 dy = end["position_m"][1] - start["position_m"][1]
@@ -407,12 +427,23 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                 }[action]
                 _require(entry["signed_final_progress"] > 0.0, "Final physical movement has the wrong sign")
                 if hold:
+                    held = entry["held"]
+                    held_dx = held["position_m"][0] - start["position_m"][0]
+                    held_dy = held["position_m"][1] - start["position_m"][1]
+                    held_forward = held_dx * math.cos(start["yaw_rad"]) + held_dy * math.sin(start["yaw_rad"])
+                    held_yaw = (held["yaw_rad"] - start["yaw_rad"] + math.pi) % (2 * math.pi) - math.pi
+                    entry["signed_held_progress"] = {
+                        "forward": held_forward,
+                        "back": -held_forward,
+                        "turn_left": held_yaw,
+                        "turn_right": -held_yaw,
+                    }[action]
                     old_goal = (
                         example._gaze_locomotion.config.distance_m
                         if action in ("forward", "back")
                         else math.radians(example._gaze_locomotion.config.turn_degrees)
                     )
-                    _require(entry["signed_final_progress"] > old_goal, "Held movement stopped at the old step limit")
+                    _require(entry["signed_held_progress"] > old_goal, "Held movement stopped at the old step limit")
                 _require(entry["planar_displacement_m"] < 1.0, "Short-action fixture exceeded one meter of travel")
             entry["passed"] = True
             print(f"Gaze validation: {action} passed ({fixture['elapsed_s']:.2f} simulated seconds)", flush=True)
@@ -479,10 +510,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("preview", "move"), default="preview")
     parser.add_argument("--control-mode", choices=("step", "hold"), default="step")
+    parser.add_argument("--dwell-s", type=float, default=None, help="Default: 0 for hold, 0.7 for step")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--load-timeout", type=float, default=180.0)
     parser.add_argument("--test-timeout", type=float, default=180.0)
     args, kit_args = parser.parse_known_args()
+    if args.dwell_s is None:
+        args.dwell_s = 0.0 if args.control_mode == "hold" else 0.7
+    if not math.isfinite(args.dwell_s) or not 0 <= args.dwell_s <= 5:
+        parser.error("--dwell-s must be finite and between 0 and 5")
     for name in ("load_timeout", "test_timeout"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be finite and positive")
@@ -495,6 +531,7 @@ def main() -> int:
         "phase": "starting_application",
         "mode": args.mode,
         "control_mode": args.control_mode,
+        "dwell_s": args.dwell_s,
         "run_id": run_id,
         "fixture": "Real warehouse/robot/actor; synthetic tracked eye descriptors; no injected hands or payload",
         "dwell_clock": "Synthetic monotonic selection time advanced by physics dt only inside gaze update",
@@ -519,7 +556,7 @@ def main() -> int:
             "G1_WEBCAM_ENABLED": "0",
             "G1_GAZE_PREVIEW": "1" if args.mode == "preview" else "0",
             "G1_GAZE_MODE": args.control_mode,
-            "G1_GAZE_DWELL_S": "0.7",
+            "G1_GAZE_DWELL_S": str(args.dwell_s),
             "G1_GAZE_DISTANCE_M": "0.20",
             "G1_GAZE_TURN_DEG": "10",
             "G1_GAZE_FORWARD_SPEED": "0.20",

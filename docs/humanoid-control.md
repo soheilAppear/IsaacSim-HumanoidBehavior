@@ -245,7 +245,7 @@ Paths in this table are relative to
 | `interactive/humanoid/point_navigation_scene.py` | Blue visuals, real floor/object approaches, segment clearance, and turning-footprint queries |
 | `interactive/humanoid/factory_route.py` | Incremental bounded floor-route search and collision-checked corner reduction |
 | `interactive/humanoid/controller_locomotion.py` | Joystick deadzones, signs, diagonal cap and neutral/reconnect interlock |
-| `interactive/humanoid/gaze_locomotion.py` | Eye-dwell selection, hold-to-move and optional bounded steps/turns, preview, settling and look-away interlock |
+| `interactive/humanoid/gaze_locomotion.py` | Immediate or delayed eye selection, hold-to-move and optional bounded steps/turns, preview, step settling and look-away interlock |
 | `interactive/humanoid/gaze_controls_scene.py` | Camera-following button panels, dwell/command feedback and eye-ray hit geometry |
 | `interactive/humanoid/comfort_camera.py` | Wall-time filtering of robot XY/yaw, idle hold, and fixed neutral eye-height calibration; no HMD filtering |
 | `interactive/humanoid/tall_packages.py` | Three lightweight compound cartons with collision-open handles |
@@ -920,20 +920,23 @@ Changing between them requires exit/relaunch and LOAD because the base topology
 differs. Preview does not validate dynamic balance, braking or carried loads.
 
 Camera-following side panels keep the middle of the view available for the box.
-Look off all buttons to arm, then dwell continuously for 0.7 wall seconds on
-Forward, Back, Turn left or Turn right. The ring indicates dwell progress. In the
-default **hold** mode, a completed dwell starts movement that continues while the
+Look off all buttons to arm, then look at Forward, Back, Turn left or Turn right.
+In the default **hold** mode, the first valid button hit activates immediately,
+including a quick glance. There is no dwell timer or ring at the default zero
+delay. Movement continues while the
 same valid, unoccluded button remains fixated. Looking away or at another button
 ramps the requested velocity toward zero through the existing 0.06-second release
 filter; eye loss, button occlusion, a callback gap, or session failure requests
 zero immediately. Movement uses the existing 0.30-second attack filter; both
-filter constants use wall time. Physical braking and settling take time.
-Selection does not transfer directly to a different
-button while moving: stopping must finish, and a fresh off-all-buttons look-away
-must rearm the next dwell. There is no fixed travel distance or turn angle in hold
+filter constants use wall time. Physical braking still takes time. A valid look
+outside all buttons rearms the next selection without a separate gaze settling
+wait. Selection does not transfer directly to a different button: a fresh
+off-all-buttons look-away must rearm it. Invalid tracking requires a subsequent
+valid look-away before activation. There is no fixed travel distance or turn angle in hold
 mode. Both hands continue updating during fixation.
 
-Optional **step** mode starts one measured movement per completed dwell. Its
+Optional **step** mode starts one measured movement after its default 0.7-second
+dwell. A positive delay displays a progress ring. Its
 accepted command continues after looking away or losing eye tracking, allowing
 the operator to look back at the box; eye loss cancels unfinished dwell. Holding
 the button does not repeat a step, and busy selection is ignored. Both modes
@@ -945,7 +948,9 @@ eye data. Application polling times are not hardware capture timestamps.
 
 Defaults are `G1_GAZE_MODE=hold`, `G1_GAZE_DISTANCE_M=0.20`, `G1_GAZE_TURN_DEG=10`,
 `G1_GAZE_FORWARD_SPEED=0.20`, `G1_GAZE_BACKWARD_SPEED=0.15`,
-`G1_GAZE_YAW_SPEED=0.25`, and `G1_GAZE_DWELL_S=0.7`. Distance is in meters,
+`G1_GAZE_YAW_SPEED=0.25`, and `G1_GAZE_DWELL_S=0` in hold mode. Step mode defaults
+to `G1_GAZE_DWELL_S=0.7`; an explicit override is preserved in either mode. A
+positive override restores delayed activation and the ring. Distance is in meters,
 turn angle in degrees, translational speed in m/s, and yaw speed in rad/s.
 Distance and turn angle apply only to `G1_GAZE_MODE=step`; hold mode continues
 at the requested translation or yaw speed while the same button remains fixated.
@@ -955,7 +960,17 @@ travel or stopping distances. The existing actor supports reverse movement;
 loaded transport still requires a separate physical acceptance check.
 Setting `G1_GAZE_BACKWARD_SPEED=0` disables reverse selection. Dwell uses wall time;
 step-mode progress and settling use simulation time, with measured planar pose and
-speed determining completion rather than elapsed wall time alone. Stopping ends
+speed determining completion rather than elapsed wall time alone. Hold mode does
+not enter the additional pelvis-settling gate or its four-second timeout when
+looking away. It delegates physical stopping faults to the unchanged support-aware
+unintended-motion, balance/fall and runaway guards.
+
+The reported automatic pause was the duplicate four-second pelvis-settling fault
+during active arm movement: the movement command was near zero and the robot
+remained upright. The existing support-aware motion guard remains responsible for persistent
+unintended movement in hold mode.
+
+In step mode, stopping ends
 with exactly zero requested velocity, then waits for measured translation and
 rotation to remain within the settling limits. Settling accepts either the
 existing low instantaneous speeds or a one-second rolling pose window with
@@ -974,13 +989,26 @@ describes application observation rather than proven device freshness. The
 existing `gaze.csv` distinguishes eye tracking from HMD fallback; a ray hit alone
 does not establish selection or human intent.
 
-**Hold-mode validation on 8 November 2026:** all **981 offline regressions passed**.
+**Immediate-hold validation on 8 November 2026:** all **990 offline regressions
+passed**, and the actual-scene anchored preview passed immediate activation for
+all four controls with synthetic eyes. The physical run also passed all four
+directions, holding each for three seconds and continuing beyond the former
+0.20 m/10-degree goals. Back and both turns used normal look-away release;
+Forward used simulated eye-tracking loss and immediately cleared the filtered
+command. Every release was observed for five simulation seconds, beyond the old
+four-second gate, with no latched fault and the independent guards still active.
+The run retained 6,974 arm updates and 6,974 finger updates. These are real-actor
+checks with synthetic eyes; they do not validate hardware gaze or payload grasping.
+
+**Earlier delayed-hold validation on 8 November 2026:** all **981 offline regressions passed**.
 The actual-scene anchored preview passed, and all four physical actions stayed
 active under sustained synthetic fixation beyond the former 0.20 m/10-degree
 goals. Back and both turns requested stopping on look-away; Forward used simulated
 eye-tracking loss, immediately zeroed its filtered command, and then settled.
 All four returned to idle with zero commands and no latched fault. The run
 retained 4,194 arm updates and 4,194 finger updates.
+That revision used a 0.7-second dwell and the additional hold-settling gate;
+these results do not validate immediate activation or removal of that gate.
 
 | Held action | Measured final travel after stopping |
 | --- | --- |

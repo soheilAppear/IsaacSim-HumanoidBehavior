@@ -1,5 +1,23 @@
 # Changelog
 
+## HumanoidBehavior immediate gaze activation — 2026-11-08
+
+- Default hold mode to zero activation delay: the first valid tracked button hit
+  starts the request, including a quick glance, with no dwell ring. Preserve an
+  explicit dwell override; a positive value restores the delay and progress ring.
+  Step mode keeps its 0.7-second default and bounded movement behavior.
+- Remove the duplicate pelvis-settling gate and its four-second auto-pause from
+  hold mode. A valid look-away requests zero and rearms; invalid tracking requires
+  a subsequent valid look-away. Keep the existing release smoothing and independent
+  support-aware unintended-motion, balance/fall and runaway guards. Step mode
+  retains measured settling and its timeout.
+- Pass 990 offline regressions and actual-scene preview/physical checks for
+  immediate activation of all four controls with synthetic eyes. Three-second
+  holds continue past the old bounded goals; every release is observed for five
+  simulation seconds without a fault. Forward eye loss immediately clears the
+  filtered command; arm/finger updates continue. Hardware gaze and payload
+  acceptance remain separate; earlier results below apply to delayed activation.
+
 ## HumanoidBehavior hold-to-move gaze controls — 2026-11-08
 
 - Default the gaze profile to `G1_GAZE_MODE=hold`: after the 0.7-second dwell,

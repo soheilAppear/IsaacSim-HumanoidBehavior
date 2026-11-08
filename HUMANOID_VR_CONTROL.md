@@ -34,7 +34,7 @@ Eye tracking and its red ray remain unchanged.
 
 The separate [gaze-button profile](#gaze-buttons-with-both-hands-free) keeps both
 optical hands free. Its default preview anchors the base; a fresh `--move` launch
-enables physical walking/turning after a deliberate eye dwell, continuing while
+enables physical walking/turning immediately on a tracked button hit, continuing while
 the same button remains fixated and stopping when the operator looks away.
 
 The following September 2026 observations describe specific historical tests and
@@ -446,6 +446,8 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
 2. Launch the anchored preview:
 
    ```powershell
+   $env:G1_GAZE_MODE = 'hold'
+   $env:G1_GAZE_DWELL_S = '0'
    .\tools\launch_gaze_walking.bat
    ```
 
@@ -457,8 +459,9 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
    already selected. Preserve the working OpenXR runtime settings and click
    **Start XR**.
 4. Put down the controllers and show both hands to the headset. Look between the
-   buttons first to arm selection. Look at one button for **0.7 seconds** while its
-   ring fills, then keep looking to sustain the request. Look away to end it.
+   buttons first to arm selection. Look at one button to activate it **immediately**,
+   then keep looking to sustain the request. **Even a quick glance activates it.**
+   The default zero delay has no dwell ring. Look away to end the request.
    Preview reports the interaction while the base remains anchored.
    Look away from every button before trying another selection.
    **NO EYE** means Isaac is not receiving a currently tracked eye pose. Check
@@ -467,6 +470,8 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
 5. After verifying tracking and comfortable panel placement, exit Isaac and run:
 
    ```powershell
+   $env:G1_GAZE_MODE = 'hold'
+   $env:G1_GAZE_DWELL_S = '0'
    .\tools\launch_gaze_walking.bat --move
    ```
 
@@ -478,24 +483,33 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
    anchor changes the robot topology: do not try to turn preview into movement
    by toggling an attribute in a running scene.
 
-The default **hold** mode starts after a completed dwell and continues only while
+The default **hold** mode starts on the first valid button sample after arming,
+without a fixation timer, and continues only while
 you keep looking at the same button. **Look away to stop**, including when looking
 back at the box. Changing buttons or lost/invalid eye tracking also requests a
 stop. Requests use **0.20 m/s forward**, **0.15 m/s backward**, or **0.25 rad/s
 yaw**; turning continues while the turn button is held. Physical braking and
 contacts determine actual travel and stopping distance. A stop request is not an
-instant physical stop. Look away from all buttons and wait for stopping to finish
-before beginning another dwell. XR shutdown, Pause/Stop, Reset and recentering
+instant physical stop. A valid look outside all buttons rearms the next selection
+without a separate settling wait; moving directly between buttons does not switch
+the direction. After tracking loss, first provide a valid look outside all buttons.
+Hold mode has no four-second gaze settling timer. Existing balance, fall and
+unintended-motion guards can still pause a detected fault. XR shutdown, Pause/Stop, Reset and recentering
 cancel selection/movement and require rearming. Use the example's **Reset** after
 a latched simulation fault; Play alone does not clear it.
 
-To retain the previous bounded interaction, set `$env:G1_GAZE_MODE='step'` before
-launching. Each completed dwell then requests one **0.20 m** forward/backward move
+The reported automatic pause came from the duplicate four-second pelvis-settling
+check during arm movement, with a near-zero movement command and an upright robot.
+Removing that hold-mode check leaves the existing support-aware motion guard active.
+
+To retain the previous bounded interaction, set `$env:G1_GAZE_MODE='step'` and
+`$env:G1_GAZE_DWELL_S='0.7'` before launching, replacing the zero delay above.
+The **0.7-second dwell** requests one **0.20 m** forward/backward move
 or **10°** left/right turn. That accepted step continues to its measured stop after
 looking away or losing eye tracking; tracking loss still cancels unfinished dwell.
 Holding a button cannot repeat a step. New selections are ignored while busy, and
-look-away is required before another dwell. Set `$env:G1_GAZE_MODE='hold'` to return
-to continuous movement in the next launch.
+look-away is required before another dwell. Set `$env:G1_GAZE_MODE='hold'` and
+`$env:G1_GAZE_DWELL_S='0'` to return to immediate continuous movement in the next launch.
 
 Every launcher invocation resets preview to on, including when an old terminal
 contains `G1_GAZE_PREVIEW=0`. Only a **first** `--move` enables motion; a first
@@ -509,7 +523,7 @@ an explicit `step` override. Supply settings in the environment before starting 
 | Environment variable | Default | Meaning |
 |---|---:|---|
 | `G1_GAZE_MODE` | `hold` | Continue while looking; `step` selects one bounded movement |
-| `G1_GAZE_DWELL_S` | `0.7` | Initial continuous button dwell, in wall seconds |
+| `G1_GAZE_DWELL_S` | `0` in hold; `0.7` in step | Activation delay in wall seconds; zero activates on the first valid button hit |
 | `G1_GAZE_DISTANCE_M` | `0.20` | Step mode only: requested forward/backward distance, in meters |
 | `G1_GAZE_TURN_DEG` | `10` | Step mode only: requested turn angle, in degrees |
 | `G1_GAZE_FORWARD_SPEED` | `0.20` | Forward command speed, in m/s |
@@ -517,17 +531,24 @@ an explicit `step` override. Supply settings in the environment before starting 
 | `G1_GAZE_YAW_SPEED` | `0.25` | Turn command speed, in rad/s |
 
 Set `G1_GAZE_BACKWARD_SPEED=0` to disable backward selection. The default enables
-it. Dwell uses wall time; requested speeds and settling use simulation time, so
+it. A positive override such as `$env:G1_GAZE_DWELL_S='0.7'` restores a fixation
+delay and progress ring; explicit overrides are preserved in either mode.
+The launch examples explicitly set the delay to `0` to clear an older terminal's override.
+Immediate activation removes the selection wait, while the physical command
+still uses the existing acceleration and stopping behavior. Dwell uses wall time;
+requested speeds and settling use simulation time, so
 slow simulation changes actual movement per wall second.
 
 The directional speed settings remain bounded by the existing physical profile's
 0.65 m/s forward, 0.35 m/s backward and 0.40 rad/s yaw caps. The source supports
-backward walking. **981 offline regressions passed**, followed by actual-scene
-synthetic-eye hold checks: anchored preview stayed fixed, and all four physical
-directions continued beyond the old 20 cm/10-degree limits. Back and both turns
-settled after look-away; Forward settled after simulated eye-tracking loss, with
-an immediate zero command. The physical run completed without a fault and retained
-arm/finger updates. Preview checks selection and hand availability, not balance,
+backward walking. **990 offline regressions passed**, and the actual-scene
+preview and physical runs passed all four controls with synthetic eyes. Physical
+movement continued during a three-second hold beyond the old step/turn limits.
+Each release was observed for five simulation seconds without a fault, including
+immediate command clearing on Forward's simulated eye loss. Arm/finger updates
+continued. These checks do not establish hardware eye tracking or loaded grasping.
+Preview checks selection and
+hand availability, not balance,
 gait, braking, shelf pickup or loaded transport. A displayed selection is an
 explicit interface action, not a claim that gaze reveals general mental intent.
 Live eye-tracker calibration, in-headset readability, and picking up/carrying a
