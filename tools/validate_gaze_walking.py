@@ -10,7 +10,9 @@ Run with the installed Isaac Sim python.bat and this checkout's entire extension
         --ext-path POLICY_EXTENSION --enable isaacsim.robot.policy.examples-5.2.11 \
         --/app/vulkan=false --/metricsAssembler/changeListenerEnabled=false
 
-Use a fresh invocation with --mode move for the physical GR00T scene. The full
+Use a fresh invocation with --mode move for the physical GR00T scene. Add
+--control-mode hold to verify sustained fixation and look-away/eye-loss stops;
+--control-mode step retains the original short-action checks. The full
 production warehouse, camera, panel hit tests, occlusion checks, actor, motor loop,
 and health guards remain active. No robot root/joint state or payload is injected.
 The eye descriptors are synthetic, and only the synchronous gaze-selection call
@@ -123,11 +125,13 @@ async def _validate(example: object, module: object, report: dict, output: Path,
     _require(example._gaze_walking_enabled, "The loaded scene is not the gaze profile")
     _require(example._optical_hands_only, "The gaze fixture must leave both hands optical-only")
     preview = report["mode"] == "preview"
+    hold = report["control_mode"] == "hold"
     _require(example._gaze_locomotion.config.preview is preview, "Unexpected preview configuration")
+    _require(example._gaze_locomotion.config.control_mode == report["control_mode"], "Wrong gaze control mode")
     _require(example._g1_locomotion == ("stationary" if preview else "policy"), "Wrong robot base topology")
     _require(not example._pointing_navigation_enabled, "Pointing input must be disabled")
 
-    fixture = {"target": None, "elapsed_s": 0.0, "last_state": None}
+    fixture = {"target": None, "eye_valid": True, "elapsed_s": 0.0, "last_state": None}
     counts = {"gaze_updates": 0, "arm_updates": 0, "finger_updates": 0}
     report["updater_calls"] = counts
     report["state_transitions"] = []
@@ -174,7 +178,7 @@ async def _validate(example: object, module: object, report: dict, output: Path,
             return ("gaze_ext",)
 
         def get_virtual_world_pose_desc(self, name: str) -> SimpleNamespace:
-            if name != "gaze_ext":
+            if name != "gaze_ext" or not fixture["eye_valid"]:
                 return SimpleNamespace(validity_flags=0, pose_matrix=None)
             camera = Gf.Matrix4d(example._head_camera_transform_op.Get())
             target = fixture["target"]
@@ -322,16 +326,33 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                 "A full dwell did not select exactly the intended action; inspect occlusion/tracking status",
             )
             entry["activated"] = snapshot()
-            await wait_sim(1.0)
+            await wait_sim(2.0 if hold else 1.0)
             _require(
                 example._gaze_locomotion.command.activation_count == baseline_count + 1,
                 "Holding a gaze button repeated the action",
             )
+            entry["held"] = snapshot()
+            if hold and not preview:
+                _require(example._gaze_locomotion.command.state == "active", "Held gaze did not continue moving")
+                _require(any(example._gaze_locomotion.command.velocity), "Held gaze lost its movement request")
+            # Exercise real invalid-eye handling as well as ordinary look-away.
+            lose_eye = hold and action == "forward"
+            fixture["eye_valid"] = not lose_eye
             fixture["target"] = None
+            entry["release_reason"] = "eye_tracking_lost" if lose_eye else "looked_away"
+            if hold and not preview:
+                await wait_sim(0.01)
+                entry["released"] = snapshot()
+                _require(not any(example._gaze_locomotion.command.velocity), "Look-away retained a movement request")
+                if lose_eye:
+                    _require(
+                        not any(float(value) for value in example._base_command), "Eye loss did not stop immediately"
+                    )
             end_sim = fixture["elapsed_s"] + 12.0
             while example._gaze_locomotion.command.state in ("active", "stopping"):
                 _require(fixture["elapsed_s"] < end_sim, "Movement failed to finish before the fixture deadline")
                 await advance()
+            fixture["eye_valid"] = True
             await wait_sim(0.10)
             entry["end"] = snapshot()
             transitions = report["state_transitions"][transition_start:]
@@ -344,24 +365,29 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                 _require(
                     "active" in entry["states"] and "stopping" in entry["states"], "Missing physical action/stop states"
                 )
-                _require(
-                    any("Movement target reached" in sample["status"]["detail"] for sample in transitions),
-                    "The physical action timed out instead of reaching its measured target",
-                )
+                if not hold:
+                    _require(
+                        any("Movement target reached" in sample["status"]["detail"] for sample in transitions),
+                        "The physical action timed out instead of reaching its measured target",
+                    )
                 _require(
                     not any("timed out" in sample["status"]["detail"] for sample in transitions),
                     "The physical action reported a timeout",
                 )
                 entry["motion_origin"] = next(sample for sample in transitions if sample["status"]["state"] == "active")
-                entry["goal_sample"] = next(
-                    sample for sample in transitions if "Movement target reached" in sample["status"]["detail"]
+                entry["goal_sample"] = (
+                    entry["held"]
+                    if hold
+                    else next(
+                        sample for sample in transitions if "Movement target reached" in sample["status"]["detail"]
+                    )
                 )
                 entry["settled_sample"] = next(
                     (
                         sample
                         for sample in transitions
                         if sample["status"]["state"] == "awaiting_release"
-                        and "Movement target reached" in sample["status"]["detail"]
+                        and (hold or "Movement target reached" in sample["status"]["detail"])
                     ),
                     None,
                 )
@@ -380,6 +406,13 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                     "turn_right": -yaw_change,
                 }[action]
                 _require(entry["signed_final_progress"] > 0.0, "Final physical movement has the wrong sign")
+                if hold:
+                    old_goal = (
+                        example._gaze_locomotion.config.distance_m
+                        if action in ("forward", "back")
+                        else math.radians(example._gaze_locomotion.config.turn_degrees)
+                    )
+                    _require(entry["signed_final_progress"] > old_goal, "Held movement stopped at the old step limit")
                 _require(entry["planar_displacement_m"] < 1.0, "Short-action fixture exceeded one meter of travel")
             entry["passed"] = True
             print(f"Gaze validation: {action} passed ({fixture['elapsed_s']:.2f} simulated seconds)", flush=True)
@@ -445,6 +478,7 @@ def main() -> int:
     """Own one bounded application run and preserve its report on every Python exit."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("preview", "move"), default="preview")
+    parser.add_argument("--control-mode", choices=("step", "hold"), default="step")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--load-timeout", type=float, default=180.0)
     parser.add_argument("--test-timeout", type=float, default=180.0)
@@ -460,6 +494,7 @@ def main() -> int:
         "passed": False,
         "phase": "starting_application",
         "mode": args.mode,
+        "control_mode": args.control_mode,
         "run_id": run_id,
         "fixture": "Real warehouse/robot/actor; synthetic tracked eye descriptors; no injected hands or payload",
         "dwell_clock": "Synthetic monotonic selection time advanced by physics dt only inside gaze update",
@@ -483,6 +518,7 @@ def main() -> int:
             "G1_OPTICAL_HANDS_ONLY": "1",
             "G1_WEBCAM_ENABLED": "0",
             "G1_GAZE_PREVIEW": "1" if args.mode == "preview" else "0",
+            "G1_GAZE_MODE": args.control_mode,
             "G1_GAZE_DWELL_S": "0.7",
             "G1_GAZE_DISTANCE_M": "0.20",
             "G1_GAZE_TURN_DEG": "10",

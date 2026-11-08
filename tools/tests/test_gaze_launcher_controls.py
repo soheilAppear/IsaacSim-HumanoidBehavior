@@ -60,6 +60,7 @@ class TestGazeLauncherControls(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(forwarded, "")
         self.assertEqual(values["G1_GAZE_PREVIEW"], "1")
+        self.assertEqual(values["G1_GAZE_MODE"], "hold")
         self.assertEqual(values["G1_GESTURE_WALKING"], "1")
         self.assertEqual(values["G1_LOCOMOTION_INPUT"], "gaze")
         self.assertEqual(values["G1_OPTICAL_HANDS_ONLY"], "1")
@@ -69,6 +70,7 @@ class TestGazeLauncherControls(unittest.TestCase):
         result, values, forwarded = self._run_launcher("--move", "--xr-verbose", "--/app/title=two words")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(values["G1_GAZE_PREVIEW"], "0")
+        self.assertEqual(values["G1_GAZE_MODE"], "hold")
         self.assertEqual(forwarded, '--xr-verbose "--/app/title=two words"')
 
     def test_explicit_preview_is_case_insensitive_and_only_first_flag_is_consumed(self) -> None:
@@ -103,6 +105,17 @@ class TestGazeLauncherControls(unittest.TestCase):
             "G1_GAZE_YAW_SPEED": "0.25",
         }.items():
             self.assertEqual(values[key], value)
+
+    def test_explicit_step_mode_survives_preview_and_movement_launches(self) -> None:
+        """An inherited control mode changes interaction, never preview opt-in."""
+        for args, preview in (((), "1"), (("--move",), "0")):
+            with self.subTest(args=args):
+                result, values, _ = self._run_launcher(
+                    *args, overrides={"G1_GAZE_MODE": "step", "G1_GAZE_PREVIEW": "0"}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values["G1_GAZE_MODE"], "step")
+                self.assertEqual(values["G1_GAZE_PREVIEW"], preview)
 
     def test_base_launcher_failure_is_returned(self) -> None:
         result, _, _ = self._run_launcher("--move", exit_code=23)

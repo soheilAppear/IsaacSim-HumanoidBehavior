@@ -19,9 +19,11 @@ Launch configuration selects the control profile before the scene is built:
   translation and turning and controller or optical input for manipulation.
 - Experimental pointing navigation uses an optical left-index ray to select a
   checked destination and requires the pointing gesture to remain active.
-- Eye-gaze buttons use tracked combined-eye input to select one short step or
-  turn with a progress-ring dwell. Preview anchors the base; explicit movement
-  mode uses the existing walking policy and finishes without continued fixation.
+- Eye-gaze buttons use tracked combined-eye input and a progress-ring dwell.
+  The default `G1_GAZE_MODE=hold` continues movement while the same button is
+  fixated; looking away or losing valid eye tracking requests a stop. Preview
+  anchors the base; explicit movement mode uses the existing walking policy.
+  Optional `step` mode retains bounded steps/turns that finish without fixation.
 
 These profiles share the arm, finger, contact, and recording pipeline; switching
 between anchored and walking configurations requires rebuilding the scene. They

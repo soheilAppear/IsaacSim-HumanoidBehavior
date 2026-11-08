@@ -245,7 +245,7 @@ Paths in this table are relative to
 | `interactive/humanoid/point_navigation_scene.py` | Blue visuals, real floor/object approaches, segment clearance, and turning-footprint queries |
 | `interactive/humanoid/factory_route.py` | Incremental bounded floor-route search and collision-checked corner reduction |
 | `interactive/humanoid/controller_locomotion.py` | Joystick deadzones, signs, diagonal cap and neutral/reconnect interlock |
-| `interactive/humanoid/gaze_locomotion.py` | Eye-dwell selection, preview, measured short moves/turns, settling and look-away interlock |
+| `interactive/humanoid/gaze_locomotion.py` | Eye-dwell selection, hold-to-move and optional bounded steps/turns, preview, settling and look-away interlock |
 | `interactive/humanoid/gaze_controls_scene.py` | Camera-following button panels, dwell/command feedback and eye-ray hit geometry |
 | `interactive/humanoid/comfort_camera.py` | Wall-time filtering of robot XY/yaw, idle hold, and fixed neutral eye-height calibration; no HMD filtering |
 | `interactive/humanoid/tall_packages.py` | Three lightweight compound cartons with collision-open handles |
@@ -906,8 +906,9 @@ the free base. This is a supported manipulation setup, not a demonstration of ba
 
 `tools/launch_gaze_walking.bat` selects `G1_LOCOMOTION_INPUT=gaze`, disables
 pointing navigation, and sets `G1_OPTICAL_HANDS_ONLY=1` so both hands remain
-available for manipulation. Its default `G1_GAZE_PREVIEW=1` is reset on every
-invocation; only a first `--move` changes it to `0`. A first `--preview` explicitly
+available for manipulation. It defaults `G1_GAZE_MODE=hold` only when unset,
+preserving an explicit `step` override. Its default `G1_GAZE_PREVIEW=1` is reset
+on every invocation; only a first `--move` changes it to `0`. A first `--preview` explicitly
 retains preview. Remaining raw arguments pass through to `launch_isaac_vr.bat`.
 The base launcher still disables webcam robot input and loads this checkout's
 complete extension. See the [operator procedure](../HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free).
@@ -920,31 +921,50 @@ differs. Preview does not validate dynamic balance, braking or carried loads.
 
 Camera-following side panels keep the middle of the view available for the box.
 Look off all buttons to arm, then dwell continuously for 0.7 wall seconds on
-Forward, Back, Turn left or Turn right. The ring indicates dwell progress; one
-completed dwell starts one bounded command. The operator can then look back at
-the box. Busy selection is ignored and a fresh look-away is required before
-another dwell. Eye tracking loss clears unfinished dwell; an already accepted
-movement continues to its measured stop. XR profile/display shutdown and lifecycle/recenter transitions cancel
-and disarm. Eye-driven commands require the combined gaze device's current tracked
-pose; the visual/recording HMD-forward fallback never authorizes motion. Runtime
+Forward, Back, Turn left or Turn right. The ring indicates dwell progress. In the
+default **hold** mode, a completed dwell starts movement that continues while the
+same valid, unoccluded button remains fixated. Looking away or at another button
+ramps the requested velocity toward zero through the existing 0.06-second release
+filter; eye loss, button occlusion, a callback gap, or session failure requests
+zero immediately. Movement uses the existing 0.30-second attack filter; both
+filter constants use wall time. Physical braking and settling take time.
+Selection does not transfer directly to a different
+button while moving: stopping must finish, and a fresh off-all-buttons look-away
+must rearm the next dwell. There is no fixed travel distance or turn angle in hold
+mode. Both hands continue updating during fixation.
+
+Optional **step** mode starts one measured movement per completed dwell. Its
+accepted command continues after looking away or losing eye tracking, allowing
+the operator to look back at the box; eye loss cancels unfinished dwell. Holding
+the button does not repeat a step, and busy selection is ignored. Both modes
+require look-away to rearm. XR profile/display shutdown and lifecycle/recenter
+transitions cancel and disarm. Eye-driven commands require the combined gaze
+device's current tracked pose; the visual/recording HMD-forward fallback never authorizes motion. Runtime
 permissions and calibration still determine whether the device supplies usable
 eye data. Application polling times are not hardware capture timestamps.
 
-Defaults are `G1_GAZE_DISTANCE_M=0.20`, `G1_GAZE_TURN_DEG=10`,
+Defaults are `G1_GAZE_MODE=hold`, `G1_GAZE_DISTANCE_M=0.20`, `G1_GAZE_TURN_DEG=10`,
 `G1_GAZE_FORWARD_SPEED=0.20`, `G1_GAZE_BACKWARD_SPEED=0.15`,
 `G1_GAZE_YAW_SPEED=0.25`, and `G1_GAZE_DWELL_S=0.7`. Distance is in meters,
 turn angle in degrees, translational speed in m/s, and yaw speed in rad/s.
+Distance and turn angle apply only to `G1_GAZE_MODE=step`; hold mode continues
+at the requested translation or yaw speed while the same button remains fixated.
 Forward/reverse/yaw requests remain bounded by the direct-control caps
 0.65/0.35 m/s and 0.40 rad/s. These are requested targets, not guaranteed physical
 travel or stopping distances. The existing actor supports reverse movement;
 loaded transport still requires a separate physical acceptance check.
 Setting `G1_GAZE_BACKWARD_SPEED=0` disables reverse selection. Dwell uses wall time;
-motion and settling deadlines use simulation time, with measured planar pose and
-speed determining progress and completion rather than elapsed wall time alone.
-Completion requests exactly zero velocity, then waits for planar speed below
-0.03 m/s and yaw speed below 0.06 rad/s continuously for 0.20 simulation seconds.
-The settling deadline is 4 seconds to accommodate measured balance sway; failure
-to settle latches a fault. Independent balance and runaway guards remain active.
+step-mode progress and settling use simulation time, with measured planar pose and
+speed determining completion rather than elapsed wall time alone. Stopping ends
+with exactly zero requested velocity, then waits for measured translation and
+rotation to remain within the settling limits. Settling accepts either the
+existing low instantaneous speeds or a one-second rolling pose window with
+bounded sway, low fitted and endpoint drift, and bounded speed peaks; the
+criterion must hold for 0.20 simulation seconds. Failure to settle within four
+simulation seconds latches a fault. This accommodates limited balance sway
+without treating continued travel as a stop. Independent balance and runaway
+guards remain active. Gaze movement does not perform the route/turn-clearance
+checks used by pointing navigation; the operator must leave room for the robot.
 
 Inspect `EX.gaze_locomotion_status()` through `tools/kit_exec.py` for the current
 selection/movement state. Gaze controls supply only base intent: the per-step
@@ -954,13 +974,36 @@ describes application observation rather than proven device freshness. The
 existing `gaze.csv` distinguishes eye tracking from HMD fallback; a ray hit alone
 does not establish selection or human intent.
 
-**Validation on 8 November 2026:** actual-scene anchored preview passed all four
-selections with zero sampled base displacement. Ordinary 0.3-second glances did
+**Hold-mode validation on 8 November 2026:** all **981 offline regressions passed**.
+The actual-scene anchored preview passed, and all four physical actions stayed
+active under sustained synthetic fixation beyond the former 0.20 m/10-degree
+goals. Back and both turns requested stopping on look-away; Forward used simulated
+eye-tracking loss, immediately zeroed its filtered command, and then settled.
+All four returned to idle with zero commands and no latched fault. The run
+retained 4,194 arm updates and 4,194 finger updates.
+
+| Held action | Measured final travel after stopping |
+| --- | --- |
+| Back | 0.318 m backward |
+| Turn left | 24.81 degrees left; 0.031 m planar drift |
+| Turn right | 31.55 degrees right; 0.025 m planar drift |
+| Forward, then eye loss | 0.258 m forward |
+
+These are unloaded measurements from the real actor with synthetic tracked eye
+descriptors and a simulated selection clock. The validator checks floor/corridor
+or turning clearance before each action; that fixture check is not a gaze-mode
+obstacle-avoidance feature. Measured settling permits bounded balance sway, not
+an exactly motionless pelvis. Live headset usability, real optical grasping and
+loaded transport remain separate acceptance checks.
+
+**Earlier step-mode validation on 8 November 2026:** actual-scene anchored preview
+passed all four selections with zero sampled base displacement. Ordinary 0.3-second glances did
 not activate; full dwell fired once; sustained fixation did not repeat. The
 physical sequence also passed all four actions and measured stopping, with
 3,084 arm updates and 3,084 finger updates during the same run. It first backed
 away from the front shelf to satisfy the conservative turn-clearance preflight.
 No root/object teleports, policy changes, or physics-guard bypasses were used.
+These results predate hold-to-move and do not validate that interaction.
 
 | Request | Measured final result in that unloaded run |
 | --- | --- |
@@ -972,15 +1015,15 @@ No root/object teleports, policy changes, or physics-guard bypasses were used.
 The validator uses synthetic tracked eye descriptors and an explicitly simulated
 selection clock; it does not test live XR delivery, wall-time fixation quality,
 headset readability, optical hand tracking, or frictional carrying. The real
-warehouse camera renders were inspected separately. All **965 offline regressions
-passed**, including production optical curl extraction and two-arm IK updates during
-active gaze locomotion with controlled contact/actuator fixtures. That test
+warehouse camera renders were inspected separately. In that earlier revision,
+all **965 offline regressions passed**, including production optical curl extraction
+and two-arm IK updates during active gaze locomotion with controlled contact/actuator fixtures. That test
 explicitly does not establish a physically supported grasp. Tests also cover strict
 source/validity, XR exit, occlusion, one-shot/rearm behavior, UI failure stopping,
 geometry, input ownership, and launcher argument handling.
 
-To reproduce, set `ISAAC_DIR` to the installed Isaac Sim 6.1 directory and run
-from this checkout with no other Isaac process open:
+To reproduce the bounded step checks, set `ISAAC_DIR` to the installed Isaac Sim 6.1
+directory and run from this checkout with no other Isaac process open:
 
 ```powershell
 $gazeCheck = @(
@@ -990,9 +1033,12 @@ $gazeCheck = @(
   '--/app/vulkan=false', '--/metricsAssembler/changeListenerEnabled=false',
   '--/app/extensions/fsWatcherEnabled=0'
 )
-& "$env:ISAAC_DIR\python.bat" @gazeCheck --mode preview
-& "$env:ISAAC_DIR\python.bat" @gazeCheck --mode move
+& "$env:ISAAC_DIR\python.bat" @gazeCheck --mode preview --control-mode step
+& "$env:ISAAC_DIR\python.bat" @gazeCheck --mode move --control-mode step
 ```
+
+Use `--control-mode hold` in the two commands to run the sustained-fixation,
+look-away and simulated eye-loss checks instead.
 
 Each invocation owns and closes its own headless process, disables behavioral
 recording, and retains a unique JSON report and PNGs in the requested output

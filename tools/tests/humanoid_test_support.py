@@ -20,6 +20,7 @@ import random
 import sys
 import time
 import types
+from collections import deque
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
@@ -97,6 +98,7 @@ def load_source(relative_path, **extra):
         BaseSample=BaseSample,
         import_module=importlib.import_module,
         dataclass=dataclass,
+        deque=deque,
         SimpleNamespace=types.SimpleNamespace,
         **extra,
     )

@@ -1,5 +1,24 @@
 # Changelog
 
+## HumanoidBehavior hold-to-move gaze controls — 2026-11-08
+
+- Default the gaze profile to `G1_GAZE_MODE=hold`: after the 0.7-second dwell,
+  continue translation or turning only while the same button remains fixated.
+  Looking away, changing buttons, or losing valid eye tracking requests a stop;
+  actual braking remains physical. Both optical hands retain manipulation control.
+- Preserve anchored preview on every launcher invocation, with physical movement
+  enabled only by a first `--move`. Preserve an explicit `G1_GAZE_MODE=step` override
+  for the previous measured 0.20 m steps and 10-degree turns. Distance and angle
+  settings apply only to step mode; continuous turns use the configured yaw speed.
+- Permit bounded balance sway with low measured drift as an alternative settling
+  criterion, retaining the existing deadline and independent physics guards.
+- Pass 981 offline regressions and actual-scene hold preview/movement checks.
+  All four physical actions continue beyond the old 20 cm/10-degree limits;
+  Back and both turns settle after look-away, and Forward settles after simulated
+  eye loss with an immediate zero command. The run has no latched fault and retains
+  arm/finger updates. Inputs are synthetic; hardware gaze and payload acceptance
+  remain separate. Earlier results below describe step mode.
+
 ## HumanoidBehavior eye-gaze walking — 2026-11-08
 
 - Add four stereo scene buttons with a configurable 0.7-second dwell and progress

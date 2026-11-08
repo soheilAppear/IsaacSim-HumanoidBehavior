@@ -302,8 +302,7 @@ class GazeControlsScene:
         if not self._is_created():
             self._camera_inverse = None
             raise RuntimeError("Create the gaze controls before setting their camera")
-        self._camera_inverse = None
-        UsdGeom.Imageable(self._stage.GetPrimAtPath(self.root_path)).MakeInvisible()
+        visibility = UsdGeom.Imageable(self._stage.GetPrimAtPath(self.root_path)).GetVisibilityAttr()
         try:
             if len(camera_pose) != 4 or any(len(row) != 4 for row in camera_pose):
                 raise ValueError("Camera transform must be 4 by 4")
@@ -323,11 +322,18 @@ class GazeControlsScene:
                 or abs(pose[3][3] - 1) > 1e-8
             ):
                 raise ValueError("Camera transform must be rigid and affine")
-        except (TypeError, RuntimeError) as error:
+            if self._transform_op.Get() != pose:
+                self._transform_op.Set(pose)
+            self._camera_inverse = pose.GetInverse()
+            if visibility.Get() != UsdGeom.Tokens.inherited:
+                visibility.Set(UsdGeom.Tokens.inherited)
+        except (TypeError, ValueError, RuntimeError) as error:
+            self._camera_inverse = None
+            if visibility.Get() != UsdGeom.Tokens.invisible:
+                visibility.Set(UsdGeom.Tokens.invisible)
+            if isinstance(error, ValueError):
+                raise
             raise ValueError("Invalid gaze control camera transform") from error
-        self._transform_op.Set(pose)
-        self._camera_inverse = pose.GetInverse()
-        UsdGeom.Imageable(self._stage.GetPrimAtPath(self.root_path)).MakeVisible()
 
     def hit_test(self, origin: object, direction: object, max_distance: float | None = None) -> str | None:
         """Intersect a world-space eye ray with visible, enabled button rectangles.

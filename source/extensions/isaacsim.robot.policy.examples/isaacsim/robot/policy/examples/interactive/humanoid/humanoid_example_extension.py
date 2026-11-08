@@ -57,9 +57,15 @@ class HumanoidExampleExtension(omni.ext.IExt):
             config = sample._gaze_locomotion.config
             overview = "Eye-gaze preview: the base is anchored. " if config.preview else "Eye-gaze walking: "
             overview += f"Look between the side buttons first, then dwell for {config.dwell_s:g} seconds. "
-            overview += f"Forward/Back request {config.distance_m:g} m; turns request {config.turn_degrees:g} degrees. "
-            overview += "The ring shows selection progress. Look back at your box after selection. "
-            overview += "Each action finishes and stops automatically; other selections are ignored while moving. "
+            if config.control_mode == "hold":
+                overview += "Keep looking at the same button to continue moving; look away to stop. "
+                overview += "Loss of valid eye tracking also stops movement. "
+            else:
+                overview += (
+                    f"Forward/Back request {config.distance_m:g} m; turns request {config.turn_degrees:g} degrees. "
+                )
+                overview += "Look back at your box after selection; the short action finishes and stops automatically. "
+            overview += "The ring shows selection progress. Wait for the robot to stop before selecting again. "
             overview += "Look away and return for another action. Only tracked eyes select; head direction cannot. "
             if config.backward_speed == 0.0:
                 overview += "Back is disabled because the configured reverse speed is zero. "
@@ -84,7 +90,9 @@ class HumanoidExampleExtension(omni.ext.IExt):
         overview += "then open your hand to release."
         if sample._optical_hands_only:
             overview += "\n\nUse tracked hands to place both palms on opposite sides of a shelf carton, "
-            overview += "curl your fingers around its edges, then lift both hands together. Open and separate to release. "
+            overview += (
+                "curl your fingers around its edges, then lift both hands together. Open and separate to release. "
+            )
             overview += "Contact and friction support the package; it is never glued to the hands. "
             overview += "If the headset switches between controllers and hands, wait for the robot to stop, "
             overview += "then put down the controllers and show your open hands to the headset. "

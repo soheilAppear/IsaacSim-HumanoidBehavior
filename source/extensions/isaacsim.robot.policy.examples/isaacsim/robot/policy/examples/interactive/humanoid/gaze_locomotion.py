@@ -1,19 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Select bounded base movements with gaze dwell, independent of hand controls.
+"""Select stepped or gaze-held base movement independently of hand controls.
 
 The caller resolves eye-ray hits, supplies measured robot motion, and applies
 the returned body-frame velocity through its existing locomotion safeguards.
-This module owns no XR, scene, physics, arm, finger, or grip input. Gaze selects
-an action; looking away or losing eye tracking does not cancel an active action.
-Readiness loss does cancel it. A valid look outside every button is required
+This module owns no XR, scene, physics, arm, finger, or grip input. Step mode
+finishes its selected action independently of gaze; hold mode moves only while
+the same button has valid, uninterrupted gaze. A valid look outside every button is required
 after startup, reset, and each completed action before another dwell can begin.
 """
 
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from numbers import Real
 
@@ -30,7 +31,7 @@ def _finite(value: object) -> bool:
 
 @dataclass(frozen=True)
 class GazeLocomotionConfig:
-    """Configure a short gaze-selected step or turn, with preview enabled by default.
+    """Configure gaze-selected steps or held movement, with preview enabled by default.
 
     Args:
         dwell_s: Continuous wall-time fixation required, from 0.1 to 5 seconds.
@@ -41,6 +42,7 @@ class GazeLocomotionConfig:
         yaw_speed: Positive yaw-speed magnitude, at most 1.5 radians per second.
         preview: Emit selection events and status while keeping every velocity zero.
         max_gaze_gap_s: Largest permitted wall-time gap within a dwell, from 0.05 to 1 second.
+        control_mode: ``step`` finishes a measured distance/angle; ``hold`` requires continued fixation.
 
     Raises:
         ValueError: A setting is nonfinite, has the wrong type, or is outside its range.
@@ -54,6 +56,7 @@ class GazeLocomotionConfig:
     yaw_speed: float = 0.25
     preview: bool = True
     max_gaze_gap_s: float = 0.25
+    control_mode: str = "step"
 
     def __post_init__(self) -> None:
         """Reject invalid configuration before any input can produce a command."""
@@ -71,6 +74,8 @@ class GazeLocomotionConfig:
                 raise ValueError(f"{name} must be finite and in [{lower}, {upper}]")
         if type(self.preview) is not bool:
             raise ValueError("preview must be a boolean")
+        if not isinstance(self.control_mode, str) or self.control_mode not in ("step", "hold"):
+            raise ValueError("control_mode must be 'step' or 'hold'")
 
 
 @dataclass(frozen=True)
@@ -80,7 +85,10 @@ class GazeLocomotionCommand:
     ``activated_action`` is populated on the activation update only, including
     preview. ``last_action`` and ``activation_count`` persist until reset.
     ``progress`` is dwell fraction during selection and measured goal fraction
-    during movement. All speeds use meters per second or radians per second.
+    during stepped movement, and one during held movement. All speeds use meters
+    per second or radians per second. ``stop_immediately`` forbids the caller's
+    normal release smoothing after tracking/readiness failure or a fault. Otherwise
+    the caller applies its existing bounded start/release smoothing once.
     """
 
     state: str = "awaiting_release"
@@ -91,15 +99,18 @@ class GazeLocomotionCommand:
     velocity: tuple[float, float, float] = ZERO_VELOCITY
     detail: str = "Look outside all gaze buttons to enable selection"
     activated_action: str | None = None
+    stop_immediately: bool = False
 
 
 class GazeLocomotion:
-    """Dwell once, finish a measured movement, settle, then require look-away.
+    """Dwell once, execute the selected mode, settle, then require look-away.
 
     Dwell and sample-gap checks use monotonic wall time. Travel and stopping
     timeouts use simulation ``dt`` so slower rendering does not shorten a move.
     A movement timeout requests zero and enters settling even if the robot has
-    stalled. Failing to settle within 4 simulation seconds latches a fault
+    stalled. Hold mode has no travel/time goal and stops when fixation ends.
+    Settling accepts sustained low speeds or a bounded pose window with low net
+    drift, allowing small standing-balance sway. Failing to settle within 4 simulation seconds latches a fault
     until ``reset``. Preview does not require a robot pose and never commands motion.
 
     Args:
@@ -109,10 +120,14 @@ class GazeLocomotion:
     SETTLE_LINEAR_SPEED_M_S = 0.03
     SETTLE_YAW_SPEED_RAD_S = 0.06
     SETTLE_DWELL_S = 0.20
-    # The physical actor needs time to damp post-step balance sway. This only
-    # extends the zero-command waiting window; the stop-speed criteria and
-    # the sample's independent runaway/balance guards remain unchanged.
     SETTLE_TIMEOUT_S = 4.0
+    SETTLE_WINDOW_S = 1.0
+    SETTLE_POSITION_ENVELOPE_M = 0.04
+    SETTLE_YAW_ENVELOPE_RAD = 0.08
+    SETTLE_DRIFT_M_S = 0.02
+    SETTLE_YAW_DRIFT_RAD_S = 0.04
+    SETTLE_PEAK_LINEAR_SPEED_M_S = 0.15
+    SETTLE_PEAK_YAW_SPEED_RAD_S = 0.30
 
     def __init__(self, config: GazeLocomotionConfig | None = None) -> None:
         if config is not None and not isinstance(config, GazeLocomotionConfig):
@@ -133,6 +148,10 @@ class GazeLocomotion:
         self._move_elapsed_s = 0.0
         self._stop_elapsed_s = 0.0
         self._settled_s = 0.0
+        self._sway_settled_s = 0.0
+        self._stop_window = deque()
+        self._stop_previous_yaw = self._stop_yaw = 0.0
+        self._stop_immediately = False
         self._move_timeout_s = 0.0
         self._motion_progress = 0.0
         self._stop_detail = ""
@@ -160,6 +179,7 @@ class GazeLocomotion:
         progress: float = 0.0,
         velocity: tuple[float, float, float] = ZERO_VELOCITY,
         activated_action: str | None = None,
+        stop_immediately: bool = False,
     ) -> GazeLocomotionCommand:
         """Publish immutable status, enforcing the preview zero-velocity invariant."""
         self.command = GazeLocomotionCommand(
@@ -171,6 +191,7 @@ class GazeLocomotion:
             velocity=ZERO_VELOCITY if self.config.preview else velocity,
             detail=detail,
             activated_action=activated_action,
+            stop_immediately=stop_immediately,
         )
         return self.command
 
@@ -178,9 +199,10 @@ class GazeLocomotion:
         """Drop pending and active actions without treating cancellation as look-away."""
         self._candidate = self._dwell_start_s = self._action = None
         self._released = False
+        self._stop_window.clear()
         if fault:
             self._fault = detail
-        return self._publish("fault" if fault else "unavailable", detail)
+        return self._publish("fault" if fault else "unavailable", detail, stop_immediately=True)
 
     def _velocity(self, action: str) -> tuple[float, float, float]:
         """Map one selected action to its configured body-frame speed."""
@@ -192,11 +214,15 @@ class GazeLocomotion:
         }[action]
 
     def _description(self, action: str) -> str:
-        """Describe the bounded action for preview and movement status."""
+        """Describe the selected action and its mode-specific stopping rule."""
         if action in ("forward", "back"):
             direction = "forward" if action == "forward" else "backward"
+            if self.config.control_mode == "hold":
+                return f"move {direction} while looking at this button"
             return f"move {direction} {self.config.distance_m:.2f} m"
         direction = "left" if action == "turn_left" else "right"
+        if self.config.control_mode == "hold":
+            return f"turn {direction} while looking at this button"
         return f"turn {direction} {self.config.turn_degrees:g} degrees"
 
     def _activate(self, action: str, pose: tuple[float, float, float] | None) -> GazeLocomotionCommand:
@@ -217,6 +243,8 @@ class GazeLocomotion:
         self._start_pose = pose
         self._previous_yaw = pose[2]
         self._yaw_travel = self._move_elapsed_s = self._motion_progress = 0.0
+        if self.config.control_mode == "hold":
+            self._motion_progress = 1.0
         velocity = self._velocity(action)
         nominal_time = (
             self.config.distance_m / abs(velocity[0])
@@ -228,8 +256,102 @@ class GazeLocomotion:
             "active",
             f"Requested {self._description(action)}",
             target=action,
+            progress=1.0 if self.config.control_mode == "hold" else 0.0,
             velocity=velocity,
             activated_action=action,
+        )
+
+    def _begin_stop(
+        self,
+        detail: str,
+        pose: tuple[float, float, float],
+        linear_speed: float,
+        yaw_speed: float,
+        *,
+        immediate: bool = False,
+    ) -> GazeLocomotionCommand:
+        """Request zero once and collect fresh settling evidence after that request."""
+        self._stop_elapsed_s = self._settled_s = self._sway_settled_s = 0.0
+        self._stop_detail = detail
+        self._stop_immediately = immediate
+        self._stop_previous_yaw = self._stop_yaw = pose[2]
+        self._stop_window.clear()
+        self._stop_window.append((0.0, *pose, abs(linear_speed), abs(yaw_speed)))
+        return self._publish(
+            "stopping",
+            detail + "; requesting zero velocity",
+            target=self._action,
+            progress=self._motion_progress,
+            stop_immediately=immediate,
+        )
+
+    def _bounded_sway(self, pose: tuple[float, float, float], linear_speed: float, yaw_speed: float) -> bool:
+        """Distinguish small standing sway from continuing travel over a full pose window.
+
+        Both endpoint and fitted drift must be small; the envelope rejects large
+        out-and-back motion and the speed peaks reject violent motion with low net
+        displacement. Wrapped incremental yaw keeps the window valid across pi.
+        This supplements, rather than replaces, the caller's balance/health guards.
+        """
+        self._stop_yaw += (pose[2] - self._stop_previous_yaw + math.pi) % (2.0 * math.pi) - math.pi
+        self._stop_previous_yaw = pose[2]
+        self._stop_window.append(
+            (self._stop_elapsed_s, pose[0], pose[1], self._stop_yaw, abs(linear_speed), abs(yaw_speed))
+        )
+        cutoff = self._stop_elapsed_s - self.SETTLE_WINDOW_S
+        while len(self._stop_window) > 2 and self._stop_window[1][0] <= cutoff:
+            self._stop_window.popleft()
+        window = self._stop_window
+        span = window[-1][0] - window[0][0]
+        if len(window) < 5 or span + 1e-12 < self.SETTLE_WINDOW_S:
+            return False
+        if (
+            max(row[4] for row in window) > self.SETTLE_PEAK_LINEAR_SPEED_M_S
+            or max(row[5] for row in window) > self.SETTLE_PEAK_YAW_SPEED_RAD_S
+        ):
+            return False
+        coordinates = tuple(tuple(row[index] for row in window) for index in (1, 2, 3))
+        ranges = tuple(max(values) - min(values) for values in coordinates)
+        if math.hypot(*ranges[:2]) > self.SETTLE_POSITION_ENVELOPE_M or ranges[2] > self.SETTLE_YAW_ENVELOPE_RAD:
+            return False
+        endpoint = tuple((values[-1] - values[0]) / span for values in coordinates)
+        mean_time = sum(row[0] for row in window) / len(window)
+        centered_time = tuple(row[0] - mean_time for row in window)
+        denominator = sum(value * value for value in centered_time)
+        fitted = tuple(
+            sum(t * (value - values[0]) for t, value in zip(centered_time, values)) / denominator
+            for values in coordinates
+        )
+        return all(
+            math.hypot(*drift[:2]) <= self.SETTLE_DRIFT_M_S and abs(drift[2]) <= self.SETTLE_YAW_DRIFT_RAD_S
+            for drift in (endpoint, fitted)
+        )
+
+    def _advance_stop(
+        self, dt: float, pose: tuple[float, float, float], linear_speed: float, yaw_speed: float
+    ) -> GazeLocomotionCommand:
+        """Keep requesting zero until low motion is measured or the stop deadline faults."""
+        self._stop_elapsed_s += dt
+        if abs(linear_speed) <= self.SETTLE_LINEAR_SPEED_M_S and abs(yaw_speed) <= self.SETTLE_YAW_SPEED_RAD_S:
+            self._settled_s += dt
+        else:
+            self._settled_s = 0.0
+        self._sway_settled_s = self._sway_settled_s + dt if self._bounded_sway(pose, linear_speed, yaw_speed) else 0.0
+        if max(self._settled_s, self._sway_settled_s) + 1e-12 >= self.SETTLE_DWELL_S:
+            self._action = None
+            return self._publish(
+                "awaiting_release",
+                self._stop_detail + "; look outside all buttons to rearm",
+                stop_immediately=self._stop_immediately,
+            )
+        if self._stop_elapsed_s + 1e-12 >= self.SETTLE_TIMEOUT_S:
+            return self._cancel("Robot did not settle after zero command; reset required", fault=True)
+        return self._publish(
+            "stopping",
+            self._stop_detail + "; waiting for measured stop",
+            target=self._action,
+            progress=self._motion_progress,
+            stop_immediately=self._stop_immediately,
         )
 
     def _advance_motion(
@@ -238,21 +360,14 @@ class GazeLocomotion:
         """Measure travel and stop/settle without consuming any new gaze selection."""
         action = self._action
         if self.command.state == "stopping":
-            self._stop_elapsed_s += dt
-            if abs(linear_speed) <= self.SETTLE_LINEAR_SPEED_M_S and abs(yaw_speed) <= self.SETTLE_YAW_SPEED_RAD_S:
-                self._settled_s += dt
-            else:
-                self._settled_s = 0.0
-            if self._settled_s + 1e-12 >= self.SETTLE_DWELL_S:
-                self._action = None
-                return self._publish("awaiting_release", self._stop_detail + "; look outside all buttons to rearm")
-            if self._stop_elapsed_s + 1e-12 >= self.SETTLE_TIMEOUT_S:
-                return self._cancel("Robot did not settle after zero command; reset required", fault=True)
+            return self._advance_stop(dt, pose, linear_speed, yaw_speed)
+        if self.config.control_mode == "hold":
             return self._publish(
-                "stopping",
-                self._stop_detail + "; waiting for measured stop",
+                "active",
+                f"Requested {self._description(action)}",
                 target=action,
-                progress=self._motion_progress,
+                progress=1.0,
+                velocity=self._velocity(action),
             )
 
         self._move_elapsed_s += dt
@@ -269,15 +384,11 @@ class GazeLocomotion:
             goal = math.radians(self.config.turn_degrees)
         self._motion_progress = min(1.0, max(0.0, travel / goal))
         if travel + 1e-12 >= goal or self._move_elapsed_s + 1e-12 >= self._move_timeout_s:
-            self._stop_elapsed_s = self._settled_s = 0.0
-            self._stop_detail = (
-                "Movement target reached" if travel + 1e-12 >= goal else "Movement timed out before target"
-            )
-            return self._publish(
-                "stopping",
-                self._stop_detail + "; requesting zero velocity",
-                target=action,
-                progress=self._motion_progress,
+            return self._begin_stop(
+                "Movement target reached" if travel + 1e-12 >= goal else "Movement timed out before target",
+                pose,
+                linear_speed,
+                yaw_speed,
             )
         return self._publish(
             "active",
@@ -305,28 +416,54 @@ class GazeLocomotion:
         buttons. Unknown target IDs cannot rearm. First fixation samples contribute
         zero dwell; equal timestamps are allowed but add no time. An invalid eye
         sample, target change, or excessive callback gap clears unfinished dwell.
-        Readiness loss cancels motion immediately; the caller remains responsible
-        for its physical stop/fault guards. Invalid motion measurements while
-        moving latch a fault rather than continuing open loop.
+        In hold mode a changed button or verified look-away requests a normally
+        smoothed stop; eye loss, unknown/occluded hits, interrupted callbacks and
+        readiness loss demand immediate zero. Settling never consumes a selection
+        or a look-away for the next action. Step mode continues independently of
+        gaze. The caller remains responsible for physical stop/fault guards and
+        velocity smoothing. Invalid motion measurements while moving latch a fault.
         """
         if self._fault is not None:
-            return self._publish("fault", self._fault)
+            return self._publish("fault", self._fault, stop_immediately=True)
         moving = self._action is not None
         if not _finite(now_s) or now_s < 0 or not _finite(dt) or dt <= 0:
             self._last_time_s = None
             return self._cancel("Invalid gaze update clock or simulation timestep", fault=moving)
         previous = self._last_time_s
         self._last_time_s = float(now_s)
-        if ready is not True:
+        hold_moving = moving and self.config.control_mode == "hold"
+        if ready is not True and not hold_moving:
             return self._cancel("Gaze locomotion is not ready; look away after it becomes ready")
         measured_pose = self._pose(pose)
         if not self.config.preview and (
             measured_pose is None or not _finite(linear_speed_m_s) or not _finite(yaw_speed_rad_s)
         ):
             return self._cancel("Valid measured robot pose and speeds are required", fault=moving)
+        interrupted = previous is not None and (now_s < previous or now_s - previous > self.config.max_gaze_gap_s)
+        if hold_moving:
+            unknown_target = target is not None and (not isinstance(target, str) or target not in ACTIONS)
+            immediate = ready is not True or eye_valid is not True or interrupted or unknown_target
+            if immediate or target != self._action:
+                if self.command.state != "stopping":
+                    if ready is not True:
+                        detail = "Gaze locomotion readiness lost"
+                    elif interrupted:
+                        detail = "Gaze update interrupted"
+                    elif eye_valid is not True:
+                        detail = "Eye tracking lost"
+                    elif unknown_target:
+                        detail = "Gaze button unavailable or occluded"
+                    else:
+                        detail = "Stopped looking at the selected button"
+                    return self._begin_stop(
+                        detail, measured_pose, float(linear_speed_m_s), float(yaw_speed_rad_s), immediate=immediate
+                    )
+                # Once a stop is requested, recovered gaze cannot resume the move;
+                # an emergency also cannot revert to ordinary release smoothing.
+                self._stop_immediately = self._stop_immediately or immediate
         if moving:
             return self._advance_motion(float(dt), measured_pose, float(linear_speed_m_s), float(yaw_speed_rad_s))
-        if previous is not None and (now_s < previous or now_s - previous > self.config.max_gaze_gap_s):
+        if interrupted:
             self._candidate = self._dwell_start_s = None
             return self._publish(
                 "idle" if self._released else "awaiting_release", "Gaze update interrupted; dwell cleared"

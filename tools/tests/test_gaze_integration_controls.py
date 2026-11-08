@@ -40,6 +40,7 @@ class TestGazeIntegrationControls(unittest.TestCase):
             "G1_LOCOMOTION_INPUT": "gaze",
             "G1_GESTURE_WALKING": "1",
             "G1_GAZE_PREVIEW": "1" if preview else "0",
+            "G1_GAZE_MODE": "step",
             "G1_GAZE_DWELL_S": "0.3",
             "G1_GAZE_DISTANCE_M": "0.2",
             "G1_GAZE_TURN_DEG": "10",
@@ -176,6 +177,7 @@ class TestGazeIntegrationControls(unittest.TestCase):
             ("G1_GAZE_BACKWARD_SPEED", "0.36"),
             ("G1_GAZE_YAW_SPEED", "0.41"),
             ("G1_GAZE_PREVIEW", "maybe"),
+            ("G1_GAZE_MODE", "toggle"),
         ):
             with self.subTest(variable=variable), self.assertRaises(ValueError):
                 self.make_example(**{variable: value})
@@ -286,6 +288,43 @@ class TestGazeIntegrationControls(unittest.TestCase):
         np.testing.assert_array_equal(self.ex._base_command.numpy(), (0, 0, 0))
         np.testing.assert_array_equal(self.ex._controller_command.numpy(), (0, 0, 0))
 
+    def test_hold_release_uses_fast_existing_filter_without_restarting_dwell(self) -> None:
+        self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion
+        self.activate()
+        self.ex._base_command[:] = torch.tensor([0.2, 0, 0])
+        result = self.tick(None)
+        self.assertEqual(result.state, "stopping")
+        self.assertFalse(result.stop_immediately)
+        np.testing.assert_allclose(self.ex._base_command.numpy(), (0.2, 0, 0))
+        np.testing.assert_array_equal(self.ex._controller_command.numpy(), (0, 0, 0))
+        self.ex._teleop_input_dt = 0.02
+        values = []
+        for _ in range(10):
+            self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+            values.append(float(self.ex._base_command[0]))
+        self.assertTrue(all(a > b > 0 for a, b in zip([0.2, *values], values)))
+        self.assertLess(values[-1], 0.01)
+        for _ in range(8):
+            self.assertEqual(self.tick("turn_left").activation_count, 1)
+
+    def test_hold_tracking_loss_bypasses_release_filter_immediately(self) -> None:
+        self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion
+        self.activate()
+        self.ex._base_command[:] = torch.tensor([0.2, 0, 0])
+        self.ex._eye_gaze_tracker.read_control_ray.return_value = None
+        result = self.tick("forward")
+        self.assertEqual(result.state, "stopping")
+        self.assertTrue(result.stop_immediately)
+        for commands in (self.ex._base_command, self.ex._controller_command, self.ex._keyboard_command):
+            np.testing.assert_array_equal(commands.numpy(), (0, 0, 0))
+
+    def test_gaze_profile_defaults_to_hold_and_retains_explicit_step(self) -> None:
+        with patch.dict(os.environ, {"G1_LOCOMOTION_INPUT": "gaze"}):
+            os.environ.pop("G1_GAZE_MODE", None)
+            example = HUMANOID.HumanoidExample()
+        self.assertEqual(example._gaze_locomotion.config.control_mode, "hold")
+        self.assertEqual(self.ex._gaze_locomotion.config.control_mode, "step")
+
     def test_active_gaze_movement_keeps_fingers_and_arms_before_final_motor_efforts(self) -> None:
         self.activate()
         order = []
@@ -328,8 +367,9 @@ class TestGazeIntegrationControls(unittest.TestCase):
                 for _ in range(5):
                     self.assertEqual(self.tick("forward").state, "awaiting_release")
 
-    def test_active_gaze_preserves_real_optical_finger_and_arm_updates_for_both_hands(self) -> None:
+    def test_continuous_gaze_preserves_optical_finger_and_arm_updates_for_both_hands(self) -> None:
         """Exercise retargeting and IK with supplied sensors, without claiming a physical grasp."""
+        self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion
         self.activate()
         ex = self.ex
         stage = Usd.Stage.CreateInMemory()

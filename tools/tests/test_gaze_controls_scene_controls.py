@@ -10,7 +10,7 @@ import types
 import unittest
 
 from humanoid_test_support import load_source
-from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdShade
+from pxr import Gf, Tf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 SCENE = load_source("interactive/humanoid/gaze_controls_scene.py")
 
@@ -126,6 +126,47 @@ class TestGazeControlsScene(unittest.TestCase):
         self.assertEqual(
             UsdGeom.XformCache().GetLocalToWorldTransform(self.stage.GetPrimAtPath(self.scene.root_path)), actual
         )
+
+    def test_camera_pose_only_authors_changed_transform_or_visibility(self) -> None:
+        self.scene.update({"state": "idle"})
+        notices = []
+
+        def on_changed(notice, sender):
+            notices.append(
+                (
+                    tuple(str(path) for path in notice.GetResyncedPaths()),
+                    tuple(str(path) for path in notice.GetChangedInfoOnlyPaths()),
+                )
+            )
+
+        listener = Tf.Notice.Register(Usd.Notice.ObjectsChanged, on_changed, self.stage)
+        self.addCleanup(listener.Revoke)
+        for _ in range(3):
+            self.scene.set_camera_pose(Gf.Matrix4d(1))
+            self.scene.update({"state": "idle"})
+        self.assertEqual(notices, [])
+
+        pose = Gf.Matrix4d().SetTranslate(Gf.Vec3d(1, 2, 3))
+        self.scene.set_camera_pose(pose)
+        self.assertEqual(notices, [((), (self.scene.root_path + ".xformOp:transform",))])
+        self.assertEqual(self.scene.hit_test(*self.ray("forward", pose)), "forward")
+        notices.clear()
+
+        invalid = Gf.Matrix4d().SetScale(Gf.Vec3d(1, 2, 1))
+        for _ in range(2):
+            with self.assertRaises(ValueError):
+                self.scene.set_camera_pose(invalid)
+            self.assertIsNone(self.scene.hit_test(*self.ray("forward", pose)))
+        self.assertEqual(notices, [((), (self.scene.root_path + ".visibility",))])
+        notices.clear()
+
+        self.scene.set_camera_pose(pose)
+        self.assertEqual(notices, [((), (self.scene.root_path + ".visibility",))])
+        self.assertEqual(self.scene.hit_test(*self.ray("forward", pose)), "forward")
+        notices.clear()
+        for _ in range(3):
+            self.scene.set_camera_pose(pose)
+        self.assertEqual(notices, [])
 
     def test_center_button_gaps_and_backward_rays_do_not_select(self) -> None:
         for direction in ((0, 0, -1), (-0.55, 0, -1), (0.55, 0, -1), (0, 0, 1), (-0.55, 0.7, -1)):

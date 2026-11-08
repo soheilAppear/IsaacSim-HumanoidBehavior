@@ -8046,6 +8046,7 @@ class HumanoidExample(BaseSample):
         if preview not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
             raise ValueError("G1_GAZE_PREVIEW must be a boolean (1 for preview, 0 for movement)")
         config = GazeLocomotionConfig(
+            control_mode=os.environ.get("G1_GAZE_MODE", "hold").strip().lower(),
             dwell_s=float(os.environ.get("G1_GAZE_DWELL_S", "0.7")),
             distance_m=float(os.environ.get("G1_GAZE_DISTANCE_M", "0.20")),
             turn_degrees=float(os.environ.get("G1_GAZE_TURN_DEG", "10")),
@@ -8060,7 +8061,7 @@ class HumanoidExample(BaseSample):
         return config
 
     def _update_gaze_locomotion(self, dt: float) -> None:
-        """Select with fresh eyes, then finish a short base action independently of hands.
+        """Select with fresh eyes and control the base independently of both hands.
 
         The panels use the last displayed camera transform, matching their USD
         geometry. Query tracked eye descriptors directly rather than reusing the
@@ -8111,9 +8112,15 @@ class HumanoidExample(BaseSample):
         self._locomotion_brake = False
         for axis, value in enumerate(command.velocity):
             self._controller_command[axis] = value
-        if not any(command.velocity):
-            # Bypass smoothing at completion, cancellation and preview. Zero
-            # command still uses the actor's physical standing/balance control.
+        smooth_release = (
+            self._gaze_locomotion.config.control_mode == "hold"
+            and command.state == "stopping"
+            and not command.stop_immediately
+        )
+        if not any(command.velocity) and not smooth_release:
+            # Ordinary hold release uses the existing fast release filter.
+            # Tracking/session failures, faults, preview and completed stops
+            # clear the filter immediately. Standing still retains balance control.
             self._base_command[:] = 0.0
         self._navigation_scene.hide()
         self._gaze_controls.update(command, eye_valid=self._gaze_eye_valid)
@@ -8130,6 +8137,7 @@ class HumanoidExample(BaseSample):
         return {
             "enabled": self._gaze_walking_enabled,
             "preview": config.preview,
+            "control_mode": config.control_mode,
             "eye_valid": self._gaze_eye_valid,
             "state": command.state,
             "target": command.target,
@@ -8137,6 +8145,7 @@ class HumanoidExample(BaseSample):
             "last_action": command.last_action,
             "activation_count": command.activation_count,
             "requested_velocity": command.velocity,
+            "stop_immediately": command.stop_immediately,
             "detail": command.detail,
             "dwell_s": config.dwell_s,
             "distance_m": config.distance_m,

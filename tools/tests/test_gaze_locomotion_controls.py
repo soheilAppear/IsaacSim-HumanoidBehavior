@@ -64,6 +64,7 @@ class TestGazeLocomotionControls(unittest.TestCase):
     def test_default_configuration_is_preview_with_requested_small_movements(self) -> None:
         config = GAZE.GazeLocomotionConfig()
         self.assertTrue(config.preview)
+        self.assertEqual(config.control_mode, "step")
         self.assertEqual((config.dwell_s, config.distance_m, config.turn_degrees), (0.7, 0.2, 10))
         self.assertEqual(GAZE.GazeLocomotion().command.velocity, (0, 0, 0))
 
@@ -84,6 +85,9 @@ class TestGazeLocomotionControls(unittest.TestCase):
         for value in (0, 1, "false", None):
             with self.subTest(preview=value), self.assertRaises(ValueError):
                 replace(self.config, preview=value)
+        for value in (None, True, 0, "continuous", "HOLD", ""):
+            with self.subTest(control_mode=value), self.assertRaises(ValueError):
+                replace(self.config, control_mode=value)
 
     def test_startup_requires_valid_look_outside_all_buttons(self) -> None:
         for _ in range(8):
@@ -264,6 +268,9 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.pose = (0.2, 0.0, 0.0)
         self.tick()
         for _ in range(math.ceil(self.controller.SETTLE_TIMEOUT_S / 0.05)):
+            # Keep pose and velocity consistent: continuing translation must not
+            # be mistaken for bounded standing sway after the zero request.
+            self.pose = (self.pose[0] + 0.005, 0.0, 0.0)
             result = self.tick(linear_speed_m_s=0.1)
             self.assertEqual(result.velocity, (0, 0, 0))
         self.assertEqual(result.state, "fault")
@@ -347,6 +354,191 @@ class TestGazeLocomotionControls(unittest.TestCase):
             result.velocity = (1, 0, 0)
         # The entire selection sequence supplied gaze and base measurements only.
         self.assertEqual(result.activation_count, 1)
+
+    def test_hold_keeps_each_direction_active_beyond_step_goal_and_timeout(self) -> None:
+        for action in GAZE.ACTIONS:
+            with self.subTest(action=action):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+                result = self.fire(action)
+                expected_velocity = result.velocity
+                for index in range(150):
+                    self.pose = (index * 0.02, 0.0, index * 0.03)
+                    result = self.tick(action, dt=0.1)
+                    self.assertEqual((result.state, result.velocity), ("active", expected_velocity))
+                    self.assertEqual((result.activation_count, result.progress), (1, 1.0))
+                    self.assertIsNone(result.activated_action)
+                self.assertIn("while looking", result.detail)
+
+    def test_hold_look_away_or_other_button_requests_normal_stop_without_switching(self) -> None:
+        for target in (None, "turn_left"):
+            with self.subTest(target=target):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+                self.fire()
+                result = self.tick(target, linear_speed_m_s=0.2)
+                self.assertEqual((result.state, result.target, result.velocity), ("stopping", "forward", (0, 0, 0)))
+                self.assertFalse(result.stop_immediately)
+                result = self.tick("forward", linear_speed_m_s=0.1)
+                self.assertEqual((result.state, result.activation_count), ("stopping", 1))
+                self.assertEqual(result.velocity, (0, 0, 0))
+                self.assertEqual(self.settle("turn_left").state, "awaiting_release")
+                for _ in range(5):
+                    result = self.tick("turn_left")
+                    self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
+                self.assertEqual(self.fire("turn_left").activation_count, 2)
+
+    def test_hold_tracking_gaps_occlusion_and_readiness_loss_stop_immediately(self) -> None:
+        cases = (
+            {"eye_valid": False},
+            {"target": "occluded"},
+            {"wall_dt": 0.3},
+            {"wall_dt": -0.05},
+            {"ready": False},
+        )
+        for invalid in cases:
+            with self.subTest(invalid=invalid):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+                self.fire()
+                values = dict(target="forward", linear_speed_m_s=0.1)
+                values.update(invalid)
+                result = self.tick(**values)
+                self.assertEqual((result.state, result.velocity), ("stopping", (0, 0, 0)))
+                self.assertTrue(result.stop_immediately)
+                result = self.tick("forward", linear_speed_m_s=0.1)
+                self.assertEqual(result.state, "stopping")
+                self.assertTrue(result.stop_immediately)
+                self.assertEqual(self.settle("forward").state, "awaiting_release")
+                self.assertEqual(self.tick("forward").activation_count, 1)
+                self.assertEqual(self.fire("back").activation_count, 2)
+
+    def test_hold_tracking_loss_during_normal_stop_escalates_and_remains_immediate(self) -> None:
+        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+        self.fire()
+        self.assertFalse(self.tick(linear_speed_m_s=0.1).stop_immediately)
+        self.assertTrue(self.tick(eye_valid=False, linear_speed_m_s=0.1).stop_immediately)
+        self.assertTrue(self.tick(linear_speed_m_s=0.1).stop_immediately)
+
+    def test_hold_no_look_away_during_stopping_can_queue_another_activation(self) -> None:
+        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+        self.fire()
+        self.tick()
+        self.assertEqual(self.settle().state, "awaiting_release")
+        for _ in range(8):
+            result = self.tick("forward")
+            self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
+        self.assertEqual(self.fire().activation_count, 2)
+
+    def test_hold_preview_is_zero_and_one_activation_per_released_fixation(self) -> None:
+        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold", preview=True))
+        self.pose = None
+        result = self.fire()
+        self.assertIn("Would move forward while looking", result.detail)
+        for _ in range(20):
+            result = self.tick("forward")
+            self.assertEqual((result.state, result.velocity, result.activation_count), ("preview", (0, 0, 0), 1))
+            self.assertIsNone(result.activated_action)
+        self.tick(eye_valid=False)
+        self.tick("occluded")
+        self.assertEqual(self.tick("back").activation_count, 1)
+        self.assertEqual(self.fire("back").activation_count, 2)
+
+    def test_hold_reset_cancels_motion_and_requires_new_release_and_dwell(self) -> None:
+        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+        self.fire()
+        self.controller.reset()
+        self.assertEqual(self.controller.command.velocity, (0, 0, 0))
+        for _ in range(5):
+            self.assertEqual(self.tick("forward").state, "awaiting_release")
+        self.assertEqual(self.fire().activation_count, 1)
+
+    def test_small_recording_scale_balance_sway_settles_without_changing_deadline(self) -> None:
+        self.fire()
+        self.pose = (0.2, 0.0, math.pi - 0.005)
+        self.tick(linear_speed_m_s=0.05)
+        result = None
+        # Synthetic 8 mm planar sway and 0.012 rad yaw reproduce the measured
+        # recording's scale, not private recorded samples. Planar speed remains
+        # above the old instantaneous threshold throughout, including yaw wrap.
+        for index in range(1, 51):
+            elapsed = index * 0.05
+            phase = 2 * math.pi * elapsed
+            yaw = math.pi - 0.005 + 0.012 * math.sin(phase)
+            self.pose = (
+                0.2 + 0.008 * math.sin(phase),
+                0.008 * (math.cos(phase) - 1),
+                (yaw + math.pi) % (2 * math.pi) - math.pi,
+            )
+            result = self.tick(
+                linear_speed_m_s=2 * math.pi * 0.008, yaw_speed_rad_s=2 * math.pi * 0.012 * math.cos(phase)
+            )
+            self.assertEqual(result.velocity, (0, 0, 0))
+            if result.state == "awaiting_release":
+                break
+        self.assertEqual(result.state, "awaiting_release")
+        self.assertGreaterEqual(elapsed, self.controller.SETTLE_WINDOW_S)
+        self.assertLess(elapsed, self.controller.SETTLE_TIMEOUT_S)
+        self.assertEqual(self.controller.SETTLE_TIMEOUT_S, 4.0)
+
+    def test_ongoing_slow_translation_or_rotation_does_not_pass_sway_settling(self) -> None:
+        for action in ("translation", "rotation"):
+            with self.subTest(action=action):
+                self.setUp()
+                self.fire()
+                self.pose = (0.2, 0.0, 0.0)
+                self.tick()
+                for index in range(1, 81):
+                    elapsed = index * 0.05
+                    self.pose = (
+                        0.2 + (0.035 * elapsed if action == "translation" else 0),
+                        0,
+                        0.07 * elapsed if action == "rotation" else 0,
+                    )
+                    result = self.tick(
+                        linear_speed_m_s=0.035 if action == "translation" else 0,
+                        yaw_speed_rad_s=0.07 if action == "rotation" else 0,
+                    )
+                    self.assertEqual(result.velocity, (0, 0, 0))
+                self.assertEqual(result.state, "fault")
+                self.assertTrue(result.stop_immediately)
+
+    def test_zero_net_motion_with_large_excursions_or_speed_peaks_does_not_settle(self) -> None:
+        for case in ("position_envelope", "yaw_envelope", "linear_peak", "yaw_peak"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.fire()
+                self.pose = (0.2, 0.0, 0.0)
+                self.tick()
+                for index in range(1, 81):
+                    elapsed = index * 0.05
+                    phase = 2 * math.pi * elapsed
+                    radius = 0.03 if case == "position_envelope" else 0.005
+                    yaw_amplitude = 0.05 if case == "yaw_envelope" else 0.005
+                    self.pose = (
+                        0.2 + radius * math.sin(phase),
+                        radius * (math.cos(phase) - 1),
+                        yaw_amplitude * math.sin(phase),
+                    )
+                    result = self.tick(
+                        linear_speed_m_s=0.2 if case == "linear_peak" else 0.04,
+                        yaw_speed_rad_s=0.4 if case == "yaw_peak" else 0.08,
+                    )
+                self.assertEqual(result.state, "fault")
+
+    def test_sway_confirmation_must_be_continuous_and_cannot_override_new_drift(self) -> None:
+        self.fire()
+        self.pose = (0.2, 0.0, 0.0)
+        self.tick()
+        for _ in range(20):
+            result = self.tick(linear_speed_m_s=0.04)
+        self.assertEqual(result.state, "stopping")
+        # The pose window just became eligible; a new sustained movement must
+        # clear the alternative confirmation before it reaches 0.2 seconds.
+        for index in range(1, 61):
+            self.pose = (0.2 + 0.005 * index, 0, 0)
+            result = self.tick(linear_speed_m_s=0.2)
+        self.assertEqual(result.state, "fault")
 
 
 if __name__ == "__main__":

@@ -61,7 +61,7 @@ launcher is an alias for it.
 | Pickup | Experimental physical contact grasping with bounded finger targets; objects must be held by fingers and friction, with no hand-to-object fixed joint |
 | Camera | Stabilized robot frame follows travel; HMD orientation rotates the view and its eye offset around the measured neck. Torso roll/pitch, gait bob, and real-world head translation are excluded |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
-| Gaze buttons | Experimental eye-only dwell controls request one short forward/backward movement or left/right turn; anchored preview is the default, and both optical hands remain free |
+| Gaze buttons | Experimental eye-only dwell controls move forward/backward or turn while the same button remains fixated; look away to stop. Anchored preview is the default, and both optical hands remain free |
 | Physics | CPU: 100 Hz stationary / 200 Hz walking; rendering requests 90 Hz stationary / 60 Hz walking |
 | Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
 | Experimental walking | Left stick moves forward/backward/sideways; right stick turns. Grip/trigger manipulation and optical hands remain available; controller face buttons/stick clicks are unused, and blue pointing navigation is disabled but retained |
@@ -420,8 +420,9 @@ then **Play**. If the headset view is not already active, open **Window → Rend
 → XR**. Use **Virtual Reality Experience** and **OpenXR** if they are not already
 selected, preserve the working runtime settings, and click **Start XR**.
 Side panels follow the view while leaving its center free. Look
-between the buttons first to arm selection, then hold a button for **0.7 seconds**
-as its dwell ring fills. Preview confirms the selection without moving the base.
+between the buttons first to arm selection, then look at a button for **0.7 seconds**
+as its dwell ring fills. Keep looking to sustain the request; look away to end it.
+Preview shows this interaction without moving the anchored base.
 Both hands use optical tracking; controllers and the webcam do not substitute for
 them in this profile. Eye tracking must be enabled, calibrated and exposed by the
 VR runtime; a head-direction fallback cannot activate these controls.
@@ -432,23 +433,31 @@ After checking the preview, exit Isaac and relaunch for physical movement:
 .\tools\launch_gaze_walking.bat --move
 ```
 
-Load the scene again, click **Play**, and **Start XR** if needed. A completed dwell
-requests one **0.20 m forward/backward movement** or **10° left/right turn**, then
-you can look back at the box. The
+Load the scene again, click **Play**, and **Start XR** if needed. After the dwell,
+keep looking at **Forward**, **Back**, **Turn left**, or **Turn right** to continue
+that movement. **Look away to stop.** Invalid/lost eye tracking also requests a
+stop; physical braking takes time. The
 default requested speeds are **0.20 m/s forward, 0.15 m/s backward, and 0.25 rad/s
-turning**. Additional selections are ignored while busy; look away from all buttons
-before selecting again. Tracking loss clears unfinished dwell; an already accepted
-movement continues to its measured stop without requiring continued fixation.
-These are experimental motion targets, not guaranteed achieved distances or speeds;
+turning**. Look away from all buttons and allow stopping to finish before selecting
+again. Both hands remain available while looking at a button. These are experimental
+motion requests, not guaranteed achieved speeds or stopping distances;
 physical braking, gait and contact affect the outcome. Live gaze usability, shelf
 pickup and loaded transport still require validation. See the
 [operating guide](HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free) for
 configuration and the preview/movement distinction.
 
-The actual-scene synthetic-eye checks passed anchored preview and all four
-physical movements with measured stopping. The unloaded run achieved about
-20 cm forward, 22 cm backward, and 11-degree turns; arm/finger updates continued.
-Live eye tracking and carrying a gripped box are separate acceptance checks.
+The default is `G1_GAZE_MODE=hold`. Set `$env:G1_GAZE_MODE='step'` before launching
+to retain one **0.20 m movement** or **10° turn** per completed dwell; in that
+optional mode, the accepted movement finishes even after looking away. Distance
+and angle settings apply only to step mode.
+
+**981 offline regressions passed.** Actual-scene synthetic-eye hold checks passed
+anchored preview and all four physical directions, continuing beyond the old
+20 cm/10-degree limits. Look-away stopped Back and both turns; simulated eye loss
+immediately zeroed Forward's command and it settled without a fault. Arm/finger
+updates continued. These checks use the real robot actor with synthetic eyes;
+live eye tracking and carrying a gripped box remain separate acceptance checks.
+Earlier step-mode measurements remain in the technical guide as historical evidence.
 
 ### Retained pointing navigation
 
