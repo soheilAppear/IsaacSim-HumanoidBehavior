@@ -487,7 +487,7 @@ The default **hold** mode starts on the first valid button sample after arming,
 without a fixation timer, and continues only while
 you keep looking at the same button. **Look away to stop**, including when looking
 back at the box. Changing buttons or lost/invalid eye tracking also requests a
-stop. Requests use **0.20 m/s forward**, **0.15 m/s backward**, or **0.25 rad/s
+stop. Hold requests use **0.40 m/s forward**, **0.25 m/s backward**, or **0.40 rad/s
 yaw**; turning continues while the turn button is held. Physical braking and
 contacts determine actual travel and stopping distance. A stop request is not an
 instant physical stop. A valid look outside all buttons rearms the next selection
@@ -534,9 +534,9 @@ an explicit `step` override. Supply settings in the environment before starting 
 | `G1_GAZE_DWELL_S` | `0` in hold; `0.7` in step | Activation delay in wall seconds; zero activates on the first valid button hit |
 | `G1_GAZE_DISTANCE_M` | `0.20` | Step mode only: requested forward/backward distance, in meters |
 | `G1_GAZE_TURN_DEG` | `10` | Step mode only: requested turn angle, in degrees |
-| `G1_GAZE_FORWARD_SPEED` | `0.20` | Forward command speed, in m/s |
-| `G1_GAZE_BACKWARD_SPEED` | `0.15` | Backward command speed, in m/s |
-| `G1_GAZE_YAW_SPEED` | `0.25` | Turn command speed, in rad/s |
+| `G1_GAZE_FORWARD_SPEED` | `0.40` in hold; `0.20` in step | Requested forward speed, in m/s |
+| `G1_GAZE_BACKWARD_SPEED` | `0.25` in hold; `0.15` in step | Requested backward speed, in m/s |
+| `G1_GAZE_YAW_SPEED` | `0.40` in hold; `0.25` in step | Requested turn speed, in rad/s |
 | `G1_GAZE_HEADING_HOLD` | `1` | Enable heading feedback during Forward/Back; `0` disables it |
 | `G1_GAZE_HEADING_GAIN` | `3.0` | Corrective yaw speed per radian of heading error, in 1/s |
 | `G1_GAZE_HEADING_MAX_YAW_SPEED` | `0.15` | Maximum heading-correction magnitude, in rad/s |
@@ -548,7 +548,12 @@ The launch examples explicitly set the delay to `0` to clear an older terminal's
 Immediate activation removes the selection wait, while the physical command
 still uses the existing acceleration and stopping behavior. Dwell uses wall time;
 requested speeds and settling use simulation time, so
-slow simulation changes actual movement per wall second.
+slow simulation changes actual movement per wall second. Explicit speed overrides
+are preserved in both modes.
+
+The faster defaults passed **1,001 offline regressions** and were configured in
+the live instance with no health fault or callback error observed at that check.
+Dedicated physical validation at the higher speeds, including carrying, remains pending.
 
 The directional speed settings remain bounded by the existing physical profile's
 0.65 m/s forward, 0.35 m/s backward and 0.40 rad/s yaw caps. The source supports
@@ -562,7 +567,8 @@ all four physical actions without faults. Forward's heading error decreased from
 3.20° to 1.31° right; Back's decreased from 2.31° to 0.47° right, while Back's
 sideways drift remained about 3.6 cm. These synthetic-eye, neutral-arm checks do
 not establish hardware eye tracking, active-arm performance or loaded grasping.
-The final gain-3.0 default passed **999 offline regressions**.
+The gain-3.0 configuration passed **999 offline regressions** before the hold-speed
+increase. Those physical checks used the earlier speed defaults.
 Preview checks selection and
 hand availability, not balance,
 gait, braking, shelf pickup or loaded transport. A displayed selection is an

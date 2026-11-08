@@ -353,6 +353,16 @@ class TestGazeIntegrationControls(unittest.TestCase):
         self.assertEqual(example._gaze_locomotion.config.dwell_s, 0.7)
         self.assertEqual(self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion.config.dwell_s, 0.3)
 
+    def test_hold_speed_defaults_are_faster_and_step_speeds_stay_bounded(self) -> None:
+        for mode, speeds in (("hold", (0.4, 0.25, 0.4)), ("step", (0.2, 0.15, 0.25))):
+            with self.subTest(mode=mode), patch.dict(os.environ, {"G1_LOCOMOTION_INPUT": "gaze", "G1_GAZE_MODE": mode}):
+                for name in ("G1_GAZE_FORWARD_SPEED", "G1_GAZE_BACKWARD_SPEED", "G1_GAZE_YAW_SPEED"):
+                    os.environ.pop(name, None)
+                config = HUMANOID.HumanoidExample()._gaze_locomotion.config
+            self.assertEqual((config.forward_speed, config.backward_speed, config.yaw_speed), speeds)
+        explicit = self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion.config
+        self.assertEqual((explicit.forward_speed, explicit.backward_speed, explicit.yaw_speed), (0.2, 0.15, 0.25))
+
     def test_forward_heading_correction_reaches_base_and_eye_loss_clears_it(self) -> None:
         self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold", G1_GAZE_DWELL_S="0")._gaze_locomotion
         self.tick()

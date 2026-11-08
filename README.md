@@ -442,8 +442,10 @@ Load the scene again, click **Play**, and **Start XR** if needed. Look at
 **Forward**, **Back**, **Turn left**, or **Turn right** and keep looking to continue
 that movement. **Look away to stop.** Invalid/lost eye tracking also requests a
 stop; physical braking takes time. The
-default requested speeds are **0.20 m/s forward, 0.15 m/s backward, and 0.25 rad/s
-turning**. Looking outside all buttons rearms the next selection without a separate
+default requested hold speeds are **0.40 m/s forward, 0.25 m/s backward, and 0.40 rad/s
+turning**. Actual speed per wall second depends on simulation performance and gait.
+Step mode retains **0.20/0.15 m/s** forward/backward and **0.25 rad/s** turning;
+explicit environment speed overrides are preserved. Looking outside all buttons rearms the next selection without a separate
 settling wait. Both hands remain available while looking at a button. These are experimental
 motion requests, not guaranteed achieved speeds or stopping distances;
 physical braking, gait and contact affect the outcome. Live gaze usability, shelf
@@ -451,12 +453,16 @@ pickup and loaded transport still require validation. See the
 [operating guide](HUMANOID_VR_CONTROL.md#gaze-buttons-with-both-hands-free) for
 configuration and the preview/movement distinction.
 
+The faster profile passed **1,001 offline regressions** and was applied to the
+live instance. Dedicated physical checks at these speeds, including carrying,
+remain pending; the measurements below used the earlier speed profile.
+
 Forward and Back capture the robot's heading when each movement starts and request
 bounded corrective turning while active. This uses the existing physical walking
 controller; explicit turns keep their normal behavior. With the default gain of
 3.0/s, a paired synthetic-eye run reduced Forward's heading error from 3.20° right
 to 1.31° right. Back's heading error also decreased, while its sideways drift was
-essentially unchanged. **999 offline regressions passed** with the final default.
+essentially unchanged. **999 offline regressions passed** before the hold-speed increase.
 Heading hold does not guarantee a straight path.
 
 The default is `G1_GAZE_MODE=hold` with `G1_GAZE_DWELL_S=0`. An explicit positive

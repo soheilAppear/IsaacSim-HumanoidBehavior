@@ -20,9 +20,15 @@ if not defined G1_GAZE_DWELL_S (
 )
 if not defined G1_GAZE_DISTANCE_M set "G1_GAZE_DISTANCE_M=0.20"
 if not defined G1_GAZE_TURN_DEG set "G1_GAZE_TURN_DEG=10"
-if not defined G1_GAZE_FORWARD_SPEED set "G1_GAZE_FORWARD_SPEED=0.20"
-if not defined G1_GAZE_BACKWARD_SPEED set "G1_GAZE_BACKWARD_SPEED=0.15"
-if not defined G1_GAZE_YAW_SPEED set "G1_GAZE_YAW_SPEED=0.25"
+if /i "%G1_GAZE_MODE%"=="step" (
+    if not defined G1_GAZE_FORWARD_SPEED set "G1_GAZE_FORWARD_SPEED=0.20"
+    if not defined G1_GAZE_BACKWARD_SPEED set "G1_GAZE_BACKWARD_SPEED=0.15"
+    if not defined G1_GAZE_YAW_SPEED set "G1_GAZE_YAW_SPEED=0.25"
+) else (
+    if not defined G1_GAZE_FORWARD_SPEED set "G1_GAZE_FORWARD_SPEED=0.40"
+    if not defined G1_GAZE_BACKWARD_SPEED set "G1_GAZE_BACKWARD_SPEED=0.25"
+    if not defined G1_GAZE_YAW_SPEED set "G1_GAZE_YAW_SPEED=0.40"
+)
 if not defined G1_GAZE_HEADING_HOLD set "G1_GAZE_HEADING_HOLD=1"
 if not defined G1_GAZE_HEADING_GAIN set "G1_GAZE_HEADING_GAIN=3.0"
 if not defined G1_GAZE_HEADING_MAX_YAW_SPEED set "G1_GAZE_HEADING_MAX_YAW_SPEED=0.15"

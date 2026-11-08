@@ -102,9 +102,9 @@ class TestGazeLauncherControls(unittest.TestCase):
             "G1_GAZE_DWELL_S": "1.2",
             "G1_GAZE_DISTANCE_M": "0.20",
             "G1_GAZE_TURN_DEG": "10",
-            "G1_GAZE_FORWARD_SPEED": "0.20",
+            "G1_GAZE_FORWARD_SPEED": "0.40",
             "G1_GAZE_BACKWARD_SPEED": "0",
-            "G1_GAZE_YAW_SPEED": "0.25",
+            "G1_GAZE_YAW_SPEED": "0.40",
             "G1_GAZE_HEADING_HOLD": "1",
             "G1_GAZE_HEADING_GAIN": "3.0",
             "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.15",
@@ -154,6 +154,19 @@ class TestGazeLauncherControls(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 for name, value in overrides.items():
                     self.assertEqual(values[name], value)
+
+    def test_mode_specific_speeds_and_explicit_overrides_reach_base_launcher(self) -> None:
+        """Faster hold defaults preserve legacy steps and all explicit speed values."""
+        speed_names = ("G1_GAZE_FORWARD_SPEED", "G1_GAZE_BACKWARD_SPEED", "G1_GAZE_YAW_SPEED")
+        for mode, defaults in (("HOLD", ("0.40", "0.25", "0.40")), ("STEP", ("0.20", "0.15", "0.25"))):
+            for explicit in (None, ("0.12", "0", "0.18")):
+                with self.subTest(mode=mode, explicit=explicit):
+                    overrides = {"G1_GAZE_MODE": mode}
+                    if explicit is not None:
+                        overrides.update(zip(speed_names, explicit))
+                    result, values, _ = self._run_launcher("--move", overrides=overrides)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(tuple(values[name] for name in speed_names), explicit or defaults)
 
     def test_base_launcher_failure_is_returned(self) -> None:
         result, _, _ = self._run_launcher("--move", exit_code=23)

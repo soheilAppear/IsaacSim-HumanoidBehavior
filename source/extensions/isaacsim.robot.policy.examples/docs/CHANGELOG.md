@@ -1,5 +1,16 @@
 # Changelog
 
+## HumanoidBehavior faster continuous gaze movement — 2026-11-08
+
+- Increase requested hold-mode defaults to 0.40 m/s forward, 0.25 m/s backward and
+  0.40 rad/s yaw. Retain step-mode defaults of 0.20/0.15 m/s and 0.25 rad/s, and
+  preserve explicit speed overrides. Actual movement per wall second still depends
+  on simulation performance and the walking controller's physical response.
+- Pass 1,001 offline regressions, including launcher mode/default/override coverage,
+  and apply the faster configuration to the live instance without an observed
+  health fault or callback error. Dedicated higher-speed physical and carrying
+  validation remains pending; earlier physical results use the prior speed profile.
+
 ## HumanoidBehavior gaze translation heading feedback — 2026-11-08
 
 - Capture robot yaw at the start of Forward/Back in both gaze modes and request

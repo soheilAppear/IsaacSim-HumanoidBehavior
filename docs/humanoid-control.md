@@ -947,9 +947,10 @@ permissions and calibration still determine whether the device supplies usable
 eye data. Application polling times are not hardware capture timestamps.
 
 Defaults are `G1_GAZE_MODE=hold`, `G1_GAZE_DISTANCE_M=0.20`, `G1_GAZE_TURN_DEG=10`,
-`G1_GAZE_FORWARD_SPEED=0.20`, `G1_GAZE_BACKWARD_SPEED=0.15`,
-`G1_GAZE_YAW_SPEED=0.25`, and `G1_GAZE_DWELL_S=0` in hold mode. Step mode defaults
-to `G1_GAZE_DWELL_S=0.7`; an explicit override is preserved in either mode. A
+`G1_GAZE_FORWARD_SPEED=0.40`, `G1_GAZE_BACKWARD_SPEED=0.25`,
+`G1_GAZE_YAW_SPEED=0.40`, and `G1_GAZE_DWELL_S=0` in hold mode. Step mode retains
+forward/backward/yaw defaults of 0.20 m/s, 0.15 m/s and 0.25 rad/s, and defaults
+to `G1_GAZE_DWELL_S=0.7`; explicit speed and dwell overrides are preserved in either mode. A
 positive override restores delayed activation and the ring. Distance is in meters,
 turn angle in degrees, translational speed in m/s, and yaw speed in rad/s.
 Distance and turn angle apply only to `G1_GAZE_MODE=step`; hold mode continues
@@ -957,7 +958,18 @@ at the requested translation or yaw speed while the same button remains fixated.
 Forward/reverse/yaw requests remain bounded by the direct-control caps
 0.65/0.35 m/s and 0.40 rad/s. These are requested targets, not guaranteed physical
 travel or stopping distances. The existing actor supports reverse movement;
-loaded transport still requires a separate physical acceptance check.
+loaded transport still requires a separate physical acceptance check. Requested
+speeds are per simulation second; achieved movement per wall second also depends
+on simulation performance and physical gait response.
+
+**Faster-profile validation on 8 November 2026:** all **1,001 offline regressions
+passed in 14.852 seconds**. The 0.40/0.25 m/s and 0.40 rad/s configuration was
+applied to the existing live instance after clearing only its base-command state;
+no health fault or callback error was observed at that check. No dedicated
+physical run at these higher speeds was completed, and higher-speed carrying
+remains unvalidated. A single pre-change session observation advanced 0.343
+simulation seconds per wall second; this is an observation, not a guaranteed rate.
+The physical comparisons below used the earlier, slower requests.
 
 Forward/Back translations in both gaze modes capture measured robot yaw at
 activation and request corrective yaw toward that reference while active. The
@@ -1022,8 +1034,9 @@ Forward's largest sampled heading error with feedback was 2.30°. Heading drift
 decreased in these runs; reverse sideways drift was essentially unchanged. The
 gain-3.0 run retained 6,974 arm updates and 6,974 finger updates. These checks used
 synthetic eyes and neutral arms, not hardware tracking, active-arm manipulation or
-a carried payload. The final gain-3.0 default passed **999 offline regressions in
-12.405 seconds**.
+a carried payload. The gain-3.0 configuration passed **999 offline regressions in
+12.405 seconds** before the hold-speed increase; these physical comparisons used
+the earlier 0.20/0.15 m/s translation and 0.25 rad/s turn requests.
 
 **Immediate-hold validation before heading feedback on 8 November 2026:** all **990 offline regressions
 passed**, and the actual-scene anchored preview passed immediate activation for
