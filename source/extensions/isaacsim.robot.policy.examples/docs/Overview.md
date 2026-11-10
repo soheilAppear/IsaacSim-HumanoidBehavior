@@ -21,7 +21,11 @@ Launch configuration selects the control profile before the scene is built:
   checked destination and requires the pointing gesture to remain active.
 - Eye-gaze buttons use tracked combined-eye input. The default `G1_GAZE_MODE=hold`
   activates immediately on a button hit, including a quick glance, and continues while the same button is
-  fixated; looking away or losing valid eye tracking requests a stop. Preview
+  fixated. Looking directly at another valid button switches the hold request in
+  the same update; positive dwell restarts on the new target. Looking away or
+  losing valid eye tracking requests a stop. Startup/reset and recovery from
+  tracking loss, occlusion, session loss or callback gaps still require a valid
+  look outside all buttons. Preview
   anchors the base; explicit movement mode uses the existing walking policy.
   Optional `step` mode retains a 0.7-second dwell and bounded steps/turns that finish
   without fixation. An explicit positive `G1_GAZE_DWELL_S` adds a delay/progress ring
@@ -83,7 +87,11 @@ hand tracking when the XR instance starts. The headset and active runtime must a
 provide valid landmarks. A connected headset or controller poses alone do not prove
 that optical tracking is available. Generated-input replay checks do not verify
 headset tracking quality, occlusion recovery, or walking with a carried payload.
-The latest higher-speed/lateral hybrid revision passed 1,062 offline regressions
+Direct hold switching passed 1,068 offline tests in 15.973 seconds. A stopped-scene
+runtime check verified all four panel hit regions and 24 isolated synthetic-input
+direction transitions without commanding the robot. Dynamic-physics and headset
+acceptance of this transition remain unverified. The preceding higher-speed/lateral
+hybrid revision passed 1,062 offline regressions
 in 13.613 seconds and hybrid preview/movement checks. Preview had zero sampled base
 movement; lateral and diagonal movement, input handover and release interlocks passed.
 These checks used synthetic devices with real simulation physics and production

@@ -429,6 +429,9 @@ Side panels follow the view while leaving its center free. Look
 between the buttons first to arm selection, then look at a button to activate it
 **immediately**. Even a quick glance activates it; there is no dwell ring at the
 default zero delay. Keep looking to sustain the request; look away to end it.
+In hold mode, look directly at another valid button to request its direction
+immediately, without first looking between buttons. Physical acceleration and
+braking still apply. A positive dwell setting starts a fresh delay for the new button.
 Preview shows this interaction without moving the anchored base, including when
 using sticks. Each hand prefers optical tracking; when the current input is a
 controller, hold its grip to move the arm and use its trigger to close the fingers.
@@ -453,8 +456,11 @@ stop; physical braking takes time. The
 default requested hold speeds are **0.60 m/s forward, 0.35 m/s backward, and 0.40 rad/s
 turning**. Actual speed per wall second depends on simulation performance and gait.
 Step mode retains **0.20/0.15 m/s** forward/backward and **0.25 rad/s** turning;
-explicit environment speed overrides are preserved. Looking outside all buttons rearms the next selection without a separate
-settling wait. Both hands remain available while looking at a button. These are experimental
+explicit environment speed overrides are preserved. Startup/reset and recovery from
+tracking loss, occlusion, session loss or a callback interruption still require a
+valid look outside all buttons before gaze can activate again. Direct switching
+applies only to uninterrupted valid hold input. Both hands remain available while
+looking at a button. These are experimental
 motion requests, not guaranteed achieved speeds or stopping distances;
 physical braking, gait and contact affect the outcome. Live gaze usability, shelf
 pickup and loaded transport still require validation. See the
@@ -475,7 +481,11 @@ STICKS**. Neutral mixed hand/controller input does not block gaze.
 The launcher defaults to `G1_OPTICAL_HANDS_ONLY=0` and
 `G1_GAZE_CONTROLLER_OVERRIDE=1`, preserving explicit overrides. Set the first to
 `1` for optical-only manipulation, or the second to `0` for eye-only locomotion.
-These switches are independent. **The new speeds and hybrid sidestepping passed
+These switches are independent. **Direct hold switching passed 1,068 offline tests
+in 15.973 seconds.** A stopped-scene check verified all four panel hit regions and
+24 isolated direction transitions using synthetic input; no synthetic command was
+applied to the robot. Dynamic-physics and headset acceptance of this new transition
+remain unverified. **Before that change, the new speeds and hybrid sidestepping passed
 1,062 offline regressions in 13.613 seconds and hybrid preview/movement checks.**
 Preview had zero sampled base translation/rotation. Left/right 0.30 m/s requests
 produced **17.11/18.64 cm** of travel in 1.215 simulation seconds; diagonals moved

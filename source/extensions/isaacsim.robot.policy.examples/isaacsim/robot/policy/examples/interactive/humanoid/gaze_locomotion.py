@@ -7,10 +7,11 @@ The caller resolves eye-ray hits, supplies measured robot motion, and applies
 the returned body-frame velocity through its existing locomotion safeguards.
 This module owns no XR, scene, physics, arm, finger, or grip input. Step mode
 finishes its selected action independently of gaze; hold mode moves only while
-the same button has valid, uninterrupted gaze. A valid look outside every button
-is required after startup/reset and between actions. In hold mode the look-away
-that requests zero also permits another selection; physical motion supervision
-belongs to the caller's support-aware stop and runaway guards.
+the selected button has valid, uninterrupted gaze. Hold mode can switch directly
+to another valid button; looking outside requests zero and permits another
+selection. Startup/reset and interrupted tracking still require a verified
+look-away, as do completed step actions. Physical motion supervision belongs to
+the caller's support-aware stop and runaway guards.
 """
 
 from __future__ import annotations
@@ -115,7 +116,7 @@ class GazeLocomotionCommand:
 
 
 class GazeLocomotion:
-    """Select movement and require verified look-away between actions.
+    """Select movement with direct hold switching and verified recovery look-away.
 
     Dwell and sample-gap checks use monotonic wall time. Travel and stopping
     timeouts use simulation ``dt`` so slower rendering does not shorten a move.
@@ -158,6 +159,9 @@ class GazeLocomotion:
         self._candidate: str | None = None
         self._dwell_start_s: float | None = None
         self._action: str | None = None
+        # Preview has no physical action. Track its live hold separately from
+        # last_action, which is historical and survives tracking interruptions.
+        self._preview_hold_action: str | None = None
         self._start_pose: tuple[float, float, float] | None = None
         self._previous_yaw = 0.0
         self._yaw_travel = 0.0
@@ -245,6 +249,7 @@ class GazeLocomotion:
     def _cancel(self, detail: str, *, fault: bool = False) -> GazeLocomotionCommand:
         """Drop pending and active actions without treating cancellation as look-away."""
         self._candidate = self._dwell_start_s = self._action = None
+        self._preview_hold_action = None
         self._released = False
         self._stop_window.clear()
         if fault:
@@ -313,9 +318,11 @@ class GazeLocomotion:
         self._activation_count += 1
         self._clear_heading()
         if self.config.preview:
+            if self.config.control_mode == "hold":
+                self._preview_hold_action = action
             return self._publish(
                 "preview",
-                f"Would {self._description(action)}; look away to select again",
+                self._preview_detail(action),
                 target=action,
                 progress=1.0,
                 activated_action=action,
@@ -341,6 +348,15 @@ class GazeLocomotion:
             velocity=velocity,
             activated_action=action,
         )
+
+    def _preview_detail(self, action: str) -> str:
+        """Explain the same selection transitions that physical mode permits."""
+        next_selection = (
+            "look at another button to switch or look away to stop"
+            if self.config.control_mode == "hold"
+            else "look away to select again"
+        )
+        return f"Would {self._description(action)}; {next_selection}"
 
     def _begin_stop(
         self,
@@ -389,10 +405,11 @@ class GazeLocomotion:
     ) -> GazeLocomotionCommand:
         """Request zero without imposing a second pelvis-only physical stop guard.
 
-        Verified outside input can release and rearm on this same update. Other
-        buttons and invalid/occluded input cannot queue a new action. The caller
-        still applies normal release smoothing or immediate zero as requested,
-        and independently monitors measured foot support, drift and runaway.
+        Verified outside input can release and rearm on this same update.
+        Invalid/occluded input cannot queue a new action. Valid direct button
+        switches are handled separately in update, without a zero request. The
+        caller applies release smoothing or immediate zero as requested, and
+        independently monitors measured foot support, drift and runaway.
         """
         self._stop_diagnostics = {
             "mode": "hold",
@@ -559,9 +576,11 @@ class GazeLocomotion:
         buttons. Unknown target IDs cannot rearm. First fixation samples contribute
         zero dwell; equal timestamps are allowed but add no time. An invalid eye
         sample, target change, or excessive callback gap clears unfinished dwell.
-        In hold mode a changed button or verified look-away requests a normally
-        smoothed stop; eye loss, unknown/occluded hits, interrupted callbacks and
-        readiness loss demand immediate zero. A verified outside sample can end
+        In hold mode a valid changed button replaces the selection on this same
+        callback; a positive configured dwell starts fresh for the new button.
+        Verified look-away requests a normally smoothed stop; eye loss,
+        unknown/occluded hits, interrupted callbacks and readiness loss demand
+        immediate zero and a fresh look-away to recover. An outside sample can end
         hold and rearm selection on the same update; hold imposes no physical
         settling delay. Step mode continues independently of gaze, then settles
         without consuming a look-away for the next action. The caller remains
@@ -588,7 +607,7 @@ class GazeLocomotion:
         if hold_moving:
             unknown_target = target is not None and (not isinstance(target, str) or target not in ACTIONS)
             immediate = ready is not True or eye_valid is not True or interrupted or unknown_target
-            if immediate or target != self._action:
+            if immediate or target is None:
                 if ready is not True:
                     detail = "Gaze locomotion readiness lost"
                 elif interrupted:
@@ -607,10 +626,20 @@ class GazeLocomotion:
                     immediate=immediate,
                     verified_outside=not immediate and target is None,
                 )
+            if target != self._action:
+                # A fresh, recognized button changes intent without requiring an
+                # intervening outside sample. Do not use _release_hold: this is
+                # not a zero request or evidence of physical rest. Fall through
+                # the normal disabled-button/dwell gates and capture a new
+                # heading origin only when the replacement action activates.
+                self._candidate = self._dwell_start_s = self._action = None
+                self._released = True
+                moving = False
         if moving:
             return self._advance_motion(float(dt), measured_pose, float(linear_speed_m_s), float(yaw_speed_rad_s))
         if interrupted:
             self._candidate = self._dwell_start_s = None
+            self._preview_hold_action = None
             if self.config.control_mode == "hold":
                 self._released = False
             return self._publish(
@@ -620,6 +649,7 @@ class GazeLocomotion:
             )
         if eye_valid is not True:
             self._candidate = self._dwell_start_s = None
+            self._preview_hold_action = None
             if self.config.control_mode == "hold":
                 self._released = False
             return self._publish(
@@ -629,6 +659,7 @@ class GazeLocomotion:
             )
         if target is not None and (not isinstance(target, str) or target not in ACTIONS):
             self._candidate = self._dwell_start_s = None
+            self._preview_hold_action = None
             if self.config.control_mode == "hold":
                 self._released = False
             return self._publish(
@@ -638,6 +669,7 @@ class GazeLocomotion:
             )
         if target is None:
             self._candidate = self._dwell_start_s = None
+            self._preview_hold_action = None
             self._released = True
             return self._publish(
                 "idle",
@@ -647,11 +679,20 @@ class GazeLocomotion:
                     else "Look at one gaze button to begin dwell"
                 ),
             )
+        if self._preview_hold_action is not None and target != self._preview_hold_action:
+            # All freshness/readiness gates above passed. Historical last_action
+            # alone cannot authorize a preview switch after tracking loss.
+            self._preview_hold_action = None
+            self._released = True
         if not self._released:
-            if self.config.preview and self._last_action is not None:
+            if (
+                self.config.preview
+                and self._last_action is not None
+                and (self.config.control_mode != "hold" or self._preview_hold_action is not None)
+            ):
                 return self._publish(
                     "preview",
-                    f"Would {self._description(self._last_action)}; look away to select again",
+                    self._preview_detail(self._last_action),
                     target=self._last_action,
                     progress=1.0,
                 )

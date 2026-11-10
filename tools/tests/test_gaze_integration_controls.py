@@ -343,9 +343,43 @@ class TestGazeIntegrationControls(unittest.TestCase):
         result = self.tick("forward")
         self.assertEqual((result.state, result.activated_action), ("active", "forward"))
         self.assertGreater(float(self.ex._controller_command[0]), 0)
-        self.tick()
         result = self.tick("turn_left")
         self.assertEqual((result.state, result.activated_action, result.activation_count), ("active", "turn_left", 2))
+        np.testing.assert_allclose(self.ex._controller_command.numpy(), (0, 0, 0.25))
+        result = self.tick("back")
+        self.assertEqual((result.state, result.activated_action, result.activation_count), ("active", "back", 3))
+        np.testing.assert_allclose(self.ex._controller_command.numpy(), (-0.15, 0, 0))
+
+    def test_hold_direct_switch_with_configured_dwell_requests_zero_until_new_fixation_completes(self) -> None:
+        self.ex._gaze_locomotion = self.make_example(G1_GAZE_MODE="hold")._gaze_locomotion
+        self.activate()
+        result = self.tick("turn_right")
+        self.assertEqual((result.state, result.target, result.progress), ("dwelling", "turn_right", 0))
+        np.testing.assert_array_equal(self.ex._controller_command.numpy(), (0, 0, 0))
+        for _ in range(2):
+            result = self.tick("turn_right")
+            self.assertEqual(result.activation_count, 1)
+            np.testing.assert_array_equal(self.ex._controller_command.numpy(), (0, 0, 0))
+        result = self.tick("turn_right")
+        self.assertEqual((result.activated_action, result.activation_count), ("turn_right", 2))
+        np.testing.assert_allclose(self.ex._controller_command.numpy(), (0, 0, -0.25))
+
+    def test_hold_preview_direct_switch_updates_selection_while_clearing_all_motion_buffers(self) -> None:
+        self.ex._gaze_locomotion = self.make_example(
+            preview=True, G1_GAZE_MODE="hold", G1_GAZE_DWELL_S="0"
+        )._gaze_locomotion
+        self.tick()
+        for count, action in enumerate(("forward", "turn_left", "back", "turn_right"), start=1):
+            self.ex._base_command[:] = 0.4
+            self.ex._controller_command[:] = 0.4
+            self.ex._keyboard_command[:] = 0.4
+            result = self.tick(action)
+            self.assertEqual(
+                (result.state, result.activated_action, result.activation_count), ("preview", action, count)
+            )
+            for commands in (self.ex._base_command, self.ex._controller_command, self.ex._keyboard_command):
+                np.testing.assert_array_equal(commands.numpy(), (0, 0, 0))
+        self.ex.g1.robot.get_velocities.assert_not_called()
 
     def test_step_retains_dwell_default_and_hold_accepts_positive_override(self) -> None:
         with patch.dict(os.environ, {"G1_LOCOMOTION_INPUT": "gaze", "G1_GAZE_MODE": "step"}):

@@ -1,5 +1,19 @@
 # Changelog
 
+## HumanoidBehavior direct hold-gaze direction switching — 2026-11-09
+
+- Switch directly between valid gaze buttons in hold mode without an intervening
+  look-away. Zero dwell selects the new request in the same callback; a positive
+  dwell setting starts fresh on the new target. Existing physical command smoothing
+  still applies.
+- Preserve look-away rearming after startup/reset, tracking/session loss, occlusion,
+  callback gaps and controller handoff. Step-mode busy/rearm behavior is unchanged.
+- Pass 1,068 offline tests in 15.973 seconds. In the stopped Isaac scene, verify
+  all four panel hit regions and 24 isolated direction-pair checks (12 movement
+  selector, 12 preview) using synthetic pose/input. Apply no synthetic commands
+  to the robot. Dynamic-physics and headset acceptance of the new transition
+  remain unverified. Earlier entries describe preceding revisions.
+
 ## HumanoidBehavior faster hybrid walking and sidestepping — 2026-11-08
 
 - Increase default hold requests to 0.60 m/s forward and 0.35 m/s backward, keeping

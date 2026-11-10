@@ -478,27 +478,113 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.assertEqual((result.state, result.velocity), ("stopping", (0.0, 0.0, 0.0)))
         self.assertFalse(self.controller.heading_status["active"])
 
-    def test_hold_look_away_or_other_button_requests_normal_stop_without_switching(self) -> None:
-        for target in (None, "turn_left"):
-            with self.subTest(target=target):
-                self.setUp()
-                self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
-                self.fire()
-                result = self.tick(target, linear_speed_m_s=0.2)
-                expected_state = "idle" if target is None else "awaiting_release"
-                self.assertEqual((result.state, result.target, result.velocity), (expected_state, None, (0, 0, 0)))
-                self.assertFalse(result.stop_immediately)
-                self.assertIsNone(self.controller._action)
-                if target is not None:
-                    for _ in range(5):
-                        result = self.tick(target)
-                        self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
+    def test_hold_look_away_requests_normal_stop_without_a_settling_interlock(self) -> None:
+        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+        self.fire()
+        result = self.tick(None, linear_speed_m_s=0.2)
+        self.assertEqual((result.state, result.target, result.velocity), ("idle", None, (0, 0, 0)))
+        self.assertFalse(result.stop_immediately)
+        self.assertIsNone(self.controller._action)
+        # Only selection dwell remains; no zero-speed/settling interval
+        # is imposed by hold. Physical motion supervision is external.
+        for _ in range(4):
+            result = self.tick("turn_left", linear_speed_m_s=0.08)
+        self.assertEqual((result.state, result.activation_count), ("active", 2))
+
+    def test_zero_dwell_hold_switches_every_direction_pair_on_the_changed_sample(self) -> None:
+        velocities = {
+            "forward": (0.2, 0, 0),
+            "back": (-0.15, 0, 0),
+            "turn_left": (0, 0, 0.25),
+            "turn_right": (0, 0, -0.25),
+        }
+        for first in GAZE.ACTIONS:
+            for second in GAZE.ACTIONS:
+                if first == second:
+                    continue
+                with self.subTest(first=first, second=second):
+                    self.setUp()
+                    self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold", dwell_s=0))
                     self.tick()
-                # Only selection dwell remains; no zero-speed/settling interval
-                # is imposed by hold. Physical motion supervision is external.
-                for _ in range(4):
-                    result = self.tick("turn_left", linear_speed_m_s=0.08)
-                self.assertEqual((result.state, result.activation_count), ("active", 2))
+                    self.assertEqual(self.tick(first).activated_action, first)
+                    self.pose = (0.1, -0.1, 0.35)
+                    switched = self.tick(second, linear_speed_m_s=0.2, yaw_speed_rad_s=0.1)
+                    self.assertEqual(
+                        (switched.state, switched.target, switched.activated_action), ("active", second, second)
+                    )
+                    self.assertEqual((switched.activation_count, switched.velocity), (2, velocities[second]))
+                    self.assertFalse(switched.stop_immediately)
+                    if second in ("forward", "back"):
+                        self.assertEqual(self.controller.heading_status["target_yaw_rad"], 0.35)
+                    for _ in range(3):
+                        held = self.tick(second)
+                        self.assertEqual((held.activation_count, held.velocity), (2, velocities[second]))
+                        self.assertIsNone(held.activated_action)
+
+    def test_hold_direction_change_starts_fresh_configured_dwell_and_discards_partial_switch(self) -> None:
+        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
+        self.fire()
+        switched = self.tick("turn_left", linear_speed_m_s=0.2)
+        self.assertEqual((switched.state, switched.target, switched.progress), ("dwelling", "turn_left", 0))
+        self.assertEqual((switched.velocity, switched.activation_count), ((0, 0, 0), 1))
+        self.assertIsNone(switched.activated_action)
+        self.assertAlmostEqual(self.tick("turn_left").progress, 1 / 3)
+        changed_again = self.tick("back")
+        self.assertEqual((changed_again.state, changed_again.target, changed_again.progress), ("dwelling", "back", 0))
+        halfway = self.tick("back", wall_dt=0.15)
+        self.assertAlmostEqual(halfway.progress, 0.5)
+        self.assertEqual(halfway.velocity, (0, 0, 0))
+        completed = self.tick("back", wall_dt=0.15)
+        self.assertEqual(
+            (completed.state, completed.activated_action, completed.activation_count), ("active", "back", 2)
+        )
+        self.assertEqual(completed.velocity, (-0.15, 0, 0))
+
+    def test_hold_preview_switches_directly_with_zero_or_positive_dwell_and_never_moves(self) -> None:
+        for dwell in (0.0, 0.3):
+            with self.subTest(dwell=dwell):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(
+                    replace(self.config, control_mode="hold", dwell_s=dwell, preview=True)
+                )
+                self.pose = None
+                self.tick()
+                for count, action in enumerate(GAZE.ACTIONS, start=1):
+                    result = self.tick(action, linear_speed_m_s=math.nan, yaw_speed_rad_s=math.nan)
+                    if dwell:
+                        self.assertEqual((result.state, result.target, result.progress), ("dwelling", action, 0))
+                        for _ in range(3):
+                            result = self.tick(action)
+                    self.assertEqual(
+                        (result.state, result.target, result.activated_action), ("preview", action, action)
+                    )
+                    self.assertEqual((result.velocity, result.activation_count), ((0, 0, 0), count))
+                    for _ in range(3):
+                        held = self.tick(action)
+                        self.assertEqual(
+                            (held.state, held.velocity, held.activation_count), ("preview", (0, 0, 0), count)
+                        )
+                        self.assertIsNone(held.activated_action)
+
+    def test_hold_switch_onto_disabled_back_stops_without_activation_and_keeps_valid_selection_available(self) -> None:
+        for preview in (False, True):
+            with self.subTest(preview=preview):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(
+                    replace(self.config, control_mode="hold", dwell_s=0, backward_speed=0, preview=preview)
+                )
+                self.tick()
+                self.assertEqual(self.tick("forward").activation_count, 1)
+                for _ in range(3):
+                    disabled = self.tick("back")
+                    self.assertEqual(
+                        (disabled.state, disabled.velocity, disabled.activation_count), ("unavailable", (0, 0, 0), 1)
+                    )
+                    self.assertIn("disabled", disabled.detail)
+                    self.assertIsNone(disabled.activated_action)
+                resumed = self.tick("turn_right")
+                self.assertEqual((resumed.activated_action, resumed.activation_count), ("turn_right", 2))
+                self.assertEqual(resumed.velocity, (0, 0, 0) if preview else (0, 0, -0.25))
 
     def test_hold_tracking_gaps_occlusion_and_readiness_loss_stop_immediately(self) -> None:
         cases = (
@@ -513,13 +599,15 @@ class TestGazeLocomotionControls(unittest.TestCase):
                 self.setUp()
                 self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))
                 self.fire()
-                values = dict(target="forward", linear_speed_m_s=0.1)
+                # A newly selected direction on a failed sample must not bypass
+                # the tracking/readiness interlock used for the previous hold.
+                values = dict(target="turn_left", linear_speed_m_s=0.1)
                 values.update(invalid)
                 result = self.tick(**values)
                 self.assertEqual((result.state, result.velocity), ("unavailable", (0, 0, 0)))
                 self.assertTrue(result.stop_immediately)
-                for _ in range(5):
-                    result = self.tick("forward", linear_speed_m_s=0.1)
+                for action in (*GAZE.ACTIONS, "turn_left"):
+                    result = self.tick(action, linear_speed_m_s=0.1)
                     self.assertEqual((result.state, result.activation_count), ("awaiting_release", 1))
                     self.assertEqual(result.velocity, (0, 0, 0))
                 self.assertEqual(self.fire("back").activation_count, 2)
@@ -573,18 +661,31 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.assertTrue(self.controller.stop_diagnostics["verified_outside"])
 
     def test_hold_preview_is_zero_and_one_activation_per_released_fixation(self) -> None:
-        self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold", preview=True))
-        self.pose = None
-        result = self.fire()
-        self.assertIn("Would move forward while looking", result.detail)
-        for _ in range(20):
-            result = self.tick("forward")
-            self.assertEqual((result.state, result.velocity, result.activation_count), ("preview", (0, 0, 0), 1))
-            self.assertIsNone(result.activated_action)
-        self.tick(eye_valid=False)
-        self.tick("occluded")
-        self.assertEqual(self.tick("back").activation_count, 1)
-        self.assertEqual(self.fire("back").activation_count, 2)
+        for invalid in (
+            {"eye_valid": False},
+            {"target": "occluded"},
+            {"wall_dt": 0.3},
+            {"wall_dt": -0.05},
+            {"ready": False},
+        ):
+            with self.subTest(invalid=invalid):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold", preview=True))
+                self.pose = None
+                result = self.fire()
+                self.assertIn("Would move forward while looking", result.detail)
+                for _ in range(5):
+                    result = self.tick("forward")
+                    self.assertEqual(
+                        (result.state, result.velocity, result.activation_count), ("preview", (0, 0, 0), 1)
+                    )
+                    self.assertIsNone(result.activated_action)
+                self.tick(**{"target": "turn_left", **invalid})
+                for action in GAZE.ACTIONS:
+                    result = self.tick(action)
+                    self.assertEqual((result.velocity, result.activation_count), ((0, 0, 0), 1))
+                    self.assertIsNone(result.activated_action)
+                self.assertEqual(self.fire("back").activation_count, 2)
 
     def test_hold_reset_cancels_motion_and_requires_new_release_and_dwell(self) -> None:
         self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold"))

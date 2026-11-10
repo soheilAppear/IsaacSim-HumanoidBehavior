@@ -160,8 +160,8 @@ class TestHybridIntegrationControls(unittest.TestCase):
         self.left.y = -1
         self.tick("forward")
         self.left.y = 0
-        for _ in range(8):
-            status = self.tick("forward")
+        for action in ("forward", "turn_left", "back", "turn_right") * 2:
+            status = self.tick(action)
             np.testing.assert_array_equal(status["requested_velocity"], (0, 0, 0))
         self.tick()
         self.assertGreater(self.tick("forward")["requested_velocity"][0], 0)

@@ -926,16 +926,18 @@ Camera-following side panels keep the middle of the view available for the box.
 Look off all buttons to arm, then look at Forward, Back, Turn left or Turn right.
 In the default **hold** mode, the first valid button hit activates immediately,
 including a quick glance. There is no dwell timer or ring at the default zero
-delay. Movement continues while the
-same valid, unoccluded button remains fixated. Looking away or at another button
+delay. Movement continues while a valid, unoccluded button remains fixated. Moving
+directly to another valid button replaces the hold request in the same callback,
+without an intervening off-all-buttons sample. A positive dwell override starts
+a fresh dwell for the new target. Looking outside all buttons
 ramps the requested velocity toward zero through the existing 0.06-second release
 filter; eye loss, button occlusion, a callback gap, or session failure requests
 zero immediately. Movement uses the existing 0.30-second attack filter; both
 filter constants use wall time. Physical braking still takes time. A valid look
 outside all buttons rearms the next selection without a separate gaze settling
-wait. Selection does not transfer directly to a different button: a fresh
-off-all-buttons look-away must rearm it. Invalid tracking requires a subsequent
-valid look-away before activation. There is no fixed travel distance or turn angle in hold
+wait. Startup/reset, tracking loss, occlusion, session loss and callback gaps still
+disarm gaze and require a fresh valid off-all-buttons sample; direct switching
+cannot bypass these interlocks. There is no fixed travel distance or turn angle in hold
 mode. Both hands continue updating during fixation.
 
 With the controller override enabled, both sticks must be currently tracked and
@@ -955,8 +957,9 @@ dwell. A positive delay displays a progress ring. Its
 accepted command continues after looking away or losing eye tracking, allowing
 the operator to look back at the box; eye loss cancels unfinished dwell. A controller
 override cancels the accepted step. Holding
-the button does not repeat a step, and busy selection is ignored. Both modes
-require look-away to rearm. XR profile/display shutdown and lifecycle/recenter
+the button does not repeat a step, busy selection is ignored, and look-away is
+required before another step. Direct valid-button switching applies only to hold.
+XR profile/display shutdown and lifecycle/recenter
 transitions cancel and disarm. Eye-driven commands require the combined gaze
 device's current tracked pose; the visual/recording HMD-forward fallback never authorizes motion. Runtime
 permissions and calibration still determine whether the device supplies usable
@@ -978,7 +981,12 @@ loaded transport still requires a separate physical acceptance check. Requested
 speeds are per simulation second; achieved movement per wall second also depends
 on simulation performance and physical gait response.
 
-**Current validation:** the 0.60/0.35 m/s hold defaults and hybrid sidestepping passed
+**Direct hold switching passed 1,068 offline tests in 15.973 seconds.** A runtime
+check in the stopped Isaac scene resolved all four displayed panel hit regions
+and passed 24 isolated direction-pair checks: 12 movement-selector and 12 preview.
+Synthetic poses/input exercised the selectors without applying synthetic commands
+to the robot. This does not validate dynamic physics or headset acceptance of
+the new transition. Before this change, the 0.60/0.35 m/s hold defaults and hybrid sidestepping passed
 **1,062 offline regressions in 13.613 seconds** and hybrid preview/movement checks.
 Preview had zero sampled root translation/rotation over **1,348** normal input,
 arm and finger updates. Movement ran **18.40 simulation seconds / 3,680 callbacks**;

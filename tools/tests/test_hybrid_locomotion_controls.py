@@ -199,8 +199,9 @@ class TestHybridLocomotionControls(unittest.TestCase):
                 tick(None, controller_state="active", sticks_deflected=True)
                 self.assertEqual(tick(None).velocity, (0, 0, 0))
                 self.assertEqual(tick("forward").state, "awaiting_release")
+                self.assertEqual(tick("turn_left").state, "awaiting_release")
                 tick(None, eye_valid=False)
-                self.assertEqual(tick("forward").state, "awaiting_release")
+                self.assertEqual(tick("back").state, "awaiting_release")
                 tick(None)
                 self.assertGreater(tick("forward").velocity[0], 0)
 

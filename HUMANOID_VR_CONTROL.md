@@ -467,7 +467,8 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
    then keep looking to sustain the request. **Even a quick glance activates it.**
    The default zero delay has no dwell ring. Look away to end the request.
    Preview reports the interaction while the base remains anchored, even for sticks.
-   Look away from every button before trying another selection.
+   In hold mode, look directly at another valid button to change direction; no
+   glance outside the buttons is needed between uninterrupted valid selections.
    **NO EYE** means Isaac is not receiving a currently tracked eye pose. Check
    headset calibration, eye-tracking permission and runtime transport before
    continuing; a visible head-direction ray cannot substitute for eye input.
@@ -491,14 +492,17 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
 
 When gaze owns movement, the default **hold** mode starts on the first valid button sample after arming,
 without a fixation timer, and continues only while
-you keep looking at the same button. **Look away to stop**, including when looking
-back at the box. Changing buttons or lost/invalid eye tracking also requests a
-stop. Hold requests use **0.60 m/s forward**, **0.35 m/s backward**, or **0.40 rad/s
+you keep looking at the selected button. Looking directly at another valid,
+unoccluded button requests its direction in the same update. With a positive
+dwell override, the new button starts a fresh dwell instead of inheriting progress.
+**Look away to stop**, including when looking back at the box; lost/invalid eye
+tracking also requests a stop. Hold requests use **0.60 m/s forward**,
+**0.35 m/s backward**, or **0.40 rad/s
 yaw**; turning continues while the turn button is held. Physical braking and
 contacts determine actual travel and stopping distance. A stop request is not an
-instant physical stop. A valid look outside all buttons rearms the next selection
-without a separate settling wait; moving directly between buttons does not switch
-the direction. After tracking loss, first provide a valid look outside all buttons.
+instant physical stop or direction reversal. Startup/reset and recovery from
+tracking loss, button occlusion, session loss or a callback interruption still
+require a valid look outside all buttons before gaze can activate again.
 Hold mode has no four-second gaze settling timer. Existing balance, fall and
 unintended-motion guards can still pause a detected fault. XR shutdown, Pause/Stop, Reset and recentering
 cancel selection/movement and require rearming. Use the example's **Reset** after
@@ -596,7 +600,12 @@ requested speeds and settling use simulation time, so
 slow simulation changes actual movement per wall second. Explicit speed overrides
 are preserved in both modes.
 
-**The new speeds and hybrid sidestepping passed 1,062 offline regressions in
+**Direct hold switching passed 1,068 offline tests in 15.973 seconds.** With the
+Isaac scene stopped, all four panel hit regions and 24 isolated direction-pair
+checks passed (12 movement-selector and 12 preview checks). The checks used
+synthetic pose/input without applying commands to the robot; they do not validate
+dynamic gait or real-headset switching. **Before that change, the new speeds and
+hybrid sidestepping passed 1,062 offline regressions in
 13.613 seconds and hybrid preview/movement checks.** Preview had zero sampled root
 translation/rotation with **1,348** normal input, arm and finger updates. Movement
 ran **18.40 simulation seconds / 3,680 callbacks**: 0.30 m/s left/right requests
