@@ -18,6 +18,11 @@ if not defined G1_FACE_YAW_SPEED set "G1_FACE_YAW_SPEED=0.25"
 REM Starter thresholds from this Quest Pro's preview observations. Recheck after
 REM changing headset fit; these remain overridable and are not a reliability claim.
 if not defined G1_FACE_WINK_THRESHOLD set "G1_FACE_WINK_THRESHOLD=0.45"
+REM Per-right calibration from the user-approved Quest Pro recording; keep a longer confirmation.
+if not defined G1_FACE_RIGHT_WINK_THRESHOLD set "G1_FACE_RIGHT_WINK_THRESHOLD=0.30"
+if not defined G1_FACE_RIGHT_WINK_RELEASE_THRESHOLD set "G1_FACE_RIGHT_WINK_RELEASE_THRESHOLD=0.20"
+if not defined G1_FACE_RIGHT_WINK_CONFIRM_S set "G1_FACE_RIGHT_WINK_CONFIRM_S=0.50"
+if not defined G1_FACE_RIGHT_MOUTH_THRESHOLD set "G1_FACE_RIGHT_MOUTH_THRESHOLD=0.55"
 if not defined G1_FACE_JAW_THRESHOLD set "G1_FACE_JAW_THRESHOLD=0.45"
 if not defined G1_FACE_PUCKER_THRESHOLD set "G1_FACE_PUCKER_THRESHOLD=0.40"
 if not defined G1_FACE_MOUTH_SIDE_THRESHOLD set "G1_FACE_MOUTH_SIDE_THRESHOLD=0.45"

@@ -241,6 +241,17 @@ class HumanoidExample(BaseSample):
         if self._locomotion_input_mode not in ("pointing", "controller", "gaze"):
             raise ValueError("G1_LOCOMOTION_INPUT must be pointing, controller, or gaze")
         self._gaze_walking_enabled = self._locomotion_input_mode == "gaze"
+        # This opt-in profile scales gaze and facial requests, not physics time,
+        # actor outputs or controller sticks. Resolve it before either input
+        # integration constructs its bounded movement controller.
+        self._teleop_speed_scale = 1.0
+        if self._gaze_walking_enabled:
+            try:
+                self._teleop_speed_scale = float(os.environ.get("G1_TELEOP_SPEED_SCALE", "1"))
+            except ValueError as error:
+                raise ValueError("G1_TELEOP_SPEED_SCALE must be finite and between 1 and 3") from error
+            if not math.isfinite(self._teleop_speed_scale) or not 1.0 <= self._teleop_speed_scale <= 3.0:
+                raise ValueError("G1_TELEOP_SPEED_SCALE must be finite and between 1 and 3")
         self._gaze_locomotion = GazeLocomotion(self._read_gaze_locomotion_config())
         face_enabled = os.environ.get("G1_FACE_ENABLED", "0").strip().lower()
         if face_enabled not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
@@ -345,7 +356,9 @@ class HumanoidExample(BaseSample):
         # Command ramping, asymmetric on purpose (see _smooth_base_command). Easing INTO
         # a command stops the gait lurching; easing out of one just makes the robot feel
         # like it will not stop, so the release is nearly immediate.
-        self._command_attack_time = 0.30  # s: ramp up — smooths starts and turns
+        # A larger request takes proportionally longer to ramp up, preserving
+        # its initial acceleration. Release remains quick at every speed scale.
+        self._command_attack_time = 0.30 * self._teleop_speed_scale
         self._command_release_time = 0.06  # s: ramp down — release the stick, it stops
         self._headset_gait_enabled = (
             False  # temporarily disabled: step detection not yet stable; flip to True to restore
@@ -831,10 +844,10 @@ class HumanoidExample(BaseSample):
             # Point navigation only walks forward; sticks also need reverse and
             # sidesteps. Sharing its zero caps silently discarded those inputs.
             if self._direct_walking_enabled:
-                self._max_forward_speed = 0.65
-                self._max_backward_speed = 0.35
-                self._max_lateral_speed = 0.30
-                self._max_yaw_speed = 0.40
+                self._max_forward_speed = 0.65 * self._teleop_speed_scale
+                self._max_backward_speed = 0.35 * self._teleop_speed_scale
+                self._max_lateral_speed = max(0.30, 0.15 * self._teleop_speed_scale)
+                self._max_yaw_speed = 0.40 * self._teleop_speed_scale
             else:
                 self._max_forward_speed = self._locomotion_gesture.max_forward_speed
                 self._max_yaw_speed = self._locomotion_gesture.max_requested_yaw_speed
@@ -2503,7 +2516,7 @@ class HumanoidExample(BaseSample):
         slow/intermittent drift can remain below the speed/dwell prerequisites.
         No grasp/input-source state disables this check. The
         separate fast-runaway guard still observes instantaneous magnitudes.
-        Bounds are for this slow, flat-floor experiment and do not move the root.
+        Bounds follow the selected flat-floor profile and do not move the root.
         """
         if not self._gesture_locomotion_enabled:
             return True
@@ -2532,7 +2545,17 @@ class HumanoidExample(BaseSample):
                 raise ValueError("nonfinite velocity or command")
             speed = math.hypot(linear[0], linear[1])
             yaw_speed = abs(angular[2])
-            self._walking_runaway_time = self._walking_runaway_time + dt if speed > 0.8 or yaw_speed > 1.2 else 0.0
+            # The experimental faster gaze/facial profile must not label its
+            # intended speed as runaway. Keep a bounded margin above that
+            # profile's caps; all original profiles retain the original limits.
+            # This does not relax the separate zero-intent support/drift checks.
+            runaway_linear, runaway_yaw = 0.8, 1.2
+            if self._gaze_walking_enabled and self._teleop_speed_scale > 1.0:
+                runaway_linear = max(runaway_linear, 1.2 * self._max_forward_speed)
+                runaway_yaw = max(runaway_yaw, 1.25 * self._max_yaw_speed + 0.1)
+            self._walking_runaway_time = (
+                self._walking_runaway_time + dt if speed > runaway_linear or yaw_speed > runaway_yaw else 0.0
+            )
             residual = False
             net_speed = net_yaw_speed = 0.0
             support_motion = None
@@ -4159,6 +4182,18 @@ class HumanoidExample(BaseSample):
             return
         attack = max(self._command_attack_time, 1e-6)
         release = max(self._command_release_time, 1e-6)
+        if self._gaze_walking_enabled and self._hybrid_locomotion.selection.source == "controller":
+            # Stick peaks remain unscaled, so their established acceleration
+            # should remain unchanged too. Facial arming resets hybrid ownership.
+            attack /= self._teleop_speed_scale
+        gaze_heading_correction = (
+            self._gaze_walking_enabled
+            and (self._facial_input is None or not self._facial_input.enabled)
+            and self._hybrid_locomotion.selection.source == "gaze"
+            and self._gaze_locomotion.command.state == "active"
+            and self._gaze_locomotion.command.target in ("forward", "back")
+            and self._gaze_locomotion.config.heading_hold
+        )
         if self._gesture_locomotion_enabled:
             # The wrist joystick arrives in wall time, just like arm input. Using
             # simulation time here multiplied its delay in a slow VR session.
@@ -4174,7 +4209,12 @@ class HumanoidExample(BaseSample):
             decelerating = abs(float(target_axis)) < abs(float(current[axis])) or (
                 float(target_axis) * float(current[axis]) < 0.0
             )
-            alpha = 1.0 - math.exp(-max(float(dt), 0.0) / (release if decelerating else attack))
+            # Heading feedback corrects an observed error, so its yaw component
+            # responds faster as translation requests increase. Translation and
+            # deliberate turns keep their slower scaled ramp; stale gaze cannot
+            # affect a different input owner's command. Scale 1 stays unchanged.
+            axis_attack = 0.30 / self._teleop_speed_scale if axis == 2 and gaze_heading_correction else attack
+            alpha = 1.0 - math.exp(-max(float(dt), 0.0) / (release if decelerating else axis_attack))
             current[axis] = current[axis] + (target_axis - current[axis]) * alpha
 
     def _walking_stop_command(self, dt: float, operator_command):
@@ -8248,9 +8288,9 @@ class HumanoidExample(BaseSample):
         config = self._gaze_locomotion.config
         forward, lateral, yaw = command.velocity
         self._hybrid_controller_velocity = (
-            forward * (config.forward_speed if forward >= 0 else config.backward_speed),
+            forward * (config.forward_speed if forward >= 0 else config.backward_speed) / self._teleop_speed_scale,
             lateral * 0.30,  # Same supported sidestep cap in preview and physical mode.
-            yaw * config.yaw_speed,
+            yaw * config.yaw_speed / self._teleop_speed_scale,
         )
         self._hybrid_display_status = None
         if selection.reset_gaze:
@@ -8298,24 +8338,42 @@ class HumanoidExample(BaseSample):
         if heading_hold not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
             raise ValueError("G1_GAZE_HEADING_HOLD must be a boolean")
         control_mode = os.environ.get("G1_GAZE_MODE", "hold").strip().lower()
+        heading_gain = float(os.environ.get("G1_GAZE_HEADING_GAIN", "3.0"))
+        heading_cap = float(os.environ.get("G1_GAZE_HEADING_MAX_YAW_SPEED", "0.15"))
+        # Validate baseline settings before saturation: min(limit, NaN) can hide
+        # an invalid override. Faster translation needs more heading authority,
+        # but yaw corrections retain the existing absolute velocity bound.
+        for name, value, upper in (
+            ("G1_GAZE_HEADING_GAIN", heading_gain, 5.0),
+            ("G1_GAZE_HEADING_MAX_YAW_SPEED", heading_cap, 0.4),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= upper:
+                raise ValueError(f"{name} must be finite and between 0 and {upper}")
         config = GazeLocomotionConfig(
             control_mode=control_mode,
             dwell_s=float(os.environ.get("G1_GAZE_DWELL_S", "0" if control_mode == "hold" else "0.7")),
             distance_m=float(os.environ.get("G1_GAZE_DISTANCE_M", "0.20")),
             turn_degrees=float(os.environ.get("G1_GAZE_TURN_DEG", "10")),
-            forward_speed=float(os.environ.get("G1_GAZE_FORWARD_SPEED", "0.60" if control_mode == "hold" else "0.20")),
-            backward_speed=float(
-                os.environ.get("G1_GAZE_BACKWARD_SPEED", "0.35" if control_mode == "hold" else "0.15")
-            ),
-            yaw_speed=float(os.environ.get("G1_GAZE_YAW_SPEED", "0.40" if control_mode == "hold" else "0.25")),
+            forward_speed=float(os.environ.get("G1_GAZE_FORWARD_SPEED", "0.60" if control_mode == "hold" else "0.20"))
+            * self._teleop_speed_scale,
+            backward_speed=float(os.environ.get("G1_GAZE_BACKWARD_SPEED", "0.35" if control_mode == "hold" else "0.15"))
+            * self._teleop_speed_scale,
+            yaw_speed=float(os.environ.get("G1_GAZE_YAW_SPEED", "0.40" if control_mode == "hold" else "0.25"))
+            * self._teleop_speed_scale,
             preview=preview in ("1", "true", "yes", "on"),
             max_gaze_gap_s=float(os.environ.get("G1_GAZE_MAX_GAP_S", "0.25")),
             heading_hold=heading_hold in ("1", "true", "yes", "on"),
-            heading_gain=float(os.environ.get("G1_GAZE_HEADING_GAIN", "3.0")),
-            heading_max_yaw_speed=float(os.environ.get("G1_GAZE_HEADING_MAX_YAW_SPEED", "0.15")),
+            heading_gain=min(9.0, heading_gain * self._teleop_speed_scale),
+            heading_max_yaw_speed=min(0.4, heading_cap * self._teleop_speed_scale),
         )
-        if config.forward_speed > 0.65 or config.backward_speed > 0.35 or config.yaw_speed > 0.40:
-            raise ValueError("Gaze speeds exceed supported caps: forward 0.65 m/s, back 0.35 m/s, yaw 0.40 rad/s")
+        if (
+            config.forward_speed > 0.65 * self._teleop_speed_scale
+            or config.backward_speed > 0.35 * self._teleop_speed_scale
+            or config.yaw_speed > 0.40 * self._teleop_speed_scale
+        ):
+            raise ValueError(
+                "Unscaled gaze speeds exceed baseline caps: forward 0.65 m/s, back 0.35 m/s, yaw 0.40 rad/s"
+            )
         return config
 
     def _update_gaze_locomotion(self, dt: float) -> None:

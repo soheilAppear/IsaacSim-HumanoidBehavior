@@ -52,6 +52,7 @@ class TestGazeIntegrationControls(unittest.TestCase):
             "G1_GAZE_HEADING_HOLD": "1",
             "G1_GAZE_HEADING_GAIN": "3.0",
             "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.15",
+            "G1_TELEOP_SPEED_SCALE": "1",
             "G1_OPTICAL_HANDS_ONLY": "0",
             "G1_GRASP_MODE": "physical",
             "G1_WEBCAM_ENABLED": "0",
@@ -188,6 +189,231 @@ class TestGazeIntegrationControls(unittest.TestCase):
         ):
             with self.subTest(variable=variable), self.assertRaises(ValueError):
                 self.make_example(**{variable: value})
+
+    def _use_fast_hold_profile(self):
+        """Install real constructor-derived faster settings on the ready input fixture."""
+        fast = self.make_example(
+            G1_TELEOP_SPEED_SCALE="3",
+            G1_GAZE_MODE="hold",
+            G1_GAZE_DWELL_S="0",
+            G1_GAZE_FORWARD_SPEED="0.60",
+            G1_GAZE_BACKWARD_SPEED="0.35",
+            G1_GAZE_YAW_SPEED="0.40",
+        )
+        for name in (
+            "_teleop_speed_scale",
+            "_gaze_locomotion",
+            "_max_forward_speed",
+            "_max_backward_speed",
+            "_max_lateral_speed",
+            "_max_yaw_speed",
+            "_command_attack_time",
+            "_command_release_time",
+            "_walking_stop_feedback_enabled",
+        ):
+            setattr(self.ex, name, getattr(fast, name))
+        return fast
+
+    def test_faster_profile_scales_gaze_requests_and_caps_without_changing_physics(self) -> None:
+        fast = self._use_fast_hold_profile()
+        self.assertEqual(fast._teleop_speed_scale, 3)
+        np.testing.assert_allclose(
+            (fast._max_forward_speed, fast._max_backward_speed, fast._max_lateral_speed, fast._max_yaw_speed),
+            (1.95, 1.05, 0.45, 1.20),
+        )
+        self.assertEqual(fast._world_settings["physics_dt"], 0.005)
+        self.assertEqual(fast._world_settings["rendering_dt"], self.ex._world_settings["rendering_dt"])
+        self.assertAlmostEqual(fast._command_attack_time, 0.90)
+        self.assertAlmostEqual(fast._command_release_time, 0.06)
+        self.assertAlmostEqual(fast._gaze_locomotion.config.heading_gain, 9.0)
+        self.assertAlmostEqual(fast._gaze_locomotion.config.heading_max_yaw_speed, 0.40)
+        self.tick()
+        for target, expected in (
+            ("forward", (1.80, 0, 0)),
+            ("back", (-1.05, 0, 0)),
+            ("turn_left", (0, 0, 1.20)),
+            ("turn_right", (0, 0, -1.20)),
+        ):
+            with self.subTest(target=target):
+                np.testing.assert_allclose(self.tick(target).velocity, expected)
+        np.testing.assert_array_equal(self.tick().velocity, (0, 0, 0))
+
+    def test_speed_scale_is_bounded_and_does_not_admit_overcap_baseline_speeds(self) -> None:
+        for scale in ("0.99", "3.01", "nan", "inf", "-inf", "bad"):
+            with self.subTest(scale=scale), self.assertRaisesRegex(ValueError, "G1_TELEOP_SPEED_SCALE"):
+                self.make_example(G1_TELEOP_SPEED_SCALE=scale)
+        for key, value in (
+            ("G1_GAZE_FORWARD_SPEED", "0.66"),
+            ("G1_GAZE_BACKWARD_SPEED", "0.36"),
+            ("G1_GAZE_YAW_SPEED", "0.41"),
+        ):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.make_example(G1_TELEOP_SPEED_SCALE="3", **{key: value})
+
+    def test_heading_authority_scales_with_speed_and_preserves_baseline_overrides(self) -> None:
+        baseline = self.make_example(G1_GAZE_HEADING_GAIN="1.0", G1_GAZE_HEADING_MAX_YAW_SPEED="0.05")
+        fast = self.make_example(
+            G1_TELEOP_SPEED_SCALE="3", G1_GAZE_HEADING_GAIN="1.0", G1_GAZE_HEADING_MAX_YAW_SPEED="0.05"
+        )
+        self.assertAlmostEqual(baseline._gaze_locomotion.config.heading_gain, 1.0)
+        self.assertAlmostEqual(baseline._gaze_locomotion.config.heading_max_yaw_speed, 0.05)
+        self.assertAlmostEqual(fast._gaze_locomotion.config.heading_gain, 3.0)
+        self.assertAlmostEqual(fast._gaze_locomotion.config.heading_max_yaw_speed, 0.15)
+        capped = self.make_example(
+            G1_TELEOP_SPEED_SCALE="3", G1_GAZE_HEADING_GAIN="5.0", G1_GAZE_HEADING_MAX_YAW_SPEED="0.4"
+        )
+        self.assertAlmostEqual(capped._gaze_locomotion.config.heading_gain, 9.0)
+        self.assertAlmostEqual(capped._gaze_locomotion.config.heading_max_yaw_speed, 0.40)
+        for key, value in (
+            ("G1_GAZE_HEADING_GAIN", "nan"),
+            ("G1_GAZE_HEADING_GAIN", "inf"),
+            ("G1_GAZE_HEADING_GAIN", "5.1"),
+            ("G1_GAZE_HEADING_MAX_YAW_SPEED", "nan"),
+            ("G1_GAZE_HEADING_MAX_YAW_SPEED", "inf"),
+            ("G1_GAZE_HEADING_MAX_YAW_SPEED", "0.41"),
+        ):
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
+                self.make_example(G1_TELEOP_SPEED_SCALE="3", **{key: value})
+
+    def test_faster_forward_request_retains_bounded_corrective_yaw(self) -> None:
+        self._use_fast_hold_profile()
+        self.tick()
+        self.tick("forward")
+        self.ex._get_g1_base_pose_for_arms.return_value = (Gf.Vec3d(0, 0, 0.8), 0.10)
+        # Allow the existing gait-noise filter to observe the sustained error.
+        for _ in range(120):
+            result = self.tick("forward")
+        np.testing.assert_allclose(result.velocity, (1.80, 0, -0.40))
+
+    def test_faster_gaze_heading_yaw_scales_response_without_speeding_translation(self) -> None:
+        self._use_fast_hold_profile()
+        self.tick()
+        self.tick("forward")
+        self.ex._get_g1_base_pose_for_arms.return_value = (Gf.Vec3d(0, 0, 0.8), 0.10)
+        for _ in range(120):
+            self.tick("forward")
+        self.ex._teleop_input_dt = 0.03
+        self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(),
+            (1.80 * (1 - math.exp(-0.03 / 0.90)), 0, -0.40 * (1 - math.exp(-0.03 / 0.10))),
+            rtol=1e-6,
+        )
+        before_release = self.ex._base_command.clone()
+        self.ex._smooth_base_command(torch.zeros(3), 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(), before_release.numpy() * math.exp(-0.03 / 0.06), rtol=1e-6
+        )
+
+    def test_baseline_gaze_heading_yaw_response_is_unchanged(self) -> None:
+        baseline = self.make_example(G1_GAZE_MODE="hold", G1_GAZE_DWELL_S="0")
+        self.ex._gaze_locomotion = baseline._gaze_locomotion
+        self.tick()
+        self.tick("forward")
+        self.ex._get_g1_base_pose_for_arms.return_value = (Gf.Vec3d(0, 0, 0.8), 0.10)
+        for _ in range(120):
+            self.tick("forward")
+        self.assertEqual(self.ex._gaze_locomotion.command.state, "active")
+        self.assertAlmostEqual(float(self.ex._controller_command[2]), -0.15)
+        self.ex._teleop_input_dt = 0.03
+        self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(),
+            np.asarray(self.ex._controller_command) * (1 - math.exp(-0.03 / 0.30)),
+            rtol=1e-6,
+        )
+
+    def test_explicit_faster_gaze_turn_keeps_scaled_attack(self) -> None:
+        self._use_fast_hold_profile()
+        self.tick()
+        self.tick("turn_left")
+        self.ex._teleop_input_dt = 0.03
+        self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(), (0, 0, 1.20 * (1 - math.exp(-0.03 / 0.90))), rtol=1e-6
+        )
+
+    def test_stale_gaze_heading_cannot_accelerate_face_or_override_stick_response(self) -> None:
+        self._use_fast_hold_profile()
+        self.tick()
+        self.tick("forward")
+        self.ex._teleop_input_dt = 0.03
+        # Keep a stale active gaze command while another source owns the input.
+        self.ex._facial_input = types.SimpleNamespace(enabled=True)
+        self.ex._smooth_base_command(torch.tensor([0, 0, 0.75]), 0.005)
+        self.assertAlmostEqual(float(self.ex._base_command[2]), 0.75 * (1 - math.exp(-0.03 / 0.90)), places=6)
+        self.ex._base_command[:] = 0
+        self.ex._facial_input = None
+        self.ex._hybrid_locomotion.select(
+            controller_present=True, controller_valid=True, controller_state="active", sticks_deflected=True
+        )
+        self.ex._smooth_base_command(torch.tensor([0.60, 0, 0.40]), 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(),
+            np.asarray([0.60, 0, 0.40]) * (1 - math.exp(-0.03 / 0.30)),
+            rtol=1e-6,
+        )
+
+    def test_speed_scale_does_not_change_controller_or_pointing_profiles(self) -> None:
+        for mode in ("controller", "pointing"):
+            with self.subTest(mode=mode):
+                baseline = self.make_example(G1_LOCOMOTION_INPUT=mode)
+                fast = self.make_example(G1_LOCOMOTION_INPUT=mode, G1_TELEOP_SPEED_SCALE="3")
+                self.assertEqual(fast._teleop_speed_scale, 1)
+                for name in (
+                    "_max_forward_speed",
+                    "_max_backward_speed",
+                    "_max_lateral_speed",
+                    "_max_yaw_speed",
+                    "_command_attack_time",
+                    "_command_release_time",
+                ):
+                    self.assertEqual(getattr(fast, name), getattr(baseline, name))
+
+    def test_faster_gaze_ramp_preserves_initial_acceleration_and_release_rate(self) -> None:
+        self.ex._teleop_input_dt = 0.001
+        self.ex._smooth_base_command(torch.tensor([0.60, 0, 0]), 0.001)
+        normal_first_step = float(self.ex._base_command[0])
+        self._use_fast_hold_profile()
+        self.ex._base_command[:] = 0
+        self.ex._smooth_base_command(torch.tensor([1.80, 0, 0]), 0.001)
+        self.assertAlmostEqual(float(self.ex._base_command[0]), normal_first_step, delta=normal_first_step * 0.01)
+        self.ex._base_command[:] = torch.tensor([1.80, 0, 0])
+        self.ex._teleop_input_dt = 0.06
+        self.ex._smooth_base_command(torch.zeros(3), 0.005)
+        self.assertAlmostEqual(float(self.ex._base_command[0]), 1.80 / math.e, places=6)
+
+    def test_faster_profile_allows_intended_speed_but_still_faults_true_runaway(self) -> None:
+        for linear, yaw, command, allowed in (
+            (1.80, 0, (1.80, 0, 0), True),
+            (0, 1.20, (0, 0, 1.20), True),
+            (2.40, 0, (1.80, 0, 0), False),
+            (0, 1.70, (0, 0, 1.20), False),
+            (2.40, 0, (0, 0, 0), False),
+        ):
+            with self.subTest(linear=linear, yaw=yaw, command=command):
+                self.setUp()
+                self._use_fast_hold_profile()
+                self.ex.g1.robot.get_velocities.return_value = (
+                    Array([[linear, 0, 0]]),
+                    Array([[0, 0, yaw]]),
+                )
+                self.ex._update_walking_support_motion = Mock(return_value=(0, 0, 0, 0))
+                for _ in range(4):
+                    self.assertTrue(self.ex._check_gesture_motion(0.05, command))
+                self.assertEqual(self.ex._check_gesture_motion(0.05, command), allowed)
+                if not allowed:
+                    self.ex._pause_faulted_articulation.assert_called_once()
+
+    def test_faster_profile_retains_zero_intent_support_drift_guard(self) -> None:
+        self._use_fast_hold_profile()
+        self.ex.g1.robot.get_velocities.return_value = (Array([[0.18, 0, 0]]), Array([[0, 0, 0]]))
+        self.ex._update_walking_support_motion = Mock(return_value=(0.18, 0.0, 0.16, 0.0))
+        for _ in range(50):
+            if not self.ex._check_gesture_motion(0.05, self.ex._controller_command):
+                break
+        self.assertIn("walking did not follow", self.ex._articulation_health_fault)
+        self.ex._pause_faulted_articulation.assert_called_once()
 
     def test_gaze_selection_has_no_legacy_stick_grip_or_hand_dependency(self) -> None:
         self.ex._keyboard_command[:] = 0.5

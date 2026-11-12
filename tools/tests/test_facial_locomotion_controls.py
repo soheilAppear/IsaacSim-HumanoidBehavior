@@ -108,6 +108,10 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.assertEqual(config.eye_open_threshold, 0.15)
         self.assertEqual(config.post_blink_wink_confirm_s, 0.5)
         self.assertEqual((config.distance_m, config.turn_degrees), (0.15, 10))
+        self.assertEqual(
+            (config.forward_speed, config.backward_speed, config.lateral_speed, config.yaw_speed),
+            (0.20, 0.15, 0.15, 0.25),
+        )
         self.assertEqual(FACE.FacialLocomotion().command.velocity, (0, 0, 0))
 
     def test_configuration_rejects_invalid_numbers_modes_and_thresholds(self) -> None:
@@ -115,9 +119,9 @@ class TestFacialLocomotionControls(unittest.TestCase):
             "distance_m": (0, 1.01),
             "turn_degrees": (0, 45.01),
             "forward_speed": (0, 0.651),
-            "backward_speed": (0, 0.351),
-            "lateral_speed": (0, 0.301),
-            "yaw_speed": (0, 0.401),
+            "backward_speed": (0, 0.451),
+            "lateral_speed": (0, 0.451),
+            "yaw_speed": (0, 0.751),
             "activation_threshold": (0.39, 1.01),
             "release_threshold": (-0.01, 0.51),
             "eye_open_threshold": (-0.01, 0.351),
@@ -152,11 +156,246 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.neutral()
         self.assertEqual(self.tick("forward").state, "confirming")
 
+    def test_experimental_threefold_requests_preserve_direction_preview_and_loss_stop(self) -> None:
+        expected = {
+            "forward": (0.60, 0, 0),
+            "back": (-0.45, 0, 0),
+            "strafe_left": (0, 0.45, 0),
+            "strafe_right": (0, -0.45, 0),
+            "turn_left": (0, 0, 0.75),
+            "turn_right": (0, 0, -0.75),
+        }
+        for preview in (False, True):
+            for action, velocity in expected.items():
+                with self.subTest(preview=preview, action=action):
+                    self.setUp()
+                    self.use_config(
+                        preview=preview, forward_speed=0.60, backward_speed=0.45, lateral_speed=0.45, yaw_speed=0.75
+                    )
+                    command = self.activate(action)
+                    self.assertEqual(command.velocity, (0, 0, 0) if preview else velocity)
+                    command = self.tick(action, valid=False)
+                    self.assertEqual(command.velocity, (0, 0, 0))
+                    self.assertTrue(command.stop_immediately)
+
     def test_optional_calibration_defaults_preserve_shared_threshold(self) -> None:
-        for name in ("wink_threshold", "jaw_threshold", "pucker_threshold", "mouth_side_threshold"):
+        for name in (
+            "wink_threshold",
+            "jaw_threshold",
+            "pucker_threshold",
+            "mouth_side_threshold",
+            "right_wink_threshold",
+            "right_wink_release_threshold",
+            "right_wink_confirm_s",
+            "right_mouth_threshold",
+        ):
             self.assertIsNone(getattr(self.config, name))
         for action in EXPRESSIONS:
             self.assertEqual(self.controller._threshold_for(action), self.config.activation_threshold)
+        self.assertEqual(self.controller._release_for("EyesClosedR"), self.config.release_threshold)
+        self.assertEqual(self.controller._confirmation_for("turn_right"), self.config.confirm_s)
+
+    def test_right_calibration_rejects_invalid_values_and_effective_release_overlap(self) -> None:
+        ranges = {
+            "right_wink_threshold": (0.249, 1.001),
+            "right_wink_release_threshold": (-0.001, 0.501),
+            "right_wink_confirm_s": (0.079, 1.001),
+            "right_mouth_threshold": (0.399, 1.001),
+        }
+        for name, bounds in ranges.items():
+            for value in (*bounds, math.nan, math.inf, True, False, "0.3"):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    replace(self.config, **{name: value})
+        with self.assertRaises(ValueError):
+            replace(self.config, release_threshold=0.35, right_wink_threshold=0.30)
+        with self.assertRaises(ValueError):
+            replace(self.config, right_wink_threshold=0.30, right_wink_release_threshold=0.30)
+        with self.assertRaises(ValueError):
+            replace(self.config, release_threshold=0.45, right_mouth_threshold=0.45)
+        with self.assertRaises(ValueError):
+            replace(self.config, max_gesture_s=0.45, right_wink_confirm_s=0.50)
+        config = replace(
+            self.config, release_threshold=0.35, right_wink_threshold=0.30, right_wink_release_threshold=0.20
+        )
+        self.assertEqual(config.right_wink_threshold, 0.30)
+
+    def test_calibrated_right_wink_uses_longer_confirmation_and_its_own_release(self) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+            right_mouth_threshold=0.55,
+        )
+        self.neutral()
+        expression = {"EyesClosedL": 0.14, "EyesClosedR": 0.31, "MouthRight": 1.0}
+        for _ in range(10):
+            result = self.tick(expression)
+            self.assertEqual(result.activation_count, 0)
+            self.assertFalse(any(result.velocity))
+        result = self.tick(expression)
+        self.assertEqual(result.activated_action, "turn_right")
+        self.assertEqual(result.velocity, (0, 0, -self.config.yaw_speed))
+        result = self.tick({**expression, "EyesClosedR": 0.25})
+        self.assertEqual(result.velocity, (0, 0, -self.config.yaw_speed))
+        self.assertEqual(result.activation_count, 1)
+        result = self.tick({**expression, "EyesClosedR": 0.19})
+        self.assertFalse(any(result.velocity))
+        for _ in range(12):
+            result = self.tick({"MouthRight": 1.0})
+            self.assertEqual(result.activation_count, 1)
+            self.assertFalse(any(result.velocity))
+
+    def test_right_calibration_keeps_bilateral_blinks_and_short_tails_still(self) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+        )
+        self.neutral()
+        for _ in range(12):
+            result = self.tick({"EyesClosedL": 0.8, "EyesClosedR": 0.31})
+            self.assertEqual(result.state, "blink_pause")
+            self.assertEqual(result.activation_count, 0)
+        for _ in range(6):
+            result = self.tick({"EyesClosedR": 0.31})
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.activation_count, 0)
+        self.tick()
+        self.assertEqual(self.controller.command.activation_count, 0)
+
+    def test_lower_right_activation_requires_clearly_open_left_eye(self) -> None:
+        for mode in ("hold", "step"):
+            for mouth in (0.0, 1.0):
+                with self.subTest(mode=mode, mouth=mouth):
+                    self.setUp()
+                    self.use_config(
+                        control_mode=mode,
+                        wink_threshold=0.45,
+                        release_threshold=0.35,
+                        right_wink_threshold=0.30,
+                        right_wink_release_threshold=0.20,
+                        right_wink_confirm_s=0.50,
+                        right_mouth_threshold=0.55,
+                    )
+                    self.neutral()
+                    for _ in range(20):
+                        result = self.tick({"EyesClosedL": 0.34, "EyesClosedR": 0.31, "MouthRight": mouth})
+                        self.assertEqual(result.activation_count, 0)
+                        self.assertFalse(any(result.velocity))
+
+    def test_calibrated_active_right_wink_stops_when_left_eye_is_no_longer_clear(self) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+            right_mouth_threshold=0.55,
+        )
+        self.neutral()
+        for _ in range(11):
+            result = self.tick({"EyesClosedL": 0.14, "EyesClosedR": 0.31, "MouthRight": 1.0})
+        self.assertEqual(result.activated_action, "turn_right")
+        result = self.tick({"EyesClosedL": 0.16, "EyesClosedR": 0.31, "MouthRight": 1.0})
+        self.assertEqual(result.velocity, (0, 0, 0))
+        self.assertTrue(result.stop_immediately)
+        for _ in range(12):
+            result = self.tick({"EyesClosedL": 0.34, "EyesClosedR": 0.31, "MouthRight": 1.0})
+            self.assertEqual(result.activation_count, 1)
+            self.assertFalse(any(result.velocity))
+
+    def test_calibrated_wink_takes_priority_over_active_sidestep_without_resuming_leftover_lips(self) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+            right_mouth_threshold=0.55,
+        )
+        self.activate("strafe_right")
+        wink = {"EyesClosedL": 0.14, "EyesClosedR": 0.31, "MouthRight": 1.0}
+        for index in range(10):
+            result = self.tick(wink)
+            self.assertEqual(result.state, "confirming")
+            self.assertEqual(result.target, "turn_right")
+            self.assertEqual(result.velocity, (0, 0, 0))
+            self.assertEqual(result.activation_count, 1)
+            if index == 0:
+                self.assertTrue(result.stop_immediately)
+        result = self.tick(wink)
+        self.assertEqual(result.activated_action, "turn_right")
+        self.assertEqual(result.velocity, (0, 0, -self.config.yaw_speed))
+        self.assertEqual(result.activation_count, 2)
+        for _ in range(12):
+            result = self.tick({"MouthRight": 1.0})
+            self.assertEqual(result.velocity, (0, 0, 0))
+            self.assertEqual(result.activation_count, 2)
+            self.assertIsNone(result.activated_action)
+        self.tick()
+        for _ in range(5):
+            result = self.tick("strafe_right")
+        self.assertEqual(result.activated_action, "strafe_right")
+        self.assertEqual(result.velocity, (0, -self.config.lateral_speed, 0))
+        self.assertEqual(result.activation_count, 3)
+
+    def test_post_blink_recovery_never_shortens_calibrated_right_confirmation(self) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+            post_blink_wink_confirm_s=0.30,
+        )
+        self.neutral()
+        self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        for _ in range(10):
+            self.assertEqual(self.tick({"EyesClosedR": 0.31}).activation_count, 0)
+        self.assertEqual(self.tick({"EyesClosedR": 0.31}).activated_action, "turn_right")
+        self.assertTrue(self.tick({"EyesClosedR": 0.31}, valid=False).stop_immediately)
+        for _ in range(12):
+            result = self.tick({"EyesClosedR": 0.31})
+            self.assertEqual(result.activation_count, 1)
+            self.assertFalse(any(result.velocity))
+
+    def test_right_mouth_calibration_is_independent_of_left_mouth_and_wink(self) -> None:
+        self.use_config(mouth_side_threshold=0.45, right_mouth_threshold=0.55, release_threshold=0.35)
+        self.neutral()
+        for _ in range(8):
+            self.assertEqual(self.tick({"MouthRight": 0.50}).activation_count, 0)
+        for _ in range(5):
+            result = self.tick({"MouthRight": 0.56})
+        self.assertEqual(result.activated_action, "strafe_right")
+        self.assertEqual(result.velocity, (0, -self.config.lateral_speed, 0))
+        self.tick()
+        for _ in range(5):
+            result = self.tick({"MouthLeft": 0.50})
+        self.assertEqual(result.activated_action, "strafe_left")
+
+    def test_step_right_calibration_does_not_treat_active_wink_as_neutral(self) -> None:
+        self.use_config(
+            control_mode="step",
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+        )
+        self.neutral()
+        expression = {"EyesClosedL": 0.14, "EyesClosedR": 0.31}
+        for _ in range(10):
+            result = self.tick(expression)
+            self.assertEqual(result.activation_count, 0)
+        result = self.tick(expression)
+        self.assertEqual(result.state, "wink_release")
+        self.assertIsNone(result.activated_action)
+        self.assertEqual(self.tick({"EyesClosedR": 0.24}).activation_count, 0)
+        self.assertEqual(self.tick({"EyesClosedR": 0.19}).activated_action, "turn_right")
 
     def test_optional_thresholds_reject_invalid_values_and_release_overlap(self) -> None:
         for name in ("wink_threshold", "jaw_threshold", "pucker_threshold", "mouth_side_threshold"):

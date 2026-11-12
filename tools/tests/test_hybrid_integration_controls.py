@@ -87,6 +87,33 @@ class TestHybridIntegrationControls(unittest.TestCase):
                 self.assertEqual(status["hybrid"]["source"], "controller")
                 np.testing.assert_allclose(status["requested_velocity"], (0, lateral, 0))
 
+    def test_faster_gaze_profile_preserves_stick_speeds_ramp_and_release(self) -> None:
+        gaze_tests.TestGazeIntegrationControls._use_fast_hold_profile(self)
+        self.tick()
+        for left_x, left_y, right_x, expected in (
+            (0, 1, 0, (0.60, 0, 0)),
+            (0, -1, 0, (-0.35, 0, 0)),
+            (-1, 0, 0, (0, 0.30, 0)),
+            (0, 0, -1, (0, 0, 0.40)),
+        ):
+            with self.subTest(expected=expected):
+                self.left.x, self.left.y, self.right.x = left_x, left_y, right_x
+                status = self.tick()
+                self.assertEqual(status["hybrid"]["source"], "controller")
+                np.testing.assert_allclose(status["requested_velocity"], expected)
+                self.ex._base_command[:] = 0
+                self.ex._teleop_input_dt = 0.01
+                self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+                np.testing.assert_allclose(
+                    self.ex._base_command.numpy(), np.asarray(expected) * (1 - math.exp(-0.01 / 0.30)), rtol=1e-6
+                )
+        self.left.x = self.left.y = self.right.x = 0
+        status = self.tick()
+        np.testing.assert_array_equal(status["requested_velocity"], (0, 0, 0))
+        np.testing.assert_array_equal(self.ex._base_command.numpy(), (0, 0, 0))
+        self.tick()
+        np.testing.assert_allclose(self.tick("forward")["requested_velocity"], (1.80, 0, 0))
+
     def test_diagonal_translation_stays_normalized_with_independent_yaw(self) -> None:
         self.tick()
         for forward_sign in (-1, 1):

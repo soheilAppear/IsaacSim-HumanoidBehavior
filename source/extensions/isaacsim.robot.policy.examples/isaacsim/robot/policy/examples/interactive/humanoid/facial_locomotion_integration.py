@@ -35,18 +35,39 @@ class FacialLocomotionIntegration:
         preview = os.environ.get("G1_FACE_PREVIEW", "1").strip().lower()
         if preview not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
             raise ValueError("G1_FACE_PREVIEW must be a boolean")
+        speed_scale = host._teleop_speed_scale
         config = FacialLocomotionConfig(
             preview=host._gaze_locomotion.config.preview or preview in ("1", "true", "yes", "on"),
             control_mode=os.environ.get("G1_FACE_MODE", "hold").strip().lower(),
             distance_m=float(os.environ.get("G1_FACE_DISTANCE_M", "0.15")),
             turn_degrees=float(os.environ.get("G1_FACE_TURN_DEG", "10")),
-            forward_speed=float(os.environ.get("G1_FACE_FORWARD_SPEED", "0.20")),
-            backward_speed=float(os.environ.get("G1_FACE_BACKWARD_SPEED", "0.15")),
-            lateral_speed=float(os.environ.get("G1_FACE_LATERAL_SPEED", "0.15")),
-            yaw_speed=float(os.environ.get("G1_FACE_YAW_SPEED", "0.25")),
+            forward_speed=float(os.environ.get("G1_FACE_FORWARD_SPEED", "0.20")) * speed_scale,
+            backward_speed=float(os.environ.get("G1_FACE_BACKWARD_SPEED", "0.15")) * speed_scale,
+            lateral_speed=float(os.environ.get("G1_FACE_LATERAL_SPEED", "0.15")) * speed_scale,
+            yaw_speed=float(os.environ.get("G1_FACE_YAW_SPEED", "0.25")) * speed_scale,
             activation_threshold=float(os.environ.get("G1_FACE_ACTIVATION_THRESHOLD", "0.65")),
             wink_threshold=(
                 float(os.environ["G1_FACE_WINK_THRESHOLD"]) if "G1_FACE_WINK_THRESHOLD" in os.environ else None
+            ),
+            right_wink_threshold=(
+                float(os.environ["G1_FACE_RIGHT_WINK_THRESHOLD"])
+                if "G1_FACE_RIGHT_WINK_THRESHOLD" in os.environ
+                else None
+            ),
+            right_wink_release_threshold=(
+                float(os.environ["G1_FACE_RIGHT_WINK_RELEASE_THRESHOLD"])
+                if "G1_FACE_RIGHT_WINK_RELEASE_THRESHOLD" in os.environ
+                else None
+            ),
+            right_wink_confirm_s=(
+                float(os.environ["G1_FACE_RIGHT_WINK_CONFIRM_S"])
+                if "G1_FACE_RIGHT_WINK_CONFIRM_S" in os.environ
+                else None
+            ),
+            right_mouth_threshold=(
+                float(os.environ["G1_FACE_RIGHT_MOUTH_THRESHOLD"])
+                if "G1_FACE_RIGHT_MOUTH_THRESHOLD" in os.environ
+                else None
             ),
             jaw_threshold=float(os.environ["G1_FACE_JAW_THRESHOLD"]) if "G1_FACE_JAW_THRESHOLD" in os.environ else None,
             pucker_threshold=(
@@ -233,14 +254,33 @@ class FacialLocomotionIntegration:
             "weights": dict(self.sample.weights) if self.sample is not None else {},
             "thresholds": {
                 "wink": self.controller._threshold_for("turn_left"),
+                "right_wink": self.controller._threshold_for("turn_right"),
+                "right_wink_release": (
+                    self.controller.config.right_wink_release_threshold
+                    if self.controller.config.right_wink_release_threshold is not None
+                    else self.controller.config.release_threshold
+                ),
+                "right_wink_confirm_s": (
+                    self.controller.config.right_wink_confirm_s
+                    if self.controller.config.right_wink_confirm_s is not None
+                    else self.controller.config.confirm_s
+                ),
                 "jaw": self.controller._threshold_for("forward"),
                 "pucker": self.controller._threshold_for("back"),
                 "mouth_side": self.controller._threshold_for("strafe_left"),
+                "right_mouth": self.controller._threshold_for("strafe_right"),
                 "release": self.controller.config.release_threshold,
                 "eye_open": self.controller.config.eye_open_threshold,
                 "confirm_s": self.controller.config.confirm_s,
                 "post_blink_wink_confirm_s": self.controller.config.post_blink_wink_confirm_s,
                 "neutral_s": self.controller.config.neutral_s,
+            },
+            "speed_scale": self.host._teleop_speed_scale,
+            "speeds": {
+                "forward_m_s": self.controller.config.forward_speed,
+                "backward_m_s": self.controller.config.backward_speed,
+                "lateral_m_s": self.controller.config.lateral_speed,
+                "yaw_rad_s": self.controller.config.yaw_speed,
             },
             "transport": self.receiver.diagnostics(),
             "error": self.error,

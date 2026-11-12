@@ -42,20 +42,28 @@ def _finite(value: object) -> bool:
 class FacialLocomotionConfig:
     """Configure expression thresholds and short physical movements.
 
+    Speed bounds accept experimental requests, not a claimed trained gait
+    envelope. The host separately validates the physical profile and supervises
+    measured balance, speed and stopping. Default requests remain conservative.
+
     Args:
         preview: Publish recognition events with zero physical velocity.
         control_mode: ``hold`` moves while expressive; ``step`` completes a short movement.
         distance_m: Requested projected distance for a forward, back or side step.
         turn_degrees: Requested signed yaw change for a completed wink.
-        forward_speed: Body-forward command, within the supported walking cap.
-        backward_speed: Reverse magnitude, within the supported walking cap.
-        lateral_speed: Sidestep magnitude, within the supported walking cap.
-        yaw_speed: Turning magnitude in radians per second.
+        forward_speed: Body-forward request, at most 0.65 meters per second.
+        backward_speed: Reverse request magnitude, at most 0.45 meters per second.
+        lateral_speed: Sidestep request magnitude, at most 0.45 meters per second.
+        yaw_speed: Turning request magnitude, at most 0.75 radians per second.
         activation_threshold: Minimum expression weight to begin confirmation.
         wink_threshold: Optional eye-closure activation threshold; None uses the shared threshold.
+        right_wink_threshold: Optional right-eye activation override; a lower calibration requires the left eye clearly open.
+        right_wink_release_threshold: Optional right-eye release override; None uses release_threshold.
+        right_wink_confirm_s: Optional right-wink confirmation duration; None uses confirm_s.
         jaw_threshold: Optional jaw-opening activation threshold; None uses the shared threshold.
         pucker_threshold: Optional bilateral-pucker activation threshold; None uses the shared threshold.
         mouth_side_threshold: Optional left/right mouth activation threshold; None uses the shared threshold.
+        right_mouth_threshold: Optional right-mouth activation override; None uses mouth_side_threshold.
         release_threshold: Maximum weight permitted in neutral and unused channels.
         eye_open_threshold: Maximum closure per eye for hold-mode mouth motion; independent of wink detection.
         confirm_s: Sustained wall-time confirmation on distinct input samples.
@@ -78,9 +86,13 @@ class FacialLocomotionConfig:
     yaw_speed: float = 0.25
     activation_threshold: float = 0.65
     wink_threshold: float | None = None
+    right_wink_threshold: float | None = None
+    right_wink_release_threshold: float | None = None
+    right_wink_confirm_s: float | None = None
     jaw_threshold: float | None = None
     pucker_threshold: float | None = None
     mouth_side_threshold: float | None = None
+    right_mouth_threshold: float | None = None
     release_threshold: float = 0.25
     eye_open_threshold: float = 0.15
     confirm_s: float = 0.18
@@ -99,9 +111,9 @@ class FacialLocomotionConfig:
             ("distance_m", 0.01, 1.0),
             ("turn_degrees", 1.0, 45.0),
             ("forward_speed", 0.01, 0.65),
-            ("backward_speed", 0.01, 0.35),
-            ("lateral_speed", 0.01, 0.30),
-            ("yaw_speed", 0.01, 0.40),
+            ("backward_speed", 0.01, 0.45),
+            ("lateral_speed", 0.01, 0.45),
+            ("yaw_speed", 0.01, 0.75),
             ("activation_threshold", 0.40, 1.0),
             ("release_threshold", 0.0, 0.50),
             ("eye_open_threshold", 0.0, 0.35),
@@ -124,8 +136,31 @@ class FacialLocomotionConfig:
                 raise ValueError(f"{name} must be None or finite and in [0.4, 1.0]")
             if self.release_threshold >= value:
                 raise ValueError(f"release_threshold must be smaller than {name}")
+        for name, lower, upper in (
+            ("right_wink_threshold", 0.25, 1.0),
+            ("right_wink_release_threshold", 0.0, 0.50),
+            ("right_wink_confirm_s", 0.08, 1.0),
+            ("right_mouth_threshold", 0.40, 1.0),
+        ):
+            value = getattr(self, name)
+            if value is not None and (not _finite(value) or not lower <= value <= upper):
+                raise ValueError(f"{name} must be None or finite and in [{lower}, {upper}]")
+        right_activation = self.right_wink_threshold
+        if right_activation is None:
+            right_activation = self.wink_threshold if self.wink_threshold is not None else self.activation_threshold
+        right_release = (
+            self.right_wink_release_threshold
+            if self.right_wink_release_threshold is not None
+            else self.release_threshold
+        )
+        if right_release >= right_activation:
+            raise ValueError("Effective right-eye release must be smaller than its activation threshold")
+        if self.right_mouth_threshold is not None and self.release_threshold >= self.right_mouth_threshold:
+            raise ValueError("release_threshold must be smaller than right_mouth_threshold")
         if self.max_gesture_s <= self.confirm_s:
             raise ValueError("max_gesture_s must exceed confirm_s")
+        if self.right_wink_confirm_s is not None and self.max_gesture_s <= self.right_wink_confirm_s:
+            raise ValueError("max_gesture_s must exceed right_wink_confirm_s")
         if self.post_blink_wink_confirm_s < self.confirm_s:
             raise ValueError("post_blink_wink_confirm_s must be at least confirm_s")
 
@@ -205,7 +240,7 @@ class FacialLocomotion:
         self.command = FacialLocomotionCommand()
 
     def _make_motion(self, *, lateral: bool) -> GazeLocomotion:
-        """Reuse the measured step engine with supported directional speed limits."""
+        """Reuse the measured step engine with the configured directional requests."""
         config = self.config
         return GazeLocomotion(
             GazeLocomotionConfig(
@@ -298,6 +333,9 @@ class FacialLocomotion:
 
     def _threshold_for(self, action: str) -> float:
         """Resolve one expression's optional wearer calibration with shared fallback."""
+        override = {"turn_right": "right_wink_threshold", "strafe_right": "right_mouth_threshold"}.get(action)
+        if override is not None and getattr(self.config, override) is not None:
+            return getattr(self.config, override)
         name = {
             "turn_left": "wink_threshold",
             "turn_right": "wink_threshold",
@@ -309,19 +347,58 @@ class FacialLocomotion:
         value = getattr(self.config, name)
         return self.config.activation_threshold if value is None else value
 
+    def _release_for(self, name: str) -> float:
+        """Apply right-eye hysteresis consistently to holding, neutral and conflicts."""
+        if name == "EyesClosedR" and self.config.right_wink_release_threshold is not None:
+            return self.config.right_wink_release_threshold
+        return self.config.release_threshold
+
+    def _confirmation_for(self, action: str) -> float:
+        """Retain the shared duration unless a right-wink calibration overrides it."""
+        if action == "turn_right" and self.config.right_wink_confirm_s is not None:
+            return self.config.right_wink_confirm_s
+        return self.config.confirm_s
+
+    def _opposite_eye_limit(self, action: str) -> float:
+        """Keep a lowered right-wink activation distinct from partial bilateral closure.
+
+        Shared/default thresholds already separate activation from the opposite
+        eye's release band. A lower independent right threshold can overlap that
+        band, so its opposite left eye must instead pass the clear-eye gate.
+        """
+        opposite = "EyesClosedR" if action == "turn_left" else "EyesClosedL"
+        limit = self._release_for(opposite)
+        if (
+            action == "turn_right"
+            and self.config.right_wink_threshold is not None
+            and self.config.right_wink_threshold < self._threshold_for("turn_left")
+        ):
+            # Retain a nonoverlapping band even if the configurable eye-open
+            # threshold is later raised above the calibrated activation.
+            limit = min(limit, self.config.eye_open_threshold, self._release_for("EyesClosedR"))
+        return limit
+
+    def _eyes_clearly_open(self, values: dict[str, float]) -> bool:
+        """Require both the eye-open gate and each eye's release threshold."""
+        return all(
+            values[name] <= min(self.config.eye_open_threshold, self._release_for(name))
+            for name in ("EyesClosedL", "EyesClosedR")
+        )
+
     def _classify(self, values: dict[str, float]) -> tuple[str | None, bool]:
         """Return one unambiguous gesture or neutral, blocking all partial conflicts."""
         low = self.config.release_threshold
+        left_low, right_low = self._release_for("EyesClosedL"), self._release_for("EyesClosedR")
         left, right = values["EyesClosedL"], values["EyesClosedR"]
         mouth = tuple(values[name] for name in REQUIRED_WEIGHTS[2:])
-        if left <= low and right <= low and max(mouth) <= low:
+        if left <= left_low and right <= right_low and max(mouth) <= low:
             return None, True
         if max(mouth) <= low:
-            if left >= self._threshold_for("turn_left") and right <= low:
+            if left >= self._threshold_for("turn_left") and right <= self._opposite_eye_limit("turn_left"):
                 return "turn_left", False
-            if right >= self._threshold_for("turn_right") and left <= low:
+            if right >= self._threshold_for("turn_right") and left <= self._opposite_eye_limit("turn_right"):
                 return "turn_right", False
-        if max(left, right) <= low:
+        if left <= left_low and right <= right_low:
             for name, action in (("JawDrop", "forward"), ("MouthLeft", "strafe_left"), ("MouthRight", "strafe_right")):
                 if values[name] >= self._threshold_for(action) and all(
                     values[other] <= low for other in REQUIRED_WEIGHTS[2:] if other != name
@@ -336,6 +413,7 @@ class FacialLocomotion:
         action, neutral = self._classify(values)
         if self._candidate in ("turn_left", "turn_right"):
             candidate = self._candidate
+            confirmation_s = self._confirmation_for(candidate)
             elapsed = now_s - self._candidate_since_s
             if elapsed > self.config.max_gesture_s:
                 self._clear_recognition()
@@ -344,7 +422,7 @@ class FacialLocomotion:
             # Check the opposite eye even in the closing/opening threshold band.
             # A staggered bilateral blink must not become a wink on reopening.
             opposite = "EyesClosedR" if candidate == "turn_left" else "EyesClosedL"
-            conflicts = values[opposite] > self.config.release_threshold or any(
+            conflicts = values[opposite] > self._opposite_eye_limit(candidate) or any(
                 values[name] > self.config.release_threshold for name in REQUIRED_WEIGHTS[2:]
             )
             if conflicts:
@@ -359,13 +437,13 @@ class FacialLocomotion:
                 self._publish("awaiting_neutral", "Brief eye closure ignored; return to neutral")
                 return None
             if action == candidate:
-                if elapsed + 1e-12 >= self.config.confirm_s:
+                if elapsed + 1e-12 >= confirmation_s:
                     self._wink_confirmed = True
                 self._publish(
                     "wink_release" if self._wink_confirmed else "confirming",
                     "Reopen the winked eye to turn" if self._wink_confirmed else "Confirming deliberate wink",
                     target=candidate,
-                    progress=elapsed / self.config.confirm_s,
+                    progress=elapsed / confirmation_s,
                 )
                 return None
             # Do not accumulate confirmation through a partial closure.
@@ -416,7 +494,6 @@ class FacialLocomotion:
 
     def _partial_action(self, values: dict[str, float]) -> str | None:
         """Identify an isolated rising expression without counting confirmation."""
-        low = self.config.release_threshold
         for action, names in (
             ("turn_left", ("EyesClosedL",)),
             ("turn_right", ("EyesClosedR",)),
@@ -425,8 +502,12 @@ class FacialLocomotion:
             ("strafe_left", ("MouthLeft",)),
             ("strafe_right", ("MouthRight",)),
         ):
-            if max(values[name] for name in names) > low and all(
-                values[name] <= low for name in REQUIRED_WEIGHTS if name not in names
+            if action in ("turn_left", "turn_right"):
+                opposite = "EyesClosedR" if action == "turn_left" else "EyesClosedL"
+                if values[opposite] > self._opposite_eye_limit(action):
+                    continue
+            if any(values[name] > self._release_for(name) for name in names) and all(
+                values[name] <= self._release_for(name) for name in REQUIRED_WEIGHTS if name not in names
             ):
                 return action
         return None
@@ -441,19 +522,18 @@ class FacialLocomotion:
         left, right = values["EyesClosedL"], values["EyesClosedR"]
         if left >= self._threshold_for("turn_left") and right >= self._threshold_for("turn_right"):
             self._blink_blocked = True
-        elif max(left, right) <= self.config.eye_open_threshold:
+        elif self._eyes_clearly_open(values):
             self._blink_blocked = False
 
     def _hold_wink(self, values: dict[str, float], *, continuing: str | None = None) -> str | None:
         """Select only a clear unilateral closure, independently of lower-face cross-talk."""
-        low = self.config.release_threshold
         for action, closed, opened in (
             ("turn_left", "EyesClosedL", "EyesClosedR"),
             ("turn_right", "EyesClosedR", "EyesClosedL"),
         ):
-            threshold = low if continuing == action else self._threshold_for(action)
+            threshold = self._release_for(closed) if continuing == action else self._threshold_for(action)
             closed_enough = values[closed] > threshold if continuing == action else values[closed] >= threshold
-            if closed_enough and values[opened] <= low:
+            if closed_enough and values[opened] <= self._opposite_eye_limit(action):
                 return action
         return None
 
@@ -480,7 +560,7 @@ class FacialLocomotion:
         # A relaxed mouth can tolerate more weight than a clearly open eye. Using
         # its release threshold here misreads a weak wink plus cheek motion as a
         # sidestep, even though the wink never reaches its activation threshold.
-        eyes_open = max(values["EyesClosedL"], values["EyesClosedR"]) <= self.config.eye_open_threshold
+        eyes_open = self._eyes_clearly_open(values)
         mouth_neutral = max(values[name] for name in REQUIRED_WEIGHTS[2:]) <= low
         if fresh:
             self._update_blink_latch(values)
@@ -570,7 +650,9 @@ class FacialLocomotion:
             self._candidate_since_s = now_s
         elapsed = now_s - self._candidate_since_s
         post_blink_wink = self._blink_blocked and desired.startswith("turn")
-        confirmation_s = self.config.post_blink_wink_confirm_s if post_blink_wink else self.config.confirm_s
+        confirmation_s = self._confirmation_for(desired)
+        if post_blink_wink:
+            confirmation_s = max(confirmation_s, self.config.post_blink_wink_confirm_s)
         if elapsed + 1e-12 < confirmation_s:
             return self._publish(
                 "confirming",

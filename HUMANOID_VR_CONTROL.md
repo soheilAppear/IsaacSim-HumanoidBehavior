@@ -502,9 +502,11 @@ you keep looking at the selected button. Looking directly at another valid,
 unoccluded button requests its direction in the same update. With a positive
 dwell override, the new button starts a fresh dwell instead of inheriting progress.
 **Look away to stop**, including when looking back at the box; lost/invalid eye
-tracking also requests a stop. Hold requests use **0.60 m/s forward**,
-**0.35 m/s backward**, or **0.40 rad/s
-yaw**; turning continues while the turn button is held. Physical braking and
+tracking also requests a stop. The launcher's experimental speed scale of **3**
+requests **1.80 m/s forward**, **1.05 m/s backward**, or **1.20 rad/s yaw** in hold
+mode; turning continues while the turn button is held. These multiply baseline
+requests once, not physics time or motor gains, and do not establish three times
+the measured speed. Physical braking and
 contacts determine actual travel and stopping distance. A stop request is not an
 instant physical stop or direction reversal. Startup/reset and recovery from
 tracking loss, button occlusion, session loss or a callback interruption still
@@ -515,7 +517,7 @@ cancel selection/movement and require rearming. Use the example's **Reset** afte
 a latched simulation fault; Play alone does not clear it.
 
 To use the controller override, center both sticks while both controllers are
-tracked. **Left-stick up/down** requests forward/backward movement at the configured
+tracked. **Left-stick up/down** requests forward/backward movement at the unscaled
 gaze speeds (hold defaults **0.60/0.35 m/s**); **left-stick left/right** requests
 sidestepping up to **0.30 m/s**; **right-stick left/right** requests turning (hold
 default **0.40 rad/s**). Diagonal translation input is normalized before applying
@@ -586,12 +588,13 @@ an explicit `step` override. Supply settings in the environment before starting 
 | `G1_GAZE_DWELL_S` | `0` in hold; `0.7` in step | Activation delay in wall seconds; zero activates on the first valid button hit |
 | `G1_GAZE_DISTANCE_M` | `0.20` | Step mode only: requested forward/backward distance, in meters |
 | `G1_GAZE_TURN_DEG` | `10` | Step mode only: requested turn angle, in degrees |
-| `G1_GAZE_FORWARD_SPEED` | `0.60` in hold; `0.20` in step | Requested forward speed, in m/s |
-| `G1_GAZE_BACKWARD_SPEED` | `0.35` in hold; `0.15` in step | Requested backward speed, in m/s |
-| `G1_GAZE_YAW_SPEED` | `0.40` in hold; `0.25` in step | Requested turn speed, in rad/s |
+| `G1_TELEOP_SPEED_SCALE` | `3` in gaze/facial launchers | Multiply face/gaze baseline speeds once; range 1–3; direct code default is 1 |
+| `G1_GAZE_FORWARD_SPEED` | `0.60` in hold; `0.20` in step | Baseline forward request before scaling, in m/s |
+| `G1_GAZE_BACKWARD_SPEED` | `0.35` in hold; `0.15` in step | Baseline backward request before scaling, in m/s |
+| `G1_GAZE_YAW_SPEED` | `0.40` in hold; `0.25` in step | Baseline turn request before scaling, in rad/s |
 | `G1_GAZE_HEADING_HOLD` | `1` | Enable heading feedback during Forward/Back; `0` disables it |
-| `G1_GAZE_HEADING_GAIN` | `3.0` | Corrective yaw speed per radian of heading error, in 1/s |
-| `G1_GAZE_HEADING_MAX_YAW_SPEED` | `0.15` | Maximum heading-correction magnitude, in rad/s |
+| `G1_GAZE_HEADING_GAIN` | `3.0` | Baseline heading gain in 0–5; scaled up to a maximum of 9.0 in 1/s |
+| `G1_GAZE_HEADING_MAX_YAW_SPEED` | `0.15` | Baseline heading-correction cap; scaled up to 0.40 rad/s |
 | `G1_GAZE_STOP_FEEDBACK` | `1` | Enable the stopping-feedback candidate in physical hold mode; `0` disables it for diagnostics |
 
 Set `G1_GAZE_BACKWARD_SPEED=0` to disable backward selection. The default enables
@@ -600,11 +603,42 @@ delay and progress ring; explicit overrides are preserved in either mode.
 The launch examples explicitly select zero delay and hybrid input to clear older
 terminal overrides. Set `G1_GAZE_CONTROLLER_OVERRIDE=0` for eye-only locomotion;
 set `G1_OPTICAL_HANDS_ONLY=1` independently for optical-only manipulation.
-Immediate activation removes the selection wait, while the physical command
-still uses the existing acceleration and stopping behavior. Dwell uses wall time;
+Set `$env:G1_TELEOP_SPEED_SCALE='1'` before launching to restore the baseline request
+profile. At scale 3, face/gaze translation and deliberate turn command attack time
+is **0.90 seconds** instead of 0.30, preserving initial acceleration as the requested
+peak increases. Gaze Forward/Back heading corrections use a **0.30 / scale** yaw
+response (**0.10 seconds** at scale 3) so the slower translation ramp does not delay drift correction. This
+exception applies only while gaze owns an active Forward/Back command with heading
+hold enabled; facial input, explicit gaze turns and controller ownership cannot
+inherit it from an old gaze target. Joystick peaks and its **0.30-second** attack
+stay unchanged; release remains **0.06 seconds** for all sources.
+Physics rate, learned actors, motor limits and contact behavior are unchanged.
+The higher profile has a bounded runaway envelope; zero-intent support/drift and fall
+guards still apply. Heading gain and correction authority also scale within their
+bounded limits, reaching **9.0/s** and **0.40 rad/s** at scale 3. Dwell uses wall time;
 requested speeds and settling use simulation time, so
 slow simulation changes actual movement per wall second. Explicit speed overrides
-are preserved in both modes.
+are preserved in both modes and multiplied exactly once by the selected scale.
+
+**Native validation passed all four gaze directions at the experimental 3× request
+profile**, with heading gain 9, correction-only attack 0.10 seconds and the unchanged
+0.40 rad/s correction cap. Forward ended its held interval **1.70°** from the starting
+heading and backward **1.31°**, passing the **3-degree end-of-hold criterion**. Peak
+sampled errors were **4.23° forward / 3.74° backward**, so the criterion does not mean
+heading stays within 3° throughout a step. Mean held speeds were **0.485/0.709 m/s
+forward/backward** and **0.683/0.702 rad/s left/right**, below their respective requests.
+The backward hold was 2.5 simulation seconds and the others 1.0 second. Requested
+speed scaling is not proof of three times achieved speed.
+
+Release and simulated eye-loss stopping passed, with final sampled planar speeds
+below **0.0046 m/s** and yaw speeds below **0.00054 rad/s**. Forward advanced **0.500 m
+while held**, and **0.918 m including braking**; physical stopping takes distance.
+Gaze, arm and finger updater methods each ran **5,670 times**. The run used synthetic
+gaze, neutral arms, no payload and real simulation physics; updater execution does
+not establish live optical-hand quality or successful box handling. The local report
+is `output/gaze_speed3_response_validation/gaze-move-20261112T041827Z-2a42ae26.json`.
+Use scale 1 to restore the previous request profile. The following recorded gaze
+measurements use that baseline profile.
 
 **Direct hold switching passed 1,068 offline tests in 15.973 seconds.** With the
 Isaac scene stopped, all four panel hit regions and 24 isolated direction-pair
@@ -644,8 +678,10 @@ planar speed was at most **0.0011 m/s** in each case. This used the real gaze
 geometry with synthetic eyes and neutral arms; Forward's simulated eye loss
 cleared intent. Hardware gaze and higher-speed loaded carrying remain unvalidated.
 
-The directional speed settings remain bounded by the existing physical profile's
-0.65 m/s forward, 0.35 m/s backward and 0.40 rad/s yaw caps. The source supports
+The unscaled gaze settings remain bounded by baseline caps of 0.65 m/s forward,
+0.35 m/s backward and 0.40 rad/s yaw. Selected-profile physical caps multiply with
+the scale: at 3 they are 1.95 m/s forward, 1.05 m/s backward and 1.20 rad/s yaw.
+These are experimental limits, not a verified trained-policy envelope. The source supports
 backward walking. **Before heading feedback, 990 offline regressions passed**, and the actual-scene
 preview and physical runs passed all four controls with synthetic eyes. Physical
 movement continued during a three-second hold beyond the old step/turn limits.
@@ -751,9 +787,10 @@ topology, so switch them by exiting and relaunching.
 | Close both eyes | Request zero movement | Bilateral closure |
 
 The default **hold** mode confirms a single deliberate expression for **0.18 seconds**
-before requesting movement. Keep holding it to continue; relaxing requests a stop.
+before requesting movement, except the calibrated right wink, which requires
+**0.50 seconds**. Keep holding it to continue; relaxing requests a stop.
 Switching directly to another clear expression stops the old request and confirms
-the new one for the same **0.18 seconds**. Intermediate or ambiguous signals also
+the new one for its configured interval. Intermediate or ambiguous signals also
 stop the request and restart confirmation when a clear expression returns, without
 locking recognition until the whole face relaxes. Initial arming and recovery after
 invalid/stale tracking still require a neutral face with both eyes open for
@@ -766,7 +803,8 @@ the wink until the mouth returns to neutral. Closing both eyes requests zero mov
 Afterward, clearly holding only one eye closed can select its turn after **0.5 seconds**
 of continuous confirmation, without first reopening both eyes. Brief asymmetric
 reopening sends no command. Opening both eyes clears the blink state; a later clean
-wink uses the normal **0.18-second** confirmation. Tracking loss still requires the
+left wink uses **0.18 seconds** and a clean right wink uses its calibrated **0.50 seconds**.
+Tracking loss still requires the
 initial neutral recovery sequence.
 
 This accepts deliberate winks that begin with a two-eye closure, as requested for
@@ -791,17 +829,22 @@ command retains the blink pause/resume behavior described above.
 The same clear-eye threshold applies to initial hold-mode arming and blink recovery.
 
 The launcher starts with individual
-activation thresholds of **0.45 for winks, 0.45 for jaw opening, 0.40 for puckering,
-and 0.45 for sideways lips**, with a **0.35 release threshold**. These starter values
+activation thresholds of **0.45 for the left wink, 0.30 for the right wink, 0.45 for
+jaw opening, 0.40 for puckering, 0.45 for left lips, and 0.55 for right lips**. The
+general release threshold is **0.35**; the right eye has its own **0.20** release.
+Right winks confirm for **0.50 seconds**. These starter values
 come from this headset's preview observations and need rechecking after fit changes.
+The lowered independent right-wink threshold requires the left eye clearly open
+(closure at or below **0.15** by default); ambiguous partial closure of both eyes
+cannot select a right turn.
 
 The in-headset status identifies what recognition needs:
 
 - **RELAX FACE**: open both eyes and relax your mouth for the initial or recovery
   neutral interval.
 - **HOLD L/R WINK**, **HOLD MOUTH**, **HOLD PUCKER**, or **HOLD L/R LIPS**: a specific
-  command is being confirmed. The usual interval is **0.18 seconds**; a wink after
-  both eyes close requires **0.5 seconds** of clear unilateral closure.
+  command is being confirmed. The usual interval is **0.18 seconds**; the calibrated
+  right wink and either wink after both eyes close require **0.5 seconds**.
 - **OPEN EYES**: eye closure blocks recognition. Reopen both eyes; if a mouth
   command was already active, keeping that expression resumes it after confirmation.
 - **NO FACE DATA**: usable face data is missing. The movement request is cleared; after tracking
@@ -832,7 +875,13 @@ python tools/kit_exec.py "EX.set_facial_locomotion_enabled(False)"
 #### Facial tuning and checks
 
 Set overrides in PowerShell **before launching**. Face speeds are independent of
-the existing gaze speeds.
+gaze baseline speeds, but both share `G1_TELEOP_SPEED_SCALE`. The gaze/facial launcher
+chain defaults that scale to **3** and multiplies each configured baseline speed
+once. It does not change the simulation rate or motor limits. At scale 3 the facial
+requests are **0.60 m/s forward, 0.45 m/s back/sideways, and 0.75 rad/s turning**.
+The scaled attack time is **0.90 seconds** and release stays **0.06 seconds**;
+joystick peaks and its 0.30-second attack remain unchanged. Use
+`$env:G1_TELEOP_SPEED_SCALE='1'` before launch to restore the baseline profile.
 
 | Environment setting | Default | Meaning |
 |---|---:|---|
@@ -840,24 +889,30 @@ the existing gaze speeds.
 | `G1_FACE_MODE` | `hold` | Move while the expression remains deliberate |
 | `G1_FACE_DISTANCE_M` | `0.15` | Requested translation in optional `step` mode |
 | `G1_FACE_TURN_DEG` | `10` | Requested yaw change in optional `step` mode |
-| `G1_FACE_FORWARD_SPEED` | `0.20` | Forward request in m/s |
-| `G1_FACE_BACKWARD_SPEED` | `0.15` | Reverse request in m/s |
-| `G1_FACE_LATERAL_SPEED` | `0.15` | Sidestep request in m/s |
-| `G1_FACE_YAW_SPEED` | `0.25` | Turn request in rad/s |
+| `G1_TELEOP_SPEED_SCALE` | `3` in the launcher | Multiply facial/gaze baseline speeds once; range 1–3 |
+| `G1_FACE_FORWARD_SPEED` | `0.20` | Forward baseline request before scaling, in m/s |
+| `G1_FACE_BACKWARD_SPEED` | `0.15` | Reverse baseline request before scaling, in m/s |
+| `G1_FACE_LATERAL_SPEED` | `0.15` | Sidestep baseline request before scaling, in m/s |
+| `G1_FACE_YAW_SPEED` | `0.25` | Turn baseline request before scaling, in rad/s |
 | `G1_FACE_ACTIVATION_THRESHOLD` | `0.65` | Shared activation threshold for every expression without its own override |
-| `G1_FACE_WINK_THRESHOLD` | `0.45` | Left/right eye closure |
+| `G1_FACE_WINK_THRESHOLD` | `0.45` | Eye-closure threshold without a per-right override |
+| `G1_FACE_RIGHT_WINK_THRESHOLD` | `0.30` | Calibrated right-eye activation |
+| `G1_FACE_RIGHT_WINK_RELEASE_THRESHOLD` | `0.20` | Right-eye release hysteresis, below its activation threshold |
+| `G1_FACE_RIGHT_WINK_CONFIRM_S` | `0.50` | Deliberate right-wink confirmation duration |
+| `G1_FACE_RIGHT_MOUTH_THRESHOLD` | `0.55` | Calibrated right-lip sidestep activation |
 | `G1_FACE_JAW_THRESHOLD` | `0.45` | Forward mouth opening |
 | `G1_FACE_PUCKER_THRESHOLD` | `0.40` | Backward bilateral lip puckering |
 | `G1_FACE_MOUTH_SIDE_THRESHOLD` | `0.45` | Left/right mouth movement |
-| `G1_FACE_RELEASE_THRESHOLD` | `0.35` | Shared release threshold, below every activation threshold |
+| `G1_FACE_RELEASE_THRESHOLD` | `0.35` | Shared release threshold; right-eye closure uses its separate override |
 | `G1_FACE_EYE_OPEN_THRESHOLD` | `0.15` | Maximum closure on each eye for hold-mode arming, mouth authorization, and blink recovery |
 | `G1_FACE_CONFIRM_S` | `0.18` | Required deliberate-expression confirmation time in seconds |
 | `G1_FACE_POST_BLINK_WINK_CONFIRM_S` | `0.5` | Continuous unilateral wink confirmation after both eyes closed; hold mode only |
 | `G1_FACE_NEUTRAL_S` | `0.25` | Neutral interval for initial arming/tracking recovery; also required between gestures in optional step mode |
 
-For example, `$env:G1_FACE_FORWARD_SPEED = '0.30'` adjusts facial forward speed for
-the next launch. Supported caps are **0.65 m/s forward**, **0.35 m/s reverse**,
-**0.30 m/s lateral**, and **0.40 rad/s yaw**. The launcher defaults to preview even
+For example, `$env:G1_FACE_FORWARD_SPEED = '0.18'` requests **0.54 m/s** with scale 3
+on the next launch. Effective facial requests are bounded at **0.65 m/s forward**,
+**0.45 m/s reverse/lateral**, and **0.75 rad/s yaw**. These are experimental bounds,
+not a verified trained-policy envelope. The launcher defaults to preview even
 if an earlier terminal session set a movement environment variable. Only its first
 `--move` argument enables physical motion.
 
@@ -866,6 +921,10 @@ values above. When constructing the controller directly, an expression threshold
 of `None` falls back to `G1_FACE_ACTIVATION_THRESHOLD`. Do not put the literal string
 `None` in an environment variable. Set a numeric value from **0.40 to 1.0**, above
 the release threshold.
+The separate right-wink activation accepts **0.25 to 1.0** and must exceed its own
+release threshold; right release accepts **0 to 0.50**. Right-wink confirmation accepts
+**0.08 to 1.0 seconds**. Right-mouth activation accepts **0.40 to 1.0**, above the
+shared release threshold. These overrides avoid lowering the other side's threshold.
 `G1_FACE_EYE_OPEN_THRESHOLD` is a separate clear-eye limit with an allowed range of
 **0.0 to 0.35**; it does not follow those activation-threshold bounds. Raising it
 can allow partial eye closures to qualify as open eyes, weakening weak-wink rejection.
@@ -917,28 +976,61 @@ acceptance of a clearly held unilateral wink after **0.5 seconds**. A later live
 observation showed **active left turn**, activation count **2**, both tracking
 confidence values at **1.0**, and no reported control fault. This confirms an observed
 left-turn activation with the revised recognizer; it is not a repeatability or
-false-activation measurement. Reliable left/right wink operation remains unverified,
-and right-wink acceptance is still pending.
+false-activation measurement. Repeatable left/right wink operation and end-to-end
+right-wink headset acceptance remain unverified.
 These observations are not a six-command hardware acceptance pass or a measured
 false-activation rate.
+
+The separately approved **30-second right-side calibration** is stored locally as
+`output/right_face_calibration_20261112T034543Z.json`. It informed the right-eye
+0.30 activation / 0.20 release / 0.50-second confirmation and right-lip 0.55 activation.
+A replay of the complete recording recognized right-lip sidestepping, but two invalid
+samples from one OSC backlog episode cancelled right-wink confirmation and required
+neutral recovery. The preceding callback gap was **188.55 ms**, versus a **16.55 ms**
+median in that trace. This does not establish reliable right-wink operation.
+
+The receiver's bounded budget is now **128 datagrams per poll**, allowing short
+bursts inside the existing **250 ms** callback window to drain without necessarily
+being rejected at the old 64-packet limit. Longer interruptions still discard queued
+data, and fresh complete fields plus both confidence checks remain required before
+movement can rearm. A full budget or sustained backlog still rejects input. The
+recording did not retain the exact queue size, so this change does not prove that
+its particular interruption is fixed. After **NO FACE DATA**, relax with both eyes
+open to rearm, then repeat the intended expression.
+
+A separately approved **30-second verification** is stored locally as
+`output/right_face_calibration_20261112T040427Z.json`. All **2,004 of 2,004 samples**
+were valid. With the calibrated settings, an offline replay supplied with synthetic
+XR readiness selected two right-turn hold activations during the wink prompt, separated
+by a pause when the opposite left eye was no longer clearly open, then one right
+sidestep during the lips prompt. The turn resumed after fresh confirmation;
+the recording does not show one uninterrupted held turn.
+`MouthRight=1` during the wink did not issue translation, and **1,007 neutral samples**
+issued no command. XR was off during the recording, so the recognizer accepted the
+recorded right-side expressions, but this does not establish end-to-end XR locomotion
+or repeatable wearer performance. Further facial recording requires the wearer's
+agreement before collection.
 
 Before the recognition consistency fix, the **native Isaac anchored-preview check
 passed all six commands using simulated face input**, with the base remaining
 anchored. The rendered controls were also reviewed for readability. That preview run
 does not validate the revised recognition behavior.
 
-**Native physical validation passed after the consistency fix**, using the real
-walking actor and simulated facial input. Forward traveled 0.182 m, backward
-0.647 m, left/right sidesteps 0.101/0.138 m, and left/right turns 0.295/0.435 radians
+**Native physical validation passed at the 3× facial request profile**, using the real
+walking actor and simulated facial input. Forward traveled 0.410 m, backward
+0.747 m, left/right sidesteps 0.277/0.326 m, and left/right turns 0.710/0.991 radians
 during the selected holds. The right turn remained active when `MouthRight=1` was
 added to its wink. During held forward motion, a bilateral blink cleared requested
 and filtered velocity, reopening required fresh confirmation, and resuming forward
 retained the original activation count. Every direction passed measured stopping
 checks, including the final stale-input cancellation; brief unilateral closure and
 bilateral blinks selected no command. Scene reset also disarmed facial control.
-Arm and finger updater methods each ran **11,314 times**; this proves execution
+Arm and finger updater methods each ran **10,824 times**; this proves execution
 alongside walking, not successful hand tracking or box carrying. The local report is
-`output/facial_post_blink_validation/face-move-20261112T033529Z-87b7dab1.json`.
+`output/facial_speed3_validation/face-move-20261112T035530Z-d50af106.json`.
+The backward hold was 2.5 simulation seconds; the other route holds were 1.5 seconds,
+with an additional overlap check during the right turn. These distances and angles
+are measured progress, not proof of three times the achieved speed.
 Reliable wearer recognition and box handling remain operator acceptance checks.
 
 The final native run also passed the weak-wink regression: eye-closure weights
@@ -952,8 +1044,9 @@ turn, and relaxation stopped it. This run used strong synthetic expressions and
 the core activation thresholds, so it does not calibrate the launcher's starter
 thresholds to a wearer.
 
-The complete offline suite passed **1,175 tests** after the recognition consistency
-changes, including the weak-wink guard and sustained post-blink wink. These include
+The complete offline suite passed **1,207 tests in 16.249 seconds** after the
+speed/calibration, opposite-eye validity, bounded transport-budget and heading-response
+updates. These include
 transport, gesture transitions, control ownership, and real-USD HUD checks. The regressions cover
 wink/mouth overlap, blink pause and recovery, direct changes between clear expressions,
 and tracking-loss rearming. In the running Quest Pro
@@ -963,12 +1056,13 @@ Reproduce native validation with the installed Isaac Python wrapper, using separ
 processes for preview and physical movement. The scripts close their owned simulator.
 
 ```powershell
-& 'C:/Users/Soheil/Downloads/isaac-sim-standalone-6.1.0-windows-x86_64/python.bat' tools/validate_facial_walking.py --mode preview --output-dir output/facial_validation --ext-path source/extensions/isaacsim.robot.policy.examples --enable isaacsim.robot.policy.examples-5.2.11 --/app/vulkan=false --/app/extensions/fsWatcherEnabled=0 --/metricsAssembler/changeListenerEnabled=false
-& 'C:/Users/Soheil/Downloads/isaac-sim-standalone-6.1.0-windows-x86_64/python.bat' tools/validate_facial_walking.py --mode move --back-hold-s 5 --output-dir output/facial_validation --ext-path source/extensions/isaacsim.robot.policy.examples --enable isaacsim.robot.policy.examples-5.2.11 --/app/vulkan=false --/app/extensions/fsWatcherEnabled=0 --/metricsAssembler/changeListenerEnabled=false
+& 'C:/Users/Soheil/Downloads/isaac-sim-standalone-6.1.0-windows-x86_64/python.bat' tools/validate_facial_walking.py --mode preview --speed-scale 3 --output-dir output/facial_validation --ext-path source/extensions/isaacsim.robot.policy.examples --enable isaacsim.robot.policy.examples-5.2.11 --/app/vulkan=false --/app/extensions/fsWatcherEnabled=0 --/metricsAssembler/changeListenerEnabled=false
+& 'C:/Users/Soheil/Downloads/isaac-sim-standalone-6.1.0-windows-x86_64/python.bat' tools/validate_facial_walking.py --mode move --speed-scale 3 --back-hold-s 2.5 --output-dir output/facial_validation --ext-path source/extensions/isaacsim.robot.policy.examples --enable isaacsim.robot.policy.examples-5.2.11 --/app/vulkan=false --/app/extensions/fsWatcherEnabled=0 --/metricsAssembler/changeListenerEnabled=false
 ```
 
-The physical validation backs away through the walking controller for five seconds
-to obtain turn clearance. It does not reposition the root or alter the warehouse.
+The physical validation backs away through the walking controller for 2.5 simulation
+seconds to obtain turn clearance at scale 3. Use `--speed-scale 1 --back-hold-s 5`
+for the baseline profile. It does not reposition the root or alter the warehouse.
 Headset transport and real facial/hand gestures are separate from this synthetic replay.
 
 ### Experimental gesture walking
@@ -2141,6 +2235,24 @@ height while following headset pitch/roll and relative heading. **B** resets hea
 it never stores headset tilt as a horizon offset and does not
 change eye-gaze calibration. The left stick cannot enable room-scale camera motion.
 
+### Isaac window exits unexpectedly
+
+The reported unsolicited GUI exits remain unresolved. The latest affected process's
+log, `kit_20261111_223503.log`, ends at **12 November 2026, 04:10:10 UTC**
+(11 November, 11:10:10 pm Eastern) with native component cleanup interleaved with
+XR camera updates. The local passive record `output/isaac_shutdown_events.jsonl`
+contains its diagnostic-installation entry but no captured Python quit/restart event.
+A bounded Windows Application/System event review found no matching application
+crash or hang report, and no new local crash dump was found. Earlier XR errors
+reported an invalid anchor matrix and invalid swapchain/composition resources;
+their occurrence several minutes earlier does not establish the cause of the exit.
+
+This is separate from a walking guard pausing the timeline while Isaac remains open.
+The evidence does not identify the caller or exit reason, and the facial/gaze fixes
+do not establish that this GUI-exit problem is fixed. Retain the affected Kit log
+under `C:/Users/Soheil/.nvidia-omniverse/logs/Kit/Isaac-Sim XR VR/6.1/` when investigating
+another occurrence.
+
 ### Walking pauses after looking away near a box
 
 The later recorded pause occurred **9.54 simulation seconds after release**, while
@@ -2153,9 +2265,12 @@ whether arm contact or the walking controller caused the drift.
 With zero movement requested, the translation guard allows **1.5 simulation
 seconds** for braking, then requires a **0.4-second** sustained-overspeed interval,
 net root and support speeds both above **0.10 m/s**, and support excursion above
-**0.15 m**. The independent fast-runaway guard still pauses root speed above
-**0.8 m/s** or yaw speed above **1.2 rad/s** sustained for **0.25 seconds**.
-These thresholds remain unchanged.
+**0.15 m**. The independent fast-runaway guard pauses baseline-profile root speed
+above **0.8 m/s** or yaw speed above **1.2 rad/s** sustained for **0.25 seconds**.
+The experimental scale-3 gaze/facial profile expands only this fast envelope to
+**2.34 m/s** and **1.60 rad/s**, so its intended faster commands are not automatically
+classified as runaway. The zero-intent root/support drift conditions above and the
+fall guards remain unchanged.
 
 Inspect `EX.gaze_locomotion_status()['last_motion_fault']` for the retained reason,
 commands, signed velocities, support measurements and bounded contact summary.

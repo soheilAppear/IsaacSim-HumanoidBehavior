@@ -66,6 +66,7 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.assertTrue(config.preview)
         self.assertEqual(config.control_mode, "step")
         self.assertEqual((config.dwell_s, config.distance_m, config.turn_degrees), (0.7, 0.2, 10))
+        self.assertEqual((config.forward_speed, config.backward_speed, config.yaw_speed), (0.20, 0.15, 0.25))
         self.assertEqual((config.heading_hold, config.heading_gain, config.heading_max_yaw_speed), (True, 3.0, 0.15))
         self.assertEqual(GAZE.GazeLocomotion().command.velocity, (0, 0, 0))
 
@@ -74,11 +75,11 @@ class TestGazeLocomotionControls(unittest.TestCase):
             "dwell_s": (-0.01, 5.01),
             "distance_m": (0.009, 1.01),
             "turn_degrees": (0.99, 90.01),
-            "forward_speed": (0, 1.01),
-            "backward_speed": (-0.01, 1.01),
+            "forward_speed": (0, 1.951),
+            "backward_speed": (-0.01, 1.051),
             "yaw_speed": (0, 1.51),
             "max_gaze_gap_s": (0.049, 1.01),
-            "heading_gain": (-0.01, 5.01),
+            "heading_gain": (-0.01, 9.01),
             "heading_max_yaw_speed": (-0.01, 0.401),
         }
         for field, invalid in ranges.items():
@@ -103,6 +104,48 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.assertEqual(self.tick("forward").state, "awaiting_release")
         self.assertEqual(self.tick().state, "idle")
         self.assertEqual(self.tick("forward").progress, 0)
+
+    def test_experimental_threefold_hold_requests_preserve_preview_and_loss_stop(self) -> None:
+        expected = {
+            "forward": (1.80, 0, 0),
+            "back": (-1.05, 0, 0),
+            "turn_left": (0, 0, 1.20),
+            "turn_right": (0, 0, -1.20),
+        }
+        for preview in (False, True):
+            for action, velocity in expected.items():
+                with self.subTest(preview=preview, action=action):
+                    self.setUp()
+                    self.controller = GAZE.GazeLocomotion(
+                        replace(
+                            self.config,
+                            control_mode="hold",
+                            dwell_s=0.0,
+                            preview=preview,
+                            forward_speed=1.80,
+                            backward_speed=1.05,
+                            yaw_speed=1.20,
+                        )
+                    )
+                    self.tick()
+                    command = self.tick(action)
+                    self.assertEqual(command.activated_action, action)
+                    self.assertEqual(command.velocity, (0, 0, 0) if preview else velocity)
+                    command = self.tick(action, eye_valid=False)
+                    self.assertEqual(command.velocity, (0, 0, 0))
+                    self.assertTrue(command.stop_immediately)
+
+    def test_scaled_boundary_preserves_float_arithmetic_without_widening_limits(self) -> None:
+        forward, backward = 0.65 * 3.0, 0.35 * 3.0
+        self.controller = GAZE.GazeLocomotion(
+            replace(self.config, control_mode="hold", dwell_s=0.0, forward_speed=forward, backward_speed=backward)
+        )
+        self.tick()
+        self.assertEqual(self.tick("forward").velocity, (forward, 0, 0))
+        self.assertEqual(self.tick("back").velocity, (-backward, 0, 0))
+        for name, maximum in (("forward_speed", forward), ("backward_speed", 1.05)):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                replace(self.config, **{name: math.nextafter(maximum, math.inf)})
 
     def test_dwell_uses_wall_time_and_first_sample_has_zero_progress(self) -> None:
         self.tick()
@@ -409,6 +452,30 @@ class TestGazeLocomotionControls(unittest.TestCase):
                 self.assertAlmostEqual(self.controller.heading_status["error_rad"], -sign * math.radians(2))
                 self.assertLess(result.velocity[2] * sign, 0.0)
                 self.assertLess(abs(result.velocity[2]), self.config.heading_gain * math.radians(2))
+
+    def test_experimental_heading_gain_increases_authority_without_exceeding_yaw_cap(self) -> None:
+        corrections = {}
+        for gain in (3.0, 9.0):
+            self.setUp()
+            self.controller = GAZE.GazeLocomotion(
+                replace(
+                    self.config, control_mode="hold", forward_speed=1.80, heading_gain=gain, heading_max_yaw_speed=0.40
+                )
+            )
+            self.fire()
+            self.pose = (0.0, 0.0, -math.radians(2.0))
+            for _ in range(10):
+                result = self.tick("forward")
+            corrections[gain] = result.velocity[2]
+            self.assertEqual(result.velocity[:2], (1.80, 0.0))
+            self.assertGreater(corrections[gain], 0.0)
+            self.assertLess(corrections[gain], 0.40)
+        self.assertAlmostEqual(corrections[9.0], 3.0 * corrections[3.0])
+        self.pose = (0.0, 0.0, -0.5)
+        for _ in range(10):
+            result = self.tick("forward")
+            self.assertLessEqual(result.velocity[2], 0.40)
+        self.assertEqual(result.velocity, (1.80, 0.0, 0.40))
 
     def test_heading_feedback_deadband_and_disabled_configuration_request_no_yaw(self) -> None:
         for config, drift in (

@@ -406,7 +406,10 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
                     entry["signed_progress"] > 0.01,
                     "Physical movement did not make progress in the requested direction",
                 )
-                _require(math.dist(start["position_m"][:2], end["position_m"][:2]) < 1.0, "One action exceeded a meter")
+                _require(
+                    math.dist(start["position_m"][:2], end["position_m"][:2]) < report["speed_scale"],
+                    "One action exceeded the scaled test corridor",
+                )
                 samples = [
                     sample
                     for sample in report["motion_samples"]
@@ -469,20 +472,26 @@ def main() -> int:
     parser.add_argument("--backward-speed", type=float, default=0.15)
     parser.add_argument("--lateral-speed", type=float, default=0.15)
     parser.add_argument("--yaw-speed", type=float, default=0.25)
+    parser.add_argument(
+        "--speed-scale", type=float, default=1.0, help="Multiply base facial/gaze requests once, in [1,3]"
+    )
     parser.add_argument("--load-timeout", type=float, default=240.0)
     parser.add_argument("--test-timeout", type=float, default=480.0)
     args, kit_args = parser.parse_known_args()
+    if not math.isfinite(args.speed_scale) or not 1.0 <= args.speed_scale <= 3.0:
+        parser.error("--speed-scale must be finite and in [1,3]")
     for name, upper in (
         ("hold_s", 10),
         ("back_hold_s", 10),
         ("forward_speed", 0.65),
-        ("backward_speed", 0.35),
-        ("lateral_speed", 0.30),
-        ("yaw_speed", 0.40),
+        ("backward_speed", 0.45),
+        ("lateral_speed", 0.45),
+        ("yaw_speed", 0.75),
     ):
         value = getattr(args, name)
-        if not math.isfinite(value) or not 0 < value <= upper:
-            parser.error(f"--{name.replace('_', '-')} must be finite and in (0, {upper}]")
+        effective = value * args.speed_scale if name.endswith("_speed") else value
+        if not math.isfinite(value) or not 0 < effective <= upper:
+            parser.error(f"--{name.replace('_', '-')} after speed scaling must be finite and in (0, {upper}]")
     for name in ("load_timeout", "test_timeout"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive and finite")
@@ -495,6 +504,13 @@ def main() -> int:
         "phase": "starting_application",
         "mode": args.mode,
         "control_mode": "hold",
+        "speed_scale": args.speed_scale,
+        "requested_speeds": {
+            "forward_m_s": args.forward_speed * args.speed_scale,
+            "backward_m_s": args.backward_speed * args.speed_scale,
+            "lateral_m_s": args.lateral_speed * args.speed_scale,
+            "yaw_rad_s": args.yaw_speed * args.speed_scale,
+        },
         "run_id": run_id,
         "hold_s": args.hold_s,
         "back_hold_s": args.back_hold_s,
@@ -515,6 +531,7 @@ def main() -> int:
         {
             "G1_GESTURE_WALKING": "1",
             "G1_LOCOMOTION_INPUT": "gaze",
+            "G1_TELEOP_SPEED_SCALE": str(args.speed_scale),
             "G1_POINTING_NAVIGATION": "0",
             "G1_OPTICAL_HANDS_ONLY": "1",
             "G1_WEBCAM_ENABLED": "0",

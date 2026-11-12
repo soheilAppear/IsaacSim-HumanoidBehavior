@@ -66,6 +66,7 @@ class TestGazeLauncherControls(unittest.TestCase):
         self.assertEqual(values["G1_OPTICAL_HANDS_ONLY"], "0")
         self.assertEqual(values["G1_GAZE_CONTROLLER_OVERRIDE"], "1")
         self.assertEqual(values["G1_POINTING_NAVIGATION"], "0")
+        self.assertEqual(values["G1_TELEOP_SPEED_SCALE"], "3")
 
     def test_explicit_hand_and_controller_override_settings_are_preserved(self) -> None:
         """Preview/move opt-in must not erase either independent input opt-out."""
@@ -113,10 +114,13 @@ class TestGazeLauncherControls(unittest.TestCase):
                 self.assertEqual(forwarded, "")
 
     def test_numerical_defaults_and_explicit_override_reach_base_launcher(self) -> None:
-        result, values, _ = self._run_launcher(overrides={"G1_GAZE_BACKWARD_SPEED": "0", "G1_GAZE_DWELL_S": "1.2"})
+        result, values, _ = self._run_launcher(
+            overrides={"G1_GAZE_BACKWARD_SPEED": "0", "G1_GAZE_DWELL_S": "1.2", "G1_TELEOP_SPEED_SCALE": "1"}
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         for key, value in {
             "G1_GAZE_DWELL_S": "1.2",
+            "G1_TELEOP_SPEED_SCALE": "1",
             "G1_GAZE_DISTANCE_M": "0.20",
             "G1_GAZE_TURN_DEG": "10",
             "G1_GAZE_FORWARD_SPEED": "0.60",

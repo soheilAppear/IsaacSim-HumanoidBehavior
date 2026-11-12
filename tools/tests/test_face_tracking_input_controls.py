@@ -200,6 +200,100 @@ class TestFaceInputFreshness(unittest.TestCase):
 
 
 class TestFaceInputSocket(unittest.TestCase):
+    def test_short_callback_burst_keeps_only_latest_complete_face(self) -> None:
+        for count in (75, 100):
+            with self.subTest(packets=count):
+                receiver = FACE.SteamLinkFaceInput()
+                receiver._last_poll_s = 10.0
+                receiver._socket = Mock()
+                receiver._socket.recvfrom.side_effect = [
+                    *((frame(JawDrop=0.9), ("127.0.0.1", 1234)) for _ in range(count - 1)),
+                    (frame(MouthRight=0.6), ("127.0.0.1", 1234)),
+                    BlockingIOError(),
+                ]
+                sample = receiver.poll(now_s=10.188)
+                self.assertTrue(sample.valid)
+                self.assertAlmostEqual(sample.weights["JawDrop"], 0.0)
+                self.assertAlmostEqual(sample.weights["MouthRight"], 0.6)
+                self.assertEqual(sample.sequence, count)
+                self.assertEqual(receiver.diagnostics()["backlog_events"], 0)
+                self.assertEqual(receiver._socket.recvfrom.call_count, count + 1)
+
+    def test_long_callback_burst_is_discarded_until_a_fresh_following_poll(self) -> None:
+        for count in (75, 100):
+            with self.subTest(packets=count):
+                receiver = FACE.SteamLinkFaceInput()
+                receiver._last_poll_s = 10.0
+                receiver._socket = Mock()
+                receiver.ingest_packet(frame(), now_s=10.0)
+                receiver._socket.recvfrom.side_effect = [
+                    *((frame(JawDrop=0.9), ("127.0.0.1", 1234)) for _ in range(count)),
+                    BlockingIOError(),
+                ]
+                sample = receiver.poll(now_s=10.251)
+                self.assertFalse(sample.valid)
+                self.assertEqual(sample.weights, {})
+                self.assertEqual(sample.sequence, 1)
+                self.assertIn("callback interruption", sample.reason)
+                receiver._socket.recvfrom.side_effect = [(frame(), ("127.0.0.1", 1234)), BlockingIOError()]
+                fresh = receiver.poll(now_s=10.26)
+                self.assertTrue(fresh.valid)
+                self.assertEqual(fresh.sequence, 2)
+                self.assertEqual(fresh.weights["JawDrop"], 0.0)
+
+    def test_default_packet_cap_and_persistent_backlog_remain_invalid(self) -> None:
+        receiver = FACE.SteamLinkFaceInput()
+        self.assertEqual(receiver.max_packets_per_poll, 128)
+        receiver._last_poll_s = 10.0
+        receiver._socket = Mock()
+        receiver._socket.recvfrom.return_value = (frame(JawDrop=0.9), ("127.0.0.1", 1234))
+        for poll_index in range(3):
+            sample = receiver.poll(now_s=10.01 + poll_index * 0.01)
+            self.assertFalse(sample.valid)
+            self.assertEqual(sample.weights, {})
+            self.assertEqual(sample.sequence, 128)
+            self.assertEqual(receiver._socket.recvfrom.call_count, 128 * (poll_index + 1))
+            self.assertEqual(receiver.diagnostics()["backlog_events"], poll_index + 1)
+        receiver._socket.recvfrom.side_effect = [(frame(), ("127.0.0.1", 1234)), BlockingIOError()]
+        self.assertFalse(receiver.poll(now_s=10.04).valid)
+        receiver._socket.recvfrom.side_effect = [(frame(), ("127.0.0.1", 1234)), BlockingIOError()]
+        self.assertTrue(receiver.poll(now_s=10.05).valid)
+
+    def test_exact_default_batch_is_conservatively_invalidated(self) -> None:
+        receiver = FACE.SteamLinkFaceInput()
+        receiver._last_poll_s = 10.0
+        receiver._socket = Mock()
+        receiver._socket.recvfrom.side_effect = [
+            *((frame(JawDrop=0.9), ("127.0.0.1", 1234)) for _ in range(128)),
+            BlockingIOError(),
+        ]
+        self.assertFalse(receiver.poll(now_s=10.188).valid)
+        self.assertFalse(receiver.poll(now_s=10.20).valid)
+        receiver._socket.recvfrom.side_effect = [(frame(), ("127.0.0.1", 1234)), BlockingIOError()]
+        self.assertTrue(receiver.poll(now_s=10.21).valid)
+
+    def test_short_burst_still_requires_all_fields_and_final_confidence(self) -> None:
+        missing_jaw = bundle(
+            *(
+                message(address, args[0])
+                for address, args in FACE.decode_osc_packet(frame())
+                if not address.endswith("JawDrop")
+            )
+        )
+        low_confidence = bundle(frame(JawDrop=0.9), message("/sl/xrfb/facec/LowerFace", 0.1))
+        for payload in (missing_jaw, low_confidence):
+            with self.subTest(payload=payload):
+                receiver = FACE.SteamLinkFaceInput()
+                receiver._last_poll_s = 10.0
+                receiver._socket = Mock()
+                receiver._socket.recvfrom.side_effect = [
+                    *((payload, ("127.0.0.1", 1234)) for _ in range(100)),
+                    BlockingIOError(),
+                ]
+                sample = receiver.poll(now_s=10.188)
+                self.assertFalse(sample.valid)
+                self.assertEqual(receiver.diagnostics()["backlog_events"], 0)
+
     def test_real_loopback_bind_poll_and_close(self) -> None:
         receiver = FACE.SteamLinkFaceInput(port=0)
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

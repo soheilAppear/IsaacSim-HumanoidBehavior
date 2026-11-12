@@ -21,6 +21,7 @@ class TestFacialIntegrationControls(unittest.TestCase):
         """Build the real humanoid with deterministic facial and gaze settings."""
         environment = {
             "G1_LOCOMOTION_INPUT": "gaze",
+            "G1_TELEOP_SPEED_SCALE": "1",
             "G1_GESTURE_WALKING": "1",
             "G1_GAZE_PREVIEW": "1" if preview else "0",
             "G1_GAZE_MODE": "hold",
@@ -136,6 +137,26 @@ class TestFacialIntegrationControls(unittest.TestCase):
         self.assertTrue(self.ex._hand_tracking_arm_control_enabled)
         self.assertTrue(self.ex._controller_arm_control_enabled)
         self.assertTrue(self.ex._finger_control_enabled)
+
+    def test_faster_profile_and_independent_right_calibration_reach_controller(self) -> None:
+        calibrated = self.make_example(
+            G1_TELEOP_SPEED_SCALE="3",
+            G1_FACE_RIGHT_WINK_THRESHOLD="0.30",
+            G1_FACE_RIGHT_WINK_RELEASE_THRESHOLD="0.20",
+            G1_FACE_RIGHT_WINK_CONFIRM_S="0.50",
+            G1_FACE_RIGHT_MOUTH_THRESHOLD="0.55",
+        )
+        config = calibrated._facial_input.controller.config
+        np.testing.assert_allclose(
+            (config.forward_speed, config.backward_speed, config.lateral_speed, config.yaw_speed),
+            (0.60, 0.45, 0.45, 0.75),
+        )
+        self.assertEqual(config.right_wink_threshold, 0.30)
+        self.assertEqual(config.right_wink_release_threshold, 0.20)
+        self.assertEqual(config.right_wink_confirm_s, 0.50)
+        self.assertEqual(config.right_mouth_threshold, 0.55)
+        self.assertTrue(calibrated._hand_tracking_arm_control_enabled)
+        self.assertTrue(calibrated._finger_control_enabled)
 
     def test_disabled_face_falls_through_to_existing_gaze_dispatch(self) -> None:
         self.ex.set_facial_locomotion_enabled(False)

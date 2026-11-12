@@ -133,6 +133,17 @@ async def _validate(example: object, module: object, report: dict, output: Path,
     preview = report["mode"] == "preview"
     hold = report["control_mode"] == "hold"
     dwell_s = example._gaze_locomotion.config.dwell_s
+    config = example._gaze_locomotion.config
+    report["effective_profile"] = {
+        "speed_scale": example._teleop_speed_scale,
+        "forward_m_s": config.forward_speed,
+        "backward_m_s": config.backward_speed,
+        "yaw_rad_s": config.yaw_speed,
+        "heading_gain": config.heading_gain,
+        "heading_max_yaw_speed": config.heading_max_yaw_speed,
+        "command_attack_s": example._command_attack_time,
+        "command_release_s": example._command_release_time,
+    }
     _require(example._gaze_locomotion.config.preview is preview, "Unexpected preview configuration")
     _require(example._gaze_locomotion.config.control_mode == report["control_mode"], "Wrong gaze control mode")
     _require(example._g1_locomotion == ("stationary" if preview else "policy"), "Wrong robot base topology")
@@ -513,7 +524,10 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                                 entry["max_sampled_heading_error_degrees"] <= 6.0,
                                 "Translation exceeded the 6 degree sampled heading envelope",
                             )
-                _require(entry["planar_displacement_m"] < 1.0, "Short-action fixture exceeded one meter of travel")
+                _require(
+                    entry["planar_displacement_m"] < report["speed_scale"],
+                    "Short-action fixture exceeded its scaled test corridor",
+                )
             entry["passed"] = True
             print(f"Gaze validation: {action} passed ({fixture['elapsed_s']:.2f} simulated seconds)", flush=True)
 
@@ -585,6 +599,7 @@ def main() -> int:
     parser.add_argument("--forward-speed", type=float, default=None, help="m/s; default hold .60, step .20")
     parser.add_argument("--backward-speed", type=float, default=None, help="m/s; default hold .35, step .15")
     parser.add_argument("--yaw-speed", type=float, default=None, help="rad/s; default hold .40, step .25")
+    parser.add_argument("--speed-scale", type=float, default=1.0, help="Multiply base gaze requests once, in [1,3]")
     parser.add_argument(
         "--hold-s", type=float, default=1.5, help="Hold-mode forward/turn fixation after activation, in sim seconds"
     )
@@ -593,6 +608,8 @@ def main() -> int:
     parser.add_argument("--load-timeout", type=float, default=180.0)
     parser.add_argument("--test-timeout", type=float, default=180.0)
     args, kit_args = parser.parse_known_args()
+    if not math.isfinite(args.speed_scale) or not 1.0 <= args.speed_scale <= 3.0:
+        parser.error("--speed-scale must be finite and in [1,3]")
     if args.dwell_s is None:
         args.dwell_s = 0.0 if args.control_mode == "hold" else 0.7
     defaults = (0.60, 0.35, 0.40) if args.control_mode == "hold" else (0.20, 0.15, 0.25)
@@ -623,6 +640,7 @@ def main() -> int:
         "phase": "starting_application",
         "mode": args.mode,
         "control_mode": args.control_mode,
+        "speed_scale": args.speed_scale,
         "dwell_s": args.dwell_s,
         "heading_hold": args.heading_hold == "1",
         "heading_gain": args.heading_gain,
@@ -650,6 +668,7 @@ def main() -> int:
         {
             "G1_GESTURE_WALKING": "1",
             "G1_LOCOMOTION_INPUT": "gaze",
+            "G1_TELEOP_SPEED_SCALE": str(args.speed_scale),
             "G1_POINTING_NAVIGATION": "0",
             "G1_OPTICAL_HANDS_ONLY": "1",
             "G1_WEBCAM_ENABLED": "0",

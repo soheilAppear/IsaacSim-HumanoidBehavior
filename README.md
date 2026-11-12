@@ -460,11 +460,14 @@ $env:G1_GAZE_CONTROLLER_OVERRIDE = '1'
 Load the scene again, click **Play**, and **Start XR** if needed. Look at
 **Forward**, **Back**, **Turn left**, or **Turn right** and keep looking to continue
 that movement. **Look away to stop.** Invalid/lost eye tracking also requests a
-stop; physical braking takes time. The
-default requested hold speeds are **0.60 m/s forward, 0.35 m/s backward, and 0.40 rad/s
-turning**. Actual speed per wall second depends on simulation performance and gait.
-Step mode retains **0.20/0.15 m/s** forward/backward and **0.25 rad/s** turning;
-explicit environment speed overrides are preserved. Startup/reset and recovery from
+stop; physical braking takes time. The launcher's experimental
+`G1_TELEOP_SPEED_SCALE=3` requests **1.80 m/s forward, 1.05 m/s backward, and 1.20 rad/s
+turning** in hold mode. It multiplies the configured baseline speeds once; it does
+not promise three times the measured movement. Actual speed per wall second depends
+on simulation performance and gait. Set `$env:G1_TELEOP_SPEED_SCALE='1'` before
+launching to restore baseline **0.60/0.35 m/s** and **0.40 rad/s** requests. Step mode
+baseline values remain **0.20/0.15 m/s** and **0.25 rad/s**, also multiplied by the
+selected scale. Startup/reset and recovery from
 tracking loss, occlusion, session loss or a callback interruption still require a
 valid look outside all buttons before gaze can activate again. Direct switching
 applies only to uninterrupted valid hold input. Both hands remain available while
@@ -479,7 +482,8 @@ For controller movement, first center both tracked sticks. **Left stick up/down*
 requests forward/backward motion; **left stick left/right** requests sidestepping
 up to **0.30 m/s**; **right stick left/right** turns. Diagonal translation input is
 normalized before applying the directional speed limits. Forward/backward and
-turning use the configured gaze speeds; the separate controller walking profile
+turning use the unscaled gaze settings, normally **0.60/0.35 m/s** and **0.40 rad/s**;
+joystick acceleration is unchanged. The separate controller walking profile
 keeps its existing speeds and layout. Sticks
 override/cancel gaze, including an accepted step. Release or tracking loss requests
 zero; before using gaze again, provide a fresh valid look outside all buttons and
@@ -489,7 +493,16 @@ STICKS**. Neutral mixed hand/controller input does not block gaze.
 The launcher defaults to `G1_OPTICAL_HANDS_ONLY=0` and
 `G1_GAZE_CONTROLLER_OVERRIDE=1`, preserving explicit overrides. Set the first to
 `1` for optical-only manipulation, or the second to `0` for eye-only locomotion.
-These switches are independent. **Direct hold switching passed 1,068 offline tests
+These switches are independent. **Native validation passed all four directions at
+the experimental 3× gaze request profile**, using synthetic gaze and real simulation
+physics. Forward ended its held interval **1.70°** from its initial heading, within
+the **3°** end-of-hold limit; peak sampled error was **4.23°**, so this does not mean
+the heading always stays within 3°. Release/tracking-loss stopping passed. Measured
+mean held speeds were **0.485/0.709 m/s forward/backward** and **0.683/0.702 rad/s
+left/right**. These are achieved speeds in simulation time, not three times baseline
+performance. The run had no payload and does not validate live headset input or box
+carrying. The following gaze measurements predate this faster profile.
+**Direct hold switching passed 1,068 offline tests
 in 15.973 seconds.** A stopped-scene check verified all four panel hit regions and
 24 isolated direction transitions using synthetic input; no synthetic command was
 applied to the robot. Dynamic-physics and headset acceptance of this new transition
@@ -585,6 +598,15 @@ command. The base stays fixed in preview.
 | Pucker lips | Backward |
 | Relax face | Stop request |
 
+The shared launcher speed scale defaults to **3**: facial requests are **0.60 m/s
+forward, 0.45 m/s backward/sideways, and 0.75 rad/s turning**. This increases the
+requested speeds; achieved speed depends on the gait and simulation performance.
+Set `$env:G1_TELEOP_SPEED_SCALE='1'` before launch to restore the previous request
+profile. Joystick peaks and acceleration remain unchanged. Face/gaze translation
+and deliberate turns use a 0.90-second attack at scale 3; gaze Forward/Back heading
+correction uses a 0.10-second response at that scale (0.30 at scale 1).
+Release remains 0.06 seconds.
+
 After checking recognition, exit Isaac and launch
 `.\tools\launch_facial_walking.bat --move`. Facial control starts off until explicitly
 enabled. **FACE ON** selects facial body input; **FACE OFF** restores gaze buttons.
@@ -592,7 +614,8 @@ Both hands remain available, and deliberate joystick input cancels facial contro
 Ordinary two-eye blinks do not select turns. **Switch FACE OFF before speaking**,
 because spoken mouth movements can resemble locomotion expressions.
 
-Hold mode confirms a clear expression for **0.18 seconds**. After both eyes close,
+Hold mode normally confirms a clear expression for **0.18 seconds**; the separately
+calibrated right wink requires **0.50 seconds** even from open eyes. After both eyes close,
 holding only one eye closed can select a turn after a longer **0.5 seconds** of
 continuous confirmation. Brief uneven reopening sends no command, but a prolonged
 uneven blink can resemble this deliberate hold. A clear change to another direction
@@ -620,14 +643,25 @@ repeatability result; reliable left/right wink operation remains unverified. Ear
 attempts began by closing both eyes, which the previous rule blocked. Per-expression
 thresholds are available in the
 [operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
-uses starter thresholds from the local Quest Pro preview observations. They still
-require validation for the wearer and headset fit. After the recognition consistency
-fix, **1,175 offline tests passed** and native physical validation passed all six
-commands with simulated face input. The native run also passed right-wink/mouth
+uses starter thresholds from the local Quest Pro preview observations. Recheck them
+after headset-fit changes. After the recognition consistency
+fix, **1,207 offline tests passed**. Native physical validation passed all six facial
+commands at the **3× request profile** with simulated face input. The native run also passed right-wink/mouth
 overlap, weak-wink rejection, the sustained post-blink wink, forward blink pause/resume,
 and stale-input stopping checks; arm/finger updaters continued throughout. The earlier
 anchored-preview check predates this recognition fix. Reliable real winks and
 simultaneous box carrying remain acceptance checks.
+The approved right-side calibration supplied separate right-eye and right-lip
+settings. A separately approved verification recording contained **2,004 valid
+samples out of 2,004**. Its offline replay, supplied with synthetic XR readiness,
+recognized two right-turn hold activations separated by a pause when the opposite
+eye was no longer clearly open, followed by one right sidestep. Accompanying mouth
+movement during the wink did not trigger a sidestep, and 1,007 neutral samples sent
+no command.
+XR was off during that recording, so this verifies the calibrated recognizer against
+the recorded facial signals rather than end-to-end headset locomotion.
+The separately reported unsolicited Isaac GUI exits remain unresolved; see the
+[recorded exit evidence](HUMANOID_VR_CONTROL.md#isaac-window-exits-unexpectedly).
 
 ### Retained pointing navigation
 

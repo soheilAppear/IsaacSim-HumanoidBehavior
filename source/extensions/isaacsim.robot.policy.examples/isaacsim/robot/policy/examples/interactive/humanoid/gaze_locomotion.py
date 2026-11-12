@@ -36,18 +36,22 @@ def _finite(value: object) -> bool:
 class GazeLocomotionConfig:
     """Configure gaze-selected steps or held movement, with preview enabled by default.
 
+    Speed bounds admit experimental command requests. They do not establish the
+    learned gait's trained envelope; the host must validate its physical profile
+    and supervise measured balance, speed and stopping independently.
+
     Args:
         dwell_s: Continuous wall-time fixation required, from 0 to 5 seconds; zero selects immediately.
         distance_m: Requested projected travel, from 0.01 to 1 meter.
         turn_degrees: Requested signed yaw change, from 1 to 90 degrees.
-        forward_speed: Positive body-forward speed, at most 1 meter per second.
-        backward_speed: Reverse speed magnitude, at most 1 meter per second; zero disables reverse.
+        forward_speed: Positive body-forward request, at most 1.95 meters per second.
+        backward_speed: Reverse request magnitude, at most 1.05 meters per second; zero disables reverse.
         yaw_speed: Positive yaw-speed magnitude, at most 1.5 radians per second.
         preview: Emit selection events and status while keeping every velocity zero.
         max_gaze_gap_s: Largest permitted wall-time gap within a dwell, from 0.05 to 1 second.
         control_mode: ``step`` finishes a measured distance/angle; ``hold`` requires continued fixation.
         heading_hold: Correct measured heading drift during live forward/back translation.
-        heading_gain: Proportional heading-error gain, from 0 to 5 inverse seconds.
+        heading_gain: Proportional heading-error gain, from 0 to 9 inverse seconds.
         heading_max_yaw_speed: Correction cap, from 0 to 0.4 radians per second.
 
     Raises:
@@ -73,11 +77,13 @@ class GazeLocomotionConfig:
             ("dwell_s", 0.0, 5.0),
             ("distance_m", 0.01, 1.0),
             ("turn_degrees", 1.0, 90.0),
-            ("forward_speed", 0.01, 1.0),
-            ("backward_speed", 0.0, 1.0),
+            # Match the host's supported scaling arithmetic: .65 * 3 can be one
+            # representable float above the decimal literal 1.95.
+            ("forward_speed", 0.01, 0.65 * 3.0),
+            ("backward_speed", 0.0, 1.05),
             ("yaw_speed", 0.01, 1.5),
             ("max_gaze_gap_s", 0.05, 1.0),
-            ("heading_gain", 0.0, 5.0),
+            ("heading_gain", 0.0, 9.0),
             ("heading_max_yaw_speed", 0.0, 0.4),
         ):
             value = getattr(self, name)

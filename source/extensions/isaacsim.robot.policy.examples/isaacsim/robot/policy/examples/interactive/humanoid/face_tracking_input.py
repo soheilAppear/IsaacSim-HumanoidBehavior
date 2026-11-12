@@ -176,7 +176,7 @@ class SteamLinkFaceInput:
         *,
         stale_after_s: float = 0.25,
         min_confidence: float = 0.5,
-        max_packets_per_poll: int = 64,
+        max_packets_per_poll: int = 128,
     ) -> None:
         if type(port) is not int or not 0 <= port <= 65535:
             raise ValueError("Face OSC port must be an integer from 0 to 65535")
@@ -339,8 +339,9 @@ class SteamLinkFaceInput:
             if not discard_this_poll:
                 self.ingest_packet(payload, now_s=now)
         else:
-            # Even exactly a full batch is conservatively invalidated. Normal
-            # Steam Link sends several bundles per frame, far below this cap.
+            # Even exactly a full batch is conservatively invalidated. The
+            # default budget covers short Steam Link bursts inside the accepted
+            # callback window; longer interruptions still discard before parsing.
             self._drain_only = True
             self._backlog_count += 1
             self._values.clear()
