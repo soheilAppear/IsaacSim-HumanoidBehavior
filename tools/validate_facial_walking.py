@@ -78,6 +78,13 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
     _require(example._g1_locomotion == ("stationary" if preview else "policy"), "Wrong base topology")
     _require(example._optical_hands_only, "Optical hand profile was not retained")
     _require(not example._pointing_navigation_enabled, "Pointing navigation unexpectedly owns body input")
+    report["effective_heading"] = {
+        "enabled": face.controller.config.heading_hold,
+        "gain": face.controller.config.heading_gain,
+        "max_yaw_speed": face.controller.config.heading_max_yaw_speed,
+        "filter_s": face.controller.config.heading_filter_s,
+    }
+    report["expression_thresholds"] = face.status()["thresholds"]
     fixture = {"elapsed_s": 0.0, "expression": None, "valid": True, "stale": False, "sequence": 0}
     counts = {"facial_updates": 0, "arm_updates": 0, "finger_updates": 0}
     report["updater_calls"] = counts
@@ -308,7 +315,7 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
             counts_before = dict(counts)
             baseline = face.controller.command.activation_count
             fixture["expression"] = action
-            await wait_sim(face.controller.config.confirm_s + 0.05)
+            await wait_sim(face.controller._confirmation_for(action) + 0.05)
             _require(
                 face.controller.command.activation_count == baseline + 1, "Expression did not activate exactly once"
             )
@@ -327,6 +334,15 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
                     _require(command.velocity[2] < 0, "Mouth overlap changed the right-turn direction")
                     _require(not any(command.velocity[:2]), "Mouth overlap added translation to a right turn")
                 entry["mouth_overlap_passed"] = True
+                # A confirmed calibrated wink tolerates small noise in the open
+                # eye without repeating the half-second activation interval.
+                fixture["expression"] = {"EyesClosedL": 0.17, "EyesClosedR": 0.31, "MouthRight": 1.0}
+                await wait_sim(0.10)
+                command = face.controller.command
+                _require(command.busy and command.target == "turn_right", "Opposite-eye noise interrupted right turn")
+                _require(command.activation_count == baseline + 1, "Opposite-eye noise repeated turn activation")
+                fixture["expression"] = {"EyesClosedR": 0.9, "MouthRight": 1.0}
+                entry["right_wink_hysteresis_passed"] = True
             await wait_sim(duration)
             entry["held"] = snapshot()
             _require(face.controller.command.activation_count == baseline + 1, "Held expression repeated activation")
@@ -364,6 +380,12 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
                 _require(command.activation_count == baseline + 1, "Blink recovery counted a new forward activation")
                 if not preview:
                     _require(command.velocity[0] > 0, "Blink recovery did not restore forward intent")
+                    before_heading = entry["held"]["status"]["heading"]["target_yaw_rad"]
+                    resumed_heading = entry["blink_resumed"]["status"]["heading"]["target_yaw_rad"]
+                    _require(
+                        abs((resumed_heading - before_heading + math.pi) % (2 * math.pi) - math.pi) < 1e-6,
+                        "Blink recovery changed the original forward heading",
+                    )
                 entry["blink_pause_resume_passed"] = True
             # The last translation exercises stale input while still holding.
             fixture["stale"] = action == "forward"
@@ -402,6 +424,41 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
                 "turn_right": -yaw_delta,
             }[action]
             if not preview:
+                if action in ("forward", "back", "strafe_left", "strafe_right"):
+                    active_samples = [
+                        start,
+                        held,
+                        *[
+                            sample
+                            for sample in report["motion_samples"]
+                            if start["control_sim_time_s"] <= sample["control_sim_time_s"] <= held["control_sim_time_s"]
+                        ],
+                    ]
+                    entry["held_heading_error_degrees"] = math.degrees(yaw_delta)
+                    entry["max_sampled_heading_error_degrees"] = max(
+                        abs(math.degrees((s["yaw_rad"] - start["yaw_rad"] + math.pi) % (2 * math.pi) - math.pi))
+                        for s in active_samples
+                    )
+                    direction = start["yaw_rad"] + (math.pi / 2 if action.startswith("strafe") else 0)
+                    entry["max_sampled_cross_track_m"] = max(
+                        abs(
+                            -(s["position_m"][0] - start["position_m"][0]) * math.sin(direction)
+                            + (s["position_m"][1] - start["position_m"][1]) * math.cos(direction)
+                        )
+                        for s in active_samples
+                    )
+                    _require(
+                        abs(entry["held_heading_error_degrees"]) <= 3.0,
+                        "Held translation ended more than 3 degrees off heading",
+                    )
+                    _require(
+                        entry["max_sampled_heading_error_degrees"] <= 6.0,
+                        "Held translation exceeded 6 degrees sampled yaw error",
+                    )
+                    _require(
+                        entry["max_sampled_cross_track_m"] <= 0.05,
+                        "Held translation veered more than 5 cm off its starting line",
+                    )
                 _require(
                     entry["signed_progress"] > 0.01,
                     "Physical movement did not make progress in the requested direction",
@@ -549,7 +606,16 @@ def main() -> int:
             "G1_FACE_CONFIRM_S": "0.18",
             "G1_FACE_NEUTRAL_S": "0.25",
             "G1_FACE_ACTIVATION_THRESHOLD": "0.65",
-            "G1_FACE_RELEASE_THRESHOLD": "0.25",
+            "G1_FACE_RELEASE_THRESHOLD": "0.35",
+            "G1_FACE_WINK_THRESHOLD": "0.45",
+            "G1_FACE_RIGHT_WINK_THRESHOLD": "0.30",
+            "G1_FACE_RIGHT_WINK_RELEASE_THRESHOLD": "0.20",
+            "G1_FACE_RIGHT_WINK_CONFIRM_S": "0.50",
+            "G1_FACE_RIGHT_MOUTH_THRESHOLD": "0.55",
+            "G1_FACE_JAW_THRESHOLD": "0.45",
+            "G1_FACE_PUCKER_THRESHOLD": "0.40",
+            "G1_FACE_MOUTH_SIDE_THRESHOLD": "0.45",
+            "G1_FACE_EYE_OPEN_THRESHOLD": "0.15",
         }
     )
     sys.argv = [sys.argv[0], *kit_args]

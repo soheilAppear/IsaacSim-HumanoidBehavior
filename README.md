@@ -495,10 +495,11 @@ The launcher defaults to `G1_OPTICAL_HANDS_ONLY=0` and
 `1` for optical-only manipulation, or the second to `0` for eye-only locomotion.
 These switches are independent. **Native validation passed all four directions at
 the experimental 3× gaze request profile**, using synthetic gaze and real simulation
-physics. Forward ended its held interval **1.70°** from its initial heading, within
-the **3°** end-of-hold limit; peak sampled error was **4.23°**, so this does not mean
-the heading always stays within 3°. Release/tracking-loss stopping passed. Measured
-mean held speeds were **0.485/0.709 m/s forward/backward** and **0.683/0.702 rad/s
+physics. Forward ended its held interval **1.63°** from its initial heading, within
+the **3°** end-of-hold limit; peak sampled error was **3.30°**, so this does not mean
+the heading always stays within 3°. Peak sideways deviation was **3.49 cm forward /
+4.64 cm backward**, within the **5 cm** test envelope. Release/tracking-loss stopping passed. Measured
+mean held speeds were **0.463/0.690 m/s forward/backward** and **0.567/0.693 rad/s
 left/right**. These are achieved speeds in simulation time, not three times baseline
 performance. The run had no payload and does not validate live headset input or box
 carrying. The following gaze measurements predate this faster profile.
@@ -603,9 +604,10 @@ forward, 0.45 m/s backward/sideways, and 0.75 rad/s turning**. This increases th
 requested speeds; achieved speed depends on the gait and simulation performance.
 Set `$env:G1_TELEOP_SPEED_SCALE='1'` before launch to restore the previous request
 profile. Joystick peaks and acceleration remain unchanged. Face/gaze translation
-and deliberate turns use a 0.90-second attack at scale 3; gaze Forward/Back heading
-correction uses a 0.10-second response at that scale (0.30 at scale 1).
-Release remains 0.06 seconds.
+and deliberate turns use a 0.90-second attack at scale 3. Gaze Forward/Back and facial
+forward/back/sideways heading corrections share the scaled heading gain and cap,
+with a 0.05-second error filter and 0.10-second yaw response at that scale
+(0.15/0.30 seconds at scale 1). Release remains 0.06 seconds.
 
 After checking recognition, exit Isaac and launch
 `.\tools\launch_facial_walking.bat --move`. Facial control starts off until explicitly
@@ -623,6 +625,10 @@ uses the normal confirmation interval; you do not have to relax your entire face
 between commands. A deliberate wink takes priority over mouth
 movement that accompanies it. Closing both eyes pauses a held mouth command;
 reopening them while holding the same mouth expression resumes it after confirmation.
+The original translation heading is retained across these blink pauses. A calibrated
+right wink starts only with the left eye clearly open (closure at most 0.15). Once
+active, it permits left-eye closure up to 0.20 so small tracking fluctuations do not
+interrupt the held turn; this extra margin cannot start a new turn.
 Starting a mouth command requires both eyes clearly open. If a partial wink occurs
 with mouth movement, the mouth must relax before it can select a separate command;
 reopening the eyes alone cannot turn that wink's mouth movement into a sidestep.
@@ -645,17 +651,23 @@ thresholds are available in the
 [operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
 uses starter thresholds from the local Quest Pro preview observations. Recheck them
 after headset-fit changes. After the recognition consistency
-fix, **1,207 offline tests passed**. Native physical validation passed all six facial
+and latest heading/wink-continuation fixes, **1,219 offline tests passed**.
+Native physical validation passed all six facial
 commands at the **3× request profile** with simulated face input. The native run also passed right-wink/mouth
-overlap, weak-wink rejection, the sustained post-blink wink, forward blink pause/resume,
-and stale-input stopping checks; arm/finger updaters continued throughout. The earlier
+overlap, continuation hysteresis, weak-wink rejection, the sustained post-blink wink,
+forward blink pause/resume with the original heading retained, and stale-input
+stopping checks; arm/finger updaters continued throughout. Facial Forward's held-end
+heading error was **2.11°**, peak error **2.71°**, and peak sideways deviation **2.70 cm**.
+These passed the **3° held-end / 6° sampled peak / 5 cm cross-track** limits; the run
+does not establish zero drift or repeatable loaded performance. The earlier
 anchored-preview check predates this recognition fix. Reliable real winks and
 simultaneous box carrying remain acceptance checks.
 The approved right-side calibration supplied separate right-eye and right-lip
 settings. A separately approved verification recording contained **2,004 valid
 samples out of 2,004**. Its offline replay, supplied with synthetic XR readiness,
-recognized two right-turn hold activations separated by a pause when the opposite
-eye was no longer clearly open, followed by one right sidestep. Accompanying mouth
+now recognizes one uninterrupted right-turn hold from **9.134 to 17.118 seconds**, then
+one right sidestep at **25.242 seconds**. The continuation margin removes the prior
+brief eye-threshold interruption without weakening the starting condition. Accompanying mouth
 movement during the wink did not trigger a sidestep, and 1,007 neutral samples sent
 no command.
 XR was off during that recording, so this verifies the calibrated recognizer against

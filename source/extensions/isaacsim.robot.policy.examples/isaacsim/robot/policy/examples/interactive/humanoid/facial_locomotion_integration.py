@@ -36,6 +36,7 @@ class FacialLocomotionIntegration:
         if preview not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
             raise ValueError("G1_FACE_PREVIEW must be a boolean")
         speed_scale = host._teleop_speed_scale
+        heading = host._gaze_locomotion.config
         config = FacialLocomotionConfig(
             preview=host._gaze_locomotion.config.preview or preview in ("1", "true", "yes", "on"),
             control_mode=os.environ.get("G1_FACE_MODE", "hold").strip().lower(),
@@ -45,6 +46,13 @@ class FacialLocomotionIntegration:
             backward_speed=float(os.environ.get("G1_FACE_BACKWARD_SPEED", "0.15")) * speed_scale,
             lateral_speed=float(os.environ.get("G1_FACE_LATERAL_SPEED", "0.15")) * speed_scale,
             yaw_speed=float(os.environ.get("G1_FACE_YAW_SPEED", "0.25")) * speed_scale,
+            # Reuse the already validated/scaled heading profile. Each facial
+            # activation recreates its motion engine, so configure the source
+            # controller rather than patching one transient movement instance.
+            heading_hold=heading.heading_hold,
+            heading_gain=heading.heading_gain,
+            heading_max_yaw_speed=heading.heading_max_yaw_speed,
+            heading_filter_s=heading.heading_filter_s,
             activation_threshold=float(os.environ.get("G1_FACE_ACTIVATION_THRESHOLD", "0.65")),
             wink_threshold=(
                 float(os.environ["G1_FACE_WINK_THRESHOLD"]) if "G1_FACE_WINK_THRESHOLD" in os.environ else None
@@ -247,6 +255,7 @@ class FacialLocomotionIntegration:
             "last_action": command.last_action,
             "activation_count": command.activation_count,
             "velocity": command.velocity,
+            "heading": self.controller.heading_status,
             "sample_valid": bool(self.sample is not None and self.sample.valid),
             "sample_reason": self.sample.reason if self.sample is not None else "No sample polled",
             "confidence_upper": self.sample.confidence_upper if self.sample is not None else 0.0,

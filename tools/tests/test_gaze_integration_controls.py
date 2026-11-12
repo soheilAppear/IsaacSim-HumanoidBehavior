@@ -227,6 +227,7 @@ class TestGazeIntegrationControls(unittest.TestCase):
         self.assertAlmostEqual(fast._command_release_time, 0.06)
         self.assertAlmostEqual(fast._gaze_locomotion.config.heading_gain, 9.0)
         self.assertAlmostEqual(fast._gaze_locomotion.config.heading_max_yaw_speed, 0.40)
+        self.assertAlmostEqual(fast._gaze_locomotion.config.heading_filter_s, 0.05)
         self.tick()
         for target, expected in (
             ("forward", (1.80, 0, 0)),
@@ -257,8 +258,10 @@ class TestGazeIntegrationControls(unittest.TestCase):
         )
         self.assertAlmostEqual(baseline._gaze_locomotion.config.heading_gain, 1.0)
         self.assertAlmostEqual(baseline._gaze_locomotion.config.heading_max_yaw_speed, 0.05)
+        self.assertAlmostEqual(baseline._gaze_locomotion.config.heading_filter_s, 0.15)
         self.assertAlmostEqual(fast._gaze_locomotion.config.heading_gain, 3.0)
         self.assertAlmostEqual(fast._gaze_locomotion.config.heading_max_yaw_speed, 0.15)
+        self.assertAlmostEqual(fast._gaze_locomotion.config.heading_filter_s, 0.05)
         capped = self.make_example(
             G1_TELEOP_SPEED_SCALE="3", G1_GAZE_HEADING_GAIN="5.0", G1_GAZE_HEADING_MAX_YAW_SPEED="0.4"
         )
@@ -339,7 +342,10 @@ class TestGazeIntegrationControls(unittest.TestCase):
         self.tick("forward")
         self.ex._teleop_input_dt = 0.03
         # Keep a stale active gaze command while another source owns the input.
-        self.ex._facial_input = types.SimpleNamespace(enabled=True)
+        self.ex._facial_input = types.SimpleNamespace(
+            enabled=True,
+            controller=types.SimpleNamespace(command=types.SimpleNamespace(state="active", target="turn_left")),
+        )
         self.ex._smooth_base_command(torch.tensor([0, 0, 0.75]), 0.005)
         self.assertAlmostEqual(float(self.ex._base_command[2]), 0.75 * (1 - math.exp(-0.03 / 0.90)), places=6)
         self.ex._base_command[:] = 0

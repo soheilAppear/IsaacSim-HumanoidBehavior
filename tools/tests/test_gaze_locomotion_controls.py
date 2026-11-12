@@ -68,6 +68,7 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.assertEqual((config.dwell_s, config.distance_m, config.turn_degrees), (0.7, 0.2, 10))
         self.assertEqual((config.forward_speed, config.backward_speed, config.yaw_speed), (0.20, 0.15, 0.25))
         self.assertEqual((config.heading_hold, config.heading_gain, config.heading_max_yaw_speed), (True, 3.0, 0.15))
+        self.assertEqual(config.heading_filter_s, 0.15)
         self.assertEqual(GAZE.GazeLocomotion().command.velocity, (0, 0, 0))
 
     def test_configuration_rejects_nonfinite_boolean_and_out_of_range_values(self) -> None:
@@ -81,6 +82,7 @@ class TestGazeLocomotionControls(unittest.TestCase):
             "max_gaze_gap_s": (0.049, 1.01),
             "heading_gain": (-0.01, 9.01),
             "heading_max_yaw_speed": (-0.01, 0.401),
+            "heading_filter_s": (0.019, 1.001),
         }
         for field, invalid in ranges.items():
             for value in (*invalid, math.nan, math.inf, -math.inf, True, False, None, "1"):
@@ -104,6 +106,67 @@ class TestGazeLocomotionControls(unittest.TestCase):
         self.assertEqual(self.tick("forward").state, "awaiting_release")
         self.assertEqual(self.tick().state, "idle")
         self.assertEqual(self.tick("forward").progress, 0)
+
+    def test_restored_hold_heading_corrects_drift_without_changing_measured_pose(self) -> None:
+        for action in ("forward", "back"):
+            with self.subTest(action=action):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(replace(self.config, control_mode="hold", dwell_s=0))
+                self.pose = (1.0, 2.0, math.radians(4))
+                self.tick()
+                self.tick(action)
+                self.assertTrue(self.controller.restore_hold_heading(2 * math.pi))
+                result = self.tick(action)
+                self.assertLess(result.velocity[2], 0)
+                self.assertAlmostEqual(self.controller.heading_status["target_yaw_rad"], 0)
+                self.assertEqual(self.pose, (1.0, 2.0, math.radians(4)))
+                self.assertEqual(result.activation_count, 1)
+
+    def test_restore_hold_heading_cannot_change_step_turn_preview_or_idle(self) -> None:
+        for mode, preview, action, enabled in (
+            ("step", False, "forward", True),
+            ("hold", True, "forward", True),
+            ("hold", False, "turn_right", True),
+            ("hold", False, "forward", False),
+        ):
+            with self.subTest(mode=mode, preview=preview, action=action, enabled=enabled):
+                self.setUp()
+                self.controller = GAZE.GazeLocomotion(
+                    replace(self.config, control_mode=mode, preview=preview, dwell_s=0, heading_hold=enabled)
+                )
+                self.assertFalse(self.controller.restore_hold_heading(1.0))
+                self.tick()
+                self.tick(action)
+                self.assertFalse(self.controller.restore_hold_heading(1.0))
+        for invalid in (math.nan, math.inf, -math.inf, True, None, "0"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.controller.restore_hold_heading(invalid)
+
+    def test_faster_heading_filter_reacts_earlier_without_changing_yaw_cap(self) -> None:
+        responses = []
+        for filter_s in (0.15, 0.05):
+            self.setUp()
+            self.controller = GAZE.GazeLocomotion(
+                replace(
+                    self.config,
+                    control_mode="hold",
+                    dwell_s=0,
+                    heading_filter_s=filter_s,
+                    heading_gain=9,
+                    heading_max_yaw_speed=0.4,
+                )
+            )
+            self.tick()
+            self.tick("forward")
+            self.pose = (0.1, 0, math.radians(3))
+            result = self.tick("forward", dt=0.02)
+            responses.append(result.velocity[2])
+            self.assertEqual(result.velocity[0], self.config.forward_speed)
+            for _ in range(20):
+                result = self.tick("forward", pose=(0.1, 0, 1.0))
+                self.assertGreaterEqual(result.velocity[2], -0.4)
+        self.assertLess(responses[1], responses[0])
+        self.assertLess(responses[1], 0)
 
     def test_experimental_threefold_hold_requests_preserve_preview_and_loss_stop(self) -> None:
         expected = {

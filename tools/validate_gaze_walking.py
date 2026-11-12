@@ -141,6 +141,7 @@ async def _validate(example: object, module: object, report: dict, output: Path,
         "yaw_rad_s": config.yaw_speed,
         "heading_gain": config.heading_gain,
         "heading_max_yaw_speed": config.heading_max_yaw_speed,
+        "heading_filter_s": config.heading_filter_s,
         "command_attack_s": example._command_attack_time,
         "command_release_s": example._command_release_time,
     }
@@ -515,6 +516,13 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                         entry["max_sampled_heading_correction_rad_s"] = max(
                             abs(sample["status"]["heading"]["correction_rad_s"]) for sample in active_samples
                         )
+                        entry["max_sampled_cross_track_m"] = max(
+                            abs(
+                                -(sample["position_m"][0] - start["position_m"][0]) * math.sin(start["yaw_rad"])
+                                + (sample["position_m"][1] - start["position_m"][1]) * math.cos(start["yaw_rad"])
+                            )
+                            for sample in active_samples
+                        )
                         if report["heading_hold"]:
                             _require(
                                 abs(entry["held_heading_error_degrees"]) <= 3.0,
@@ -523,6 +531,10 @@ async def _validate(example: object, module: object, report: dict, output: Path,
                             _require(
                                 entry["max_sampled_heading_error_degrees"] <= 6.0,
                                 "Translation exceeded the 6 degree sampled heading envelope",
+                            )
+                            _require(
+                                entry["max_sampled_cross_track_m"] <= 0.05,
+                                "Translation veered more than 5 cm off its starting line",
                             )
                 _require(
                     entry["planar_displacement_m"] < report["speed_scale"],

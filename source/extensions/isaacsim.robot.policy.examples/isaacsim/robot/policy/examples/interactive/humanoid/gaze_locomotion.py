@@ -53,6 +53,7 @@ class GazeLocomotionConfig:
         heading_hold: Correct measured heading drift during live forward/back translation.
         heading_gain: Proportional heading-error gain, from 0 to 9 inverse seconds.
         heading_max_yaw_speed: Correction cap, from 0 to 0.4 radians per second.
+        heading_filter_s: Simulation-time heading-error filter, from 0.02 to 1 second.
 
     Raises:
         ValueError: A setting is nonfinite, has the wrong type, or is outside its range.
@@ -70,6 +71,7 @@ class GazeLocomotionConfig:
     heading_hold: bool = True
     heading_gain: float = 3.0
     heading_max_yaw_speed: float = 0.15
+    heading_filter_s: float = 0.15
 
     def __post_init__(self) -> None:
         """Reject invalid configuration before any input can produce a command."""
@@ -85,6 +87,7 @@ class GazeLocomotionConfig:
             ("max_gaze_gap_s", 0.05, 1.0),
             ("heading_gain", 0.0, 9.0),
             ("heading_max_yaw_speed", 0.0, 0.4),
+            ("heading_filter_s", 0.02, 1.0),
         ):
             value = getattr(self, name)
             if not _finite(value) or not lower <= value <= upper:
@@ -150,7 +153,6 @@ class GazeLocomotion:
     SETTLE_PEAK_LINEAR_SPEED_M_S = 0.15
     SETTLE_PEAK_YAW_SPEED_RAD_S = 0.30
     HEADING_DEADBAND_RAD = math.radians(0.5)
-    HEADING_FILTER_S = 0.15
 
     def __init__(self, config: GazeLocomotionConfig | None = None) -> None:
         if config is not None and not isinstance(config, GazeLocomotionConfig):
@@ -192,6 +194,37 @@ class GazeLocomotion:
     def heading_status(self) -> dict:
         """Return current translation feedback; this never changes a root pose."""
         return dict(self._heading_status)
+
+    def restore_hold_heading(self, yaw: float) -> bool:
+        """Restore a held translation's direction after a temporary input pause.
+
+        Facial control uses this after reconfirming the same mouth gesture so
+        an ordinary blink does not accept accumulated yaw drift as a new heading.
+        Only the control reference changes; measured poses and step goals do not.
+
+        Args:
+            yaw: Finite heading in the motion engine's planar movement frame.
+
+        Returns:
+            Whether a physical held translation accepted the reference.
+
+        Raises:
+            ValueError: The reference is not a finite real heading.
+        """
+        if not _finite(yaw):
+            raise ValueError("Held heading reference must be finite")
+        if (
+            self.config.preview
+            or not self.config.heading_hold
+            or self.config.control_mode != "hold"
+            or self._action not in ("forward", "back")
+            or self._start_pose is None
+        ):
+            return False
+        wrapped_yaw = (float(yaw) + math.pi) % (2.0 * math.pi) - math.pi
+        self._start_pose = (self._start_pose[0], self._start_pose[1], wrapped_yaw)
+        self._clear_heading()
+        return True
 
     def _clear_heading(self) -> None:
         """Discard the filter and correction when no translation owns heading."""
@@ -285,7 +318,7 @@ class GazeLocomotion:
         target_yaw = self._start_pose[2]
         error = (target_yaw - pose[2] + math.pi) % (2.0 * math.pi) - math.pi
         increment = (error - self._filtered_heading_error + math.pi) % (2.0 * math.pi) - math.pi
-        alpha = -math.expm1(-dt / self.HEADING_FILTER_S)
+        alpha = -math.expm1(-dt / self.config.heading_filter_s)
         self._filtered_heading_error = (self._filtered_heading_error + alpha * increment + math.pi) % (
             2.0 * math.pi
         ) - math.pi

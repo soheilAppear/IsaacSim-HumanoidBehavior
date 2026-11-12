@@ -55,9 +55,13 @@ class FacialLocomotionConfig:
         backward_speed: Reverse request magnitude, at most 0.45 meters per second.
         lateral_speed: Sidestep request magnitude, at most 0.45 meters per second.
         yaw_speed: Turning request magnitude, at most 0.75 radians per second.
+        heading_hold: Correct measured heading drift during forward, reverse and sideways requests.
+        heading_gain: Proportional heading-error gain, from 0 to 9 inverse seconds.
+        heading_max_yaw_speed: Heading-correction cap, from 0 to 0.4 radians per second.
+        heading_filter_s: Heading-error filter time constant, from 0.02 to 1 simulation second.
         activation_threshold: Minimum expression weight to begin confirmation.
         wink_threshold: Optional eye-closure activation threshold; None uses the shared threshold.
-        right_wink_threshold: Optional right-eye activation override; a lower calibration requires the left eye clearly open.
+        right_wink_threshold: Optional right-eye activation override; a lower calibration requires the left eye clearly open to start.
         right_wink_release_threshold: Optional right-eye release override; None uses release_threshold.
         right_wink_confirm_s: Optional right-wink confirmation duration; None uses confirm_s.
         jaw_threshold: Optional jaw-opening activation threshold; None uses the shared threshold.
@@ -84,6 +88,10 @@ class FacialLocomotionConfig:
     backward_speed: float = 0.15
     lateral_speed: float = 0.15
     yaw_speed: float = 0.25
+    heading_hold: bool = True
+    heading_gain: float = 3.0
+    heading_max_yaw_speed: float = 0.15
+    heading_filter_s: float = 0.15
     activation_threshold: float = 0.65
     wink_threshold: float | None = None
     right_wink_threshold: float | None = None
@@ -105,6 +113,8 @@ class FacialLocomotionConfig:
         """Validate settings before any gesture can request movement."""
         if type(self.preview) is not bool:
             raise ValueError("preview must be a boolean")
+        if type(self.heading_hold) is not bool:
+            raise ValueError("heading_hold must be a boolean")
         if self.control_mode not in ("hold", "step"):
             raise ValueError("control_mode must be hold or step")
         for name, lower, upper in (
@@ -114,6 +124,9 @@ class FacialLocomotionConfig:
             ("backward_speed", 0.01, 0.45),
             ("lateral_speed", 0.01, 0.45),
             ("yaw_speed", 0.01, 0.75),
+            ("heading_gain", 0.0, 9.0),
+            ("heading_max_yaw_speed", 0.0, 0.4),
+            ("heading_filter_s", 0.02, 1.0),
             ("activation_threshold", 0.40, 1.0),
             ("release_threshold", 0.0, 0.50),
             ("eye_open_threshold", 0.0, 0.35),
@@ -250,6 +263,10 @@ class FacialLocomotion:
                 forward_speed=config.lateral_speed if lateral else config.forward_speed,
                 backward_speed=config.lateral_speed if lateral else config.backward_speed,
                 yaw_speed=config.yaw_speed,
+                heading_hold=config.heading_hold,
+                heading_gain=config.heading_gain,
+                heading_max_yaw_speed=config.heading_max_yaw_speed,
+                heading_filter_s=config.heading_filter_s,
                 preview=config.preview,
                 max_gaze_gap_s=config.max_sample_age_s,
                 control_mode=config.control_mode,
@@ -265,6 +282,7 @@ class FacialLocomotion:
         self._wink_confirmed = False
         self._blink_blocked = False
         self._hold_paused_action: str | None = None
+        self._hold_paused_heading_yaw: float | None = None
         self._mouth_armed = False
 
     def _clear_hold_candidate(self) -> None:
@@ -359,12 +377,14 @@ class FacialLocomotion:
             return self.config.right_wink_confirm_s
         return self.config.confirm_s
 
-    def _opposite_eye_limit(self, action: str) -> float:
+    def _opposite_eye_limit(self, action: str, *, continuing: bool = False) -> float:
         """Keep a lowered right-wink activation distinct from partial bilateral closure.
 
         Shared/default thresholds already separate activation from the opposite
         eye's release band. A lower independent right threshold can overlap that
-        band, so its opposite left eye must instead pass the clear-eye gate.
+        band, so its opposite left eye must instead pass the clear-eye gate to
+        start. An already confirmed hold permits small fluctuations up to the
+        calibrated release band; that hysteresis never authorizes a new wink.
         """
         opposite = "EyesClosedR" if action == "turn_left" else "EyesClosedL"
         limit = self._release_for(opposite)
@@ -375,7 +395,9 @@ class FacialLocomotion:
         ):
             # Retain a nonoverlapping band even if the configurable eye-open
             # threshold is later raised above the calibrated activation.
-            limit = min(limit, self.config.eye_open_threshold, self._release_for("EyesClosedR"))
+            limit = min(limit, self._release_for("EyesClosedR"))
+            if not continuing:
+                limit = min(limit, self.config.eye_open_threshold)
         return limit
 
     def _eyes_clearly_open(self, values: dict[str, float]) -> bool:
@@ -533,7 +555,7 @@ class FacialLocomotion:
         ):
             threshold = self._release_for(closed) if continuing == action else self._threshold_for(action)
             closed_enough = values[closed] > threshold if continuing == action else values[closed] >= threshold
-            if closed_enough and values[opened] <= self._opposite_eye_limit(action):
+            if closed_enough and values[opened] <= self._opposite_eye_limit(action, continuing=continuing == action):
                 return action
         return None
 
@@ -552,6 +574,22 @@ class FacialLocomotion:
             if expressive and all(values[name] <= low for name in REQUIRED_WEIGHTS[2:] if name not in names):
                 return action
         return None
+
+    def _remember_mouth_pause(self, action: str) -> None:
+        """Keep the original world heading while a held mouth command is paused."""
+        if self._hold_paused_action != action or self._hold_paused_heading_yaw is None:
+            status = self._motion.heading_status
+            heading = status.get("target_yaw_rad")
+            if status.get("active") and _finite(heading):
+                # Sideways commands reuse a forward/backward engine whose frame
+                # is rotated +pi/2. Store world yaw and reapply that offset only
+                # when restoring the same sideways command.
+                self._hold_paused_heading_yaw = heading - (
+                    math.pi / 2 if action in ("strafe_left", "strafe_right") else 0.0
+                )
+            else:
+                self._hold_paused_heading_yaw = None
+        self._hold_paused_action = action
 
     def _update_hold(self, values: dict[str, float], *, fresh: bool, **motion) -> FacialLocomotionCommand:
         """Resolve held gestures without allowing a transient to permanently lock them out."""
@@ -597,13 +635,13 @@ class FacialLocomotion:
             if preserve_mouth:
                 # One eyelid often leads an ordinary blink. Retain the mouth
                 # request until a deliberate wink actually completes confirmation.
-                self._hold_paused_action = current
+                self._remember_mouth_pause(current)
         elif preserve_mouth:
+            self._remember_mouth_pause(current)
             if self._action is not None:
                 self._advance_motion(held=False, release_immediately=True, **motion)
                 if self.command.state == "fault":
                     return self.command
-            self._hold_paused_action = current
             self._clear_hold_candidate()
             return self._publish(
                 "blink_pause", "Open both eyes to resume the held mouth command", target=current, stop_immediately=True
@@ -624,6 +662,7 @@ class FacialLocomotion:
         resuming = desired is not None and desired == self._hold_paused_action
         if not resuming and not preserve_mouth:
             self._hold_paused_action = None
+            self._hold_paused_heading_yaw = None
         if desired is None:
             self._clear_hold_candidate()
             state = "idle" if eyes_open and mouth_neutral else "confirming"
@@ -666,12 +705,16 @@ class FacialLocomotion:
                 stop_immediately=old_action is not None,
             )
         self._action = desired
+        resume_heading = self._hold_paused_heading_yaw if resuming else None
         self._hold_paused_action = None
+        self._hold_paused_heading_yaw = None
         self._clear_hold_candidate()
         if desired.startswith("turn"):
             self._blink_blocked = False
             self._mouth_armed = mouth_neutral
-        return self._advance_motion(activating=True, count_activation=not resuming, **motion)
+        return self._advance_motion(
+            activating=True, count_activation=not resuming, restore_heading_yaw=resume_heading, **motion
+        )
 
     @staticmethod
     def _movement_pose(
@@ -693,6 +736,7 @@ class FacialLocomotion:
         yaw_speed_rad_s: float,
         activating: bool = False,
         count_activation: bool = True,
+        restore_heading_yaw: float | None = None,
         held: bool = True,
         release_immediately: bool = False,
     ) -> FacialLocomotionCommand:
@@ -717,6 +761,15 @@ class FacialLocomotion:
             return self._inhibit(result.detail, fault=True)
         if activating and result.activated_action is None:
             return self._inhibit("Valid measured robot pose and speeds are required")
+        if activating and restore_heading_yaw is not None:
+            movement_heading = restore_heading_yaw + (math.pi / 2 if action in ("strafe_left", "strafe_right") else 0.0)
+            if not self._motion.restore_hold_heading(movement_heading):
+                return self._inhibit("Could not restore the paused movement heading; return to neutral")
+            # Recompute against the retained reference on this resume update.
+            # This only requests actor velocity; it does not change measured pose.
+            result = self._motion.update(target=target, **arguments)
+            if result.state == "fault":
+                return self._inhibit(result.detail, fault=True)
         if activating and count_activation:
             self._last_action = action
             self._activation_count += 1

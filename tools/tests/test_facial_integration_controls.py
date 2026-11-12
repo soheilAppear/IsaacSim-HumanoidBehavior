@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import types
 import unittest
@@ -27,6 +28,9 @@ class TestFacialIntegrationControls(unittest.TestCase):
             "G1_GAZE_MODE": "hold",
             "G1_GAZE_CONTROLLER_OVERRIDE": "0",
             "G1_GAZE_DWELL_S": "0",
+            "G1_GAZE_HEADING_HOLD": "1",
+            "G1_GAZE_HEADING_GAIN": "3.0",
+            "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.15",
             "G1_FACE_ENABLED": "1",
             "G1_FACE_PREVIEW": "1" if preview else "0",
             "G1_FACE_MODE": "hold",
@@ -126,6 +130,13 @@ class TestFacialIntegrationControls(unittest.TestCase):
         for value in (self.ex._base_command, self.ex._controller_command, self.ex._keyboard_command):
             np.testing.assert_array_equal(value.numpy(), (0, 0, 0))
 
+    def use_fast_profile(self) -> None:
+        """Install constructor-derived faster controllers on the ready input fixture."""
+        fast = self.make_example(G1_TELEOP_SPEED_SCALE="3")
+        for name in ("_teleop_speed_scale", "_command_attack_time", "_command_release_time", "_gaze_locomotion"):
+            setattr(self.ex, name, getattr(fast, name))
+        self.ex._facial_input.controller = fast._facial_input.controller
+
     def test_face_owns_body_while_gaze_buttons_are_bypassed(self) -> None:
         self.ex._update_gaze_locomotion = Mock()
         command = self.activate(JawDrop=0.9)
@@ -157,6 +168,95 @@ class TestFacialIntegrationControls(unittest.TestCase):
         self.assertEqual(config.right_mouth_threshold, 0.55)
         self.assertTrue(calibrated._hand_tracking_arm_control_enabled)
         self.assertTrue(calibrated._finger_control_enabled)
+
+    def test_face_inherits_effective_heading_profile_and_disable_setting(self) -> None:
+        for overrides, expected in (
+            ({}, (True, 3.0, 0.15)),
+            ({"G1_TELEOP_SPEED_SCALE": "3"}, (True, 9.0, 0.40)),
+            (
+                {"G1_TELEOP_SPEED_SCALE": "3", "G1_GAZE_HEADING_GAIN": "1", "G1_GAZE_HEADING_MAX_YAW_SPEED": "0.05"},
+                (True, 3.0, 0.15),
+            ),
+            ({"G1_GAZE_HEADING_HOLD": "0"}, (False, 3.0, 0.15)),
+        ):
+            with self.subTest(overrides=overrides):
+                example = self.make_example(**overrides)
+                config = example._facial_input.controller.config
+                self.assertEqual(config.heading_hold, expected[0])
+                self.assertAlmostEqual(config.heading_gain, expected[1])
+                self.assertAlmostEqual(config.heading_max_yaw_speed, expected[2])
+                self.assertAlmostEqual(config.heading_filter_s, 0.15 / example._teleop_speed_scale)
+
+    def test_face_translations_correct_heading_with_fast_yaw_and_original_translation_ramp(self) -> None:
+        for action, weights, translation in (
+            ("forward", {"JawDrop": 0.9}, (0.60, 0)),
+            ("back", {"LipPuckerL": 0.9, "LipPuckerR": 0.9}, (-0.45, 0)),
+            ("strafe_left", {"MouthLeft": 0.9}, (0, 0.45)),
+            ("strafe_right", {"MouthRight": 0.9}, (0, -0.45)),
+        ):
+            with self.subTest(action=action):
+                self.setUp()
+                self.use_fast_profile()
+                self.activate(**weights)
+                self.ex._get_g1_base_pose_for_arms.return_value = (Gf.Vec3d(0, 0, 0.8), 0.10)
+                for _ in range(120):
+                    command = self.tick(**weights)
+                self.assertEqual(command.target, action)
+                np.testing.assert_allclose(command.velocity, (*translation, -0.40))
+                heading = self.ex.facial_locomotion_status()["heading"]
+                self.assertTrue(heading["active"])
+                self.assertAlmostEqual(heading["error_rad"], -0.10)
+                self.assertAlmostEqual(heading["correction_rad_s"], -0.40)
+                self.ex._teleop_input_dt = 0.03
+                self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+                np.testing.assert_allclose(
+                    self.ex._base_command.numpy(),
+                    (
+                        *[value * (1 - math.exp(-0.03 / 0.90)) for value in translation],
+                        -0.40 * (1 - math.exp(-0.03 / 0.10)),
+                    ),
+                    rtol=1e-6,
+                )
+                before_release = self.ex._base_command.clone()
+                self.tick()
+                self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+                np.testing.assert_allclose(
+                    self.ex._base_command.numpy(), before_release.numpy() * math.exp(-0.03 / 0.06), rtol=1e-6
+                )
+                self.valid = False
+                self.tick()
+                self.assert_zero_buffers()
+
+    def test_face_explicit_turn_keeps_deliberate_turn_ramp(self) -> None:
+        self.use_fast_profile()
+        self.activate(EyesClosedL=0.9)
+        self.assertFalse(self.ex.facial_locomotion_status()["heading"]["active"])
+        self.ex._teleop_input_dt = 0.03
+        self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(), (0, 0, 0.75 * (1 - math.exp(-0.03 / 0.90))), rtol=1e-6
+        )
+
+    def test_stale_face_heading_cannot_change_joystick_or_disabled_face_response(self) -> None:
+        self.use_fast_profile()
+        self.activate(JawDrop=0.9)
+        self.assertTrue(self.ex._facial_input.controller.heading_status["active"])
+        self.ex._teleop_input_dt = 0.03
+        # Keep old active face state but give a tracked stick explicit ownership.
+        self.ex._hybrid_locomotion.select(
+            controller_present=True, controller_valid=True, controller_state="active", sticks_deflected=True
+        )
+        self.ex._smooth_base_command(torch.tensor([0.60, 0, 0.40]), 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(), np.asarray((0.60, 0, 0.40)) * (1 - math.exp(-0.03 / 0.30)), rtol=1e-6
+        )
+        self.ex._base_command[:] = 0
+        self.ex._facial_input.enabled = False
+        self.ex._hybrid_locomotion.reset()
+        self.ex._smooth_base_command(torch.tensor([0, 0, 1.20]), 0.005)
+        np.testing.assert_allclose(
+            self.ex._base_command.numpy(), (0, 0, 1.20 * (1 - math.exp(-0.03 / 0.90))), rtol=1e-6
+        )
 
     def test_disabled_face_falls_through_to_existing_gaze_dispatch(self) -> None:
         self.ex.set_facial_locomotion_enabled(False)

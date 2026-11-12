@@ -108,6 +108,8 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.assertEqual(config.eye_open_threshold, 0.15)
         self.assertEqual(config.post_blink_wink_confirm_s, 0.5)
         self.assertEqual((config.distance_m, config.turn_degrees), (0.15, 10))
+        self.assertEqual((config.heading_hold, config.heading_gain, config.heading_max_yaw_speed), (True, 3.0, 0.15))
+        self.assertEqual(config.heading_filter_s, 0.15)
         self.assertEqual(
             (config.forward_speed, config.backward_speed, config.lateral_speed, config.yaw_speed),
             (0.20, 0.15, 0.15, 0.25),
@@ -122,6 +124,9 @@ class TestFacialLocomotionControls(unittest.TestCase):
             "backward_speed": (0, 0.451),
             "lateral_speed": (0, 0.451),
             "yaw_speed": (0, 0.751),
+            "heading_gain": (-0.01, 9.01),
+            "heading_max_yaw_speed": (-0.01, 0.401),
+            "heading_filter_s": (0.019, 1.001),
             "activation_threshold": (0.39, 1.01),
             "release_threshold": (-0.01, 0.51),
             "eye_open_threshold": (-0.01, 0.351),
@@ -146,6 +151,9 @@ class TestFacialLocomotionControls(unittest.TestCase):
             replace(self.config, confirm_s=0.4, post_blink_wink_confirm_s=0.3)
         with self.assertRaises(ValueError):
             replace(self.config, preview=1)
+        for value in (None, 0, 1, "false"):
+            with self.subTest(heading_hold=value), self.assertRaises(ValueError):
+                replace(self.config, heading_hold=value)
         with self.assertRaises(TypeError):
             FACE.FacialLocomotion({})
 
@@ -282,12 +290,13 @@ class TestFacialLocomotionControls(unittest.TestCase):
                         right_mouth_threshold=0.55,
                     )
                     self.neutral()
-                    for _ in range(20):
-                        result = self.tick({"EyesClosedL": 0.34, "EyesClosedR": 0.31, "MouthRight": mouth})
-                        self.assertEqual(result.activation_count, 0)
-                        self.assertFalse(any(result.velocity))
+                    for left in (0.16, 0.20, 0.34):
+                        for _ in range(20):
+                            result = self.tick({"EyesClosedL": left, "EyesClosedR": 0.31, "MouthRight": mouth})
+                            self.assertEqual(result.activation_count, 0)
+                            self.assertFalse(any(result.velocity))
 
-    def test_calibrated_active_right_wink_stops_when_left_eye_is_no_longer_clear(self) -> None:
+    def test_calibrated_active_right_wink_tolerates_small_left_noise_but_stops_above_release(self) -> None:
         self.use_config(
             wink_threshold=0.45,
             release_threshold=0.35,
@@ -300,11 +309,21 @@ class TestFacialLocomotionControls(unittest.TestCase):
         for _ in range(11):
             result = self.tick({"EyesClosedL": 0.14, "EyesClosedR": 0.31, "MouthRight": 1.0})
         self.assertEqual(result.activated_action, "turn_right")
-        result = self.tick({"EyesClosedL": 0.16, "EyesClosedR": 0.31, "MouthRight": 1.0})
+        for left in (0.155, 0.16, 0.20):
+            result = self.tick({"EyesClosedL": left, "EyesClosedR": 0.31, "MouthRight": 1.0})
+            self.assertEqual(result.velocity, (0, 0, -self.config.yaw_speed))
+            self.assertEqual(result.activation_count, 1)
+            self.assertIsNone(result.activated_action)
+        result = self.tick({"EyesClosedL": 0.201, "EyesClosedR": 0.31, "MouthRight": 1.0})
         self.assertEqual(result.velocity, (0, 0, 0))
         self.assertTrue(result.stop_immediately)
         for _ in range(12):
             result = self.tick({"EyesClosedL": 0.34, "EyesClosedR": 0.31, "MouthRight": 1.0})
+            self.assertEqual(result.activation_count, 1)
+            self.assertFalse(any(result.velocity))
+        # Returning only to the continuation band cannot restart a stopped wink.
+        for _ in range(12):
+            result = self.tick({"EyesClosedL": 0.16, "EyesClosedR": 0.31, "MouthRight": 1.0})
             self.assertEqual(result.activation_count, 1)
             self.assertFalse(any(result.velocity))
 
@@ -904,6 +923,87 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.assertGreater(result.velocity[2], 0)
         self.assertLessEqual(result.velocity[2], 0.15)
         self.assertEqual(result.velocity[:2], (0, 0.15))
+
+    def test_configured_heading_feedback_preserves_each_translation_axis_and_cap(self) -> None:
+        for action in ("forward", "back", "strafe_left", "strafe_right"):
+            with self.subTest(action=action):
+                self.setUp()
+                self.use_config(heading_gain=9.0, heading_max_yaw_speed=0.4)
+                activation = self.activate(action)
+                self.pose = (0, 0, -0.2)
+                for _ in range(20):
+                    result = self.tick(action)
+                    self.assertLessEqual(result.velocity[2], 0.4)
+                    self.assertEqual(result.velocity[:2], activation.velocity[:2])
+                self.assertEqual(result.velocity[2], 0.4)
+                self.assertTrue(self.controller.heading_status["active"])
+                self.assertAlmostEqual(self.controller.heading_status["error_rad"], 0.2)
+
+    def test_face_heading_can_be_disabled_without_affecting_deliberate_turns(self) -> None:
+        for settings in ({"heading_hold": False}, {"heading_gain": 0.0}, {"heading_max_yaw_speed": 0.0}):
+            with self.subTest(settings=settings):
+                self.setUp()
+                self.use_config(**settings)
+                self.activate("strafe_left")
+                self.pose = (0, 0, -0.2)
+                for _ in range(10):
+                    self.assertEqual(self.tick("strafe_left").velocity, (0, 0.15, 0))
+        self.setUp()
+        self.use_config(heading_gain=9.0, heading_max_yaw_speed=0.4)
+        self.activate("turn_right")
+        self.pose = (0, 0, 0.2)
+        self.assertEqual(self.tick("turn_right").velocity, (0, 0, -0.25))
+        self.assertFalse(self.controller.heading_status["active"])
+
+    def test_face_heading_filter_setting_controls_response(self) -> None:
+        corrections = {}
+        for seconds in (0.05, 0.15):
+            self.setUp()
+            self.use_config(heading_filter_s=seconds, heading_max_yaw_speed=0.4)
+            self.activate("forward")
+            self.pose = (0, 0, -0.1)
+            corrections[seconds] = self.tick("forward").velocity[2]
+        self.assertGreater(corrections[0.05], corrections[0.15])
+        self.assertGreater(corrections[0.15], 0)
+
+    def test_repeated_mouth_blinks_preserve_original_heading_including_wrap_and_strafe_frame(self) -> None:
+        for action in ("forward", "back", "strafe_left", "strafe_right"):
+            with self.subTest(action=action):
+                self.setUp()
+                self.use_config(heading_gain=9.0, heading_max_yaw_speed=0.4)
+                self.pose = (0, 0, math.radians(179))
+                self.activate(action)
+                original = self.controller.heading_status["target_yaw_rad"]
+                for yaw in (math.radians(-179), math.radians(-176)):
+                    self.tick({**EXPRESSIONS[action], "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+                    self.pose = (0, 0, yaw)
+                    for _ in range(5):
+                        result = self.tick(action)
+                    restored = self.controller.heading_status["target_yaw_rad"]
+                    difference = (restored - original + math.pi) % (2 * math.pi) - math.pi
+                    self.assertAlmostEqual(difference, 0.0)
+                    self.assertLess(result.velocity[2], 0)
+                    self.assertEqual(result.activation_count, 1)
+                    self.assertIsNone(result.activated_action)
+
+    def test_paused_heading_is_discarded_by_neutral_direction_change_and_invalid_input(self) -> None:
+        for transition in ("neutral", "direction", "invalid"):
+            with self.subTest(transition=transition):
+                self.setUp()
+                self.activate("forward")
+                self.tick({"JawDrop": 0.9, "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+                self.pose = (0, 0, 0.3)
+                if transition == "invalid":
+                    self.tick(valid=False)
+                    self.neutral()
+                elif transition == "neutral":
+                    self.tick()
+                action = "back" if transition == "direction" else "forward"
+                for _ in range(5):
+                    result = self.tick(action)
+                self.assertEqual(result.activated_action, action)
+                self.assertAlmostEqual(self.controller.heading_status["target_yaw_rad"], 0.3)
+                self.assertEqual(result.velocity[2], 0)
 
     def test_step_wink_fires_only_when_reopened(self) -> None:
         self.use_config(control_mode="step")

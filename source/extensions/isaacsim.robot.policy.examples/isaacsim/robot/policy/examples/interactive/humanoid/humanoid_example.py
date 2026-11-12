@@ -4194,6 +4194,16 @@ class HumanoidExample(BaseSample):
             and self._gaze_locomotion.command.target in ("forward", "back")
             and self._gaze_locomotion.config.heading_hold
         )
+        face = self._facial_input
+        facial_heading_correction = (
+            self._gaze_walking_enabled
+            and face is not None
+            and face.enabled
+            and self._hybrid_locomotion.selection.source != "controller"
+            and face.controller.command.state == "active"
+            and face.controller.command.target in ("forward", "back", "strafe_left", "strafe_right")
+            and face.controller.heading_status["active"]
+        )
         if self._gesture_locomotion_enabled:
             # The wrist joystick arrives in wall time, just like arm input. Using
             # simulation time here multiplied its delay in a slow VR session.
@@ -4211,9 +4221,10 @@ class HumanoidExample(BaseSample):
             )
             # Heading feedback corrects an observed error, so its yaw component
             # responds faster as translation requests increase. Translation and
-            # deliberate turns keep their slower scaled ramp; stale gaze cannot
-            # affect a different input owner's command. Scale 1 stays unchanged.
-            axis_attack = 0.30 / self._teleop_speed_scale if axis == 2 and gaze_heading_correction else attack
+            # deliberate turns keep their slower scaled ramp; stale gaze/face
+            # state cannot affect a different owner. Scale 1 stays unchanged.
+            heading_correction = gaze_heading_correction or facial_heading_correction
+            axis_attack = 0.30 / self._teleop_speed_scale if axis == 2 and heading_correction else attack
             alpha = 1.0 - math.exp(-max(float(dt), 0.0) / (release if decelerating else axis_attack))
             current[axis] = current[axis] + (target_axis - current[axis]) * alpha
 
@@ -8365,6 +8376,7 @@ class HumanoidExample(BaseSample):
             heading_hold=heading_hold in ("1", "true", "yes", "on"),
             heading_gain=min(9.0, heading_gain * self._teleop_speed_scale),
             heading_max_yaw_speed=min(0.4, heading_cap * self._teleop_speed_scale),
+            heading_filter_s=0.15 / self._teleop_speed_scale,
         )
         if (
             config.forward_speed > 0.65 * self._teleop_speed_scale
