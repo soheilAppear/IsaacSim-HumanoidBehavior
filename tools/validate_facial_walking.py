@@ -85,6 +85,7 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
         "filter_s": face.controller.config.heading_filter_s,
     }
     report["expression_thresholds"] = face.status()["thresholds"]
+    report["facial_command_attack_s"] = face.command_attack_s
     fixture = {"elapsed_s": 0.0, "expression": None, "valid": True, "stale": False, "sequence": 0}
     counts = {"facial_updates": 0, "arm_updates": 0, "finger_updates": 0}
     report["updater_calls"] = counts
@@ -311,7 +312,7 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
             duration = report["back_hold_s"] if action == "back" else report["hold_s"]
             entry = {"action": action, "passed": False, "start": snapshot(), "hold_s": duration}
             report["actions"].append(entry)
-            preflight(action, entry["start"], duration)
+            preflight(action, entry["start"], duration + 0.40)
             counts_before = dict(counts)
             baseline = face.controller.command.activation_count
             fixture["expression"] = action
@@ -351,6 +352,45 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
             _require(
                 counts["finger_updates"] > counts_before["finger_updates"], "Finger updater stopped during locomotion"
             )
+            # A briefly mixed signal must stop, then recover the already-held
+            # command without requiring a different expression or full neutral.
+            # The clean recovery samples deliberately stay below activation and
+            # above release: they continue known intent, never start a new one.
+            weak_hold = {
+                "forward": {"JawDrop": 0.40},
+                "back": {"LipPuckerL": 0.37, "LipPuckerR": 0.37},
+                "strafe_left": {"MouthLeft": 0.40},
+                "strafe_right": {"MouthRight": 0.40},
+                "turn_left": {"EyesClosedL": 0.40},
+                "turn_right": {"EyesClosedR": 0.26},
+            }[action]
+            ambiguous = dict(weak_hold)
+            if action.startswith("turn"):
+                ambiguous["EyesClosedR" if action == "turn_left" else "EyesClosedL"] = (
+                    0.25 if action == "turn_left" else 0.21
+                )
+            else:
+                ambiguous.update(EyesClosedL=0.20, EyesClosedR=0.20)
+                ambiguous["JawDrop" if action.startswith("strafe") else "MouthRight"] = 0.36
+            fixture["expression"] = ambiguous
+            await wait_sim(0.05)
+            entry["ambiguous_hold"] = snapshot()
+            _require(not any(face.controller.command.velocity), "Ambiguous hold retained a movement request")
+            _require(
+                not any(float(value) for value in example._base_command), "Ambiguous hold retained filtered movement"
+            )
+            fixture["expression"] = weak_hold
+            await wait_sim(0.05)
+            _require(not any(face.controller.command.velocity), "Interrupted hold resumed before fresh confirmation")
+            await wait_sim(face.controller._confirmation_for(action) + 0.05)
+            entry["same_hold_recovered"] = snapshot()
+            command = face.controller.command
+            _require(command.busy and command.target == action, "Clean same expression remained locked out")
+            _require(command.activation_count == baseline + 1, "Recovery incorrectly counted a new gesture")
+            if not preview:
+                _require(any(command.velocity), "Recovered hold did not restore physical intent")
+            fixture["expression"] = action
+            entry["same_hold_recovery_passed"] = True
             if action == "forward":
                 # An ordinary blink pauses the request. Holding the same mouth
                 # expression through reopening resumes it after confirmation,
@@ -423,6 +463,9 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
                 "turn_left": yaw_delta,
                 "turn_right": -yaw_delta,
             }[action]
+            entry["held_duration_s"] = held["control_sim_time_s"] - start["control_sim_time_s"]
+            entry["mean_signed_held_speed"] = entry["signed_progress"] / entry["held_duration_s"]
+            entry["speed_units"] = "rad/s" if action.startswith("turn") else "m/s"
             if not preview:
                 if action in ("forward", "back", "strafe_left", "strafe_right"):
                     active_samples = [

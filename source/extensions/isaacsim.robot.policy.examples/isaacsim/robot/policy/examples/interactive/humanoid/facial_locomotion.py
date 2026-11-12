@@ -547,17 +547,42 @@ class FacialLocomotion:
         elif self._eyes_clearly_open(values):
             self._blink_blocked = False
 
-    def _hold_wink(self, values: dict[str, float], *, continuing: str | None = None) -> str | None:
+    def _hold_wink(
+        self,
+        values: dict[str, float],
+        *,
+        continuing: str | None = None,
+        resuming: str | None = None,
+    ) -> str | None:
         """Select only a clear unilateral closure, independently of lower-face cross-talk."""
         for action, closed, opened in (
             ("turn_left", "EyesClosedL", "EyesClosedR"),
             ("turn_right", "EyesClosedR", "EyesClosedL"),
         ):
-            threshold = self._release_for(closed) if continuing == action else self._threshold_for(action)
-            closed_enough = values[closed] > threshold if continuing == action else values[closed] >= threshold
+            established = action in (continuing, resuming)
+            threshold = self._release_for(closed) if established else self._threshold_for(action)
+            closed_enough = values[closed] > threshold if established else values[closed] >= threshold
             if closed_enough and values[opened] <= self._opposite_eye_limit(action, continuing=continuing == action):
                 return action
         return None
+
+    def _expression_still_held(self, values: dict[str, float], action: str | None) -> bool:
+        """Retain established intent through conflicts, never through its actual release.
+
+        Other channels can temporarily make output ambiguous. They must stop
+        movement, but cannot erase a still-held command and force an unrelated
+        expression to recover it. This predicate alone never permits movement;
+        normal classification and fresh-sample confirmation remain required.
+        """
+        names = {
+            "turn_left": ("EyesClosedL",),
+            "turn_right": ("EyesClosedR",),
+            "forward": ("JawDrop",),
+            "back": ("LipPuckerL", "LipPuckerR"),
+            "strafe_left": ("MouthLeft",),
+            "strafe_right": ("MouthRight",),
+        }.get(action)
+        return names is not None and all(values[name] > self._release_for(name) for name in names)
 
     def _hold_mouth(self, values: dict[str, float], *, continuing: str | None = None) -> str | None:
         """Require one mouth command while ignoring eye channels for blink-paused intent."""
@@ -614,13 +639,18 @@ class FacialLocomotion:
                 self._neutral_since_s = None
             return self._publish(
                 "idle" if self._neutral_ready else "awaiting_neutral",
-                "Ready for one deliberate expression" if self._neutral_ready else "Relax your face with both eyes open",
+                (
+                    "Ready for one deliberate expression"
+                    if self._neutral_ready
+                    else "Relax your face with both eyes open"
+                ),
             )
 
         current = self._action or self._hold_paused_action
-        wink = self._hold_wink(values, continuing=self._action)
+        still_held = self._expression_still_held(values, current)
+        wink = self._hold_wink(values, continuing=self._action, resuming=self._hold_paused_action)
         mouth = self._hold_mouth(values, continuing=current)
-        preserve_mouth = current is not None and not current.startswith("turn") and mouth == current and not eyes_open
+        preserve_mouth = still_held and not current.startswith("turn")
         if not eyes_open and not mouth_neutral and not preserve_mouth:
             # A newly arriving mouth signal during eye closure may be wink
             # cross-talk. Do not let it turn into translation on reopening. An
@@ -632,37 +662,36 @@ class FacialLocomotion:
             desired = wink
             if self._action in ("turn_left", "turn_right"):
                 self._mouth_armed = mouth_neutral
-            if preserve_mouth:
-                # One eyelid often leads an ordinary blink. Retain the mouth
-                # request until a deliberate wink actually completes confirmation.
-                self._remember_mouth_pause(current)
-        elif preserve_mouth:
-            self._remember_mouth_pause(current)
-            if self._action is not None:
-                self._advance_motion(held=False, release_immediately=True, **motion)
-                if self.command.state == "fault":
-                    return self.command
-            self._clear_hold_candidate()
-            return self._publish(
-                "blink_pause", "Open both eyes to resume the held mouth command", target=current, stop_immediately=True
-            )
-        elif eyes_open and self._mouth_armed:
+        elif eyes_open and (self._mouth_armed or (preserve_mouth and mouth == current)):
             desired = mouth
         else:
             desired = None
 
         if self._action is not None and desired == self._action:
             return self._advance_motion(**motion)
+        if still_held:
+            # Preserve identity before stopping the engine, which clears its
+            # heading reference. A temporary conflicting mouth channel during
+            # a blink must not convert an existing hold into a new-mouth lockout.
+            if preserve_mouth:
+                self._remember_mouth_pause(current)
+            else:
+                self._hold_paused_action = current
+                self._hold_paused_heading_yaw = None
+        else:
+            self._hold_paused_action = None
+            self._hold_paused_heading_yaw = None
         old_action = self._action
         if old_action is not None:
             # Clear the previous velocity before confirming a different direction.
-            self._advance_motion(held=False, release_immediately=desired is not None or not eyes_open, **motion)
+            self._advance_motion(
+                held=False,
+                release_immediately=desired is not None or not eyes_open,
+                **motion,
+            )
             if self.command.state == "fault":
                 return self.command
         resuming = desired is not None and desired == self._hold_paused_action
-        if not resuming and not preserve_mouth:
-            self._hold_paused_action = None
-            self._hold_paused_heading_yaw = None
         if desired is None:
             self._clear_hold_candidate()
             state = "idle" if eyes_open and mouth_neutral else "confirming"
@@ -677,10 +706,16 @@ class FacialLocomotion:
                 detail = "Open both eyes before a new mouth command, or make one clear wink"
             elif eyes_open and not self._mouth_armed:
                 detail = "Relax your mouth after eye closure before a new mouth command"
+            if self._hold_paused_action is not None:
+                if not eyes_open:
+                    state = "blink_pause"
+                detail = "Paused by a conflicting expression; make the held command clear to resume"
             return self._publish(
                 state,
                 detail,
-                stop_immediately=old_action is not None and not (eyes_open and mouth_neutral),
+                target=self._hold_paused_action,
+                stop_immediately=self._hold_paused_action is not None
+                or (old_action is not None and not (eyes_open and mouth_neutral)),
             )
         if not fresh:
             return self._publish("confirming", "Waiting for a fresh expression sample", target=desired)
@@ -698,7 +733,7 @@ class FacialLocomotion:
                 (
                     "Hold this unilateral wink longer after the blink"
                     if post_blink_wink
-                    else "Reconfirming the held mouth command" if resuming else "Hold one deliberate expression briefly"
+                    else ("Reconfirming the held expression" if resuming else "Hold one deliberate expression briefly")
                 ),
                 target=desired,
                 progress=elapsed / confirmation_s,
@@ -713,7 +748,10 @@ class FacialLocomotion:
             self._blink_blocked = False
             self._mouth_armed = mouth_neutral
         return self._advance_motion(
-            activating=True, count_activation=not resuming, restore_heading_yaw=resume_heading, **motion
+            activating=True,
+            count_activation=not resuming,
+            restore_heading_yaw=resume_heading,
+            **motion,
         )
 
     @staticmethod

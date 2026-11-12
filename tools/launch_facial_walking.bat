@@ -15,6 +15,8 @@ if not defined G1_FACE_FORWARD_SPEED set "G1_FACE_FORWARD_SPEED=0.20"
 if not defined G1_FACE_BACKWARD_SPEED set "G1_FACE_BACKWARD_SPEED=0.15"
 if not defined G1_FACE_LATERAL_SPEED set "G1_FACE_LATERAL_SPEED=0.15"
 if not defined G1_FACE_YAW_SPEED set "G1_FACE_YAW_SPEED=0.25"
+REM Facial holds use a prompt command ramp without changing gaze or joystick response.
+if not defined G1_FACE_COMMAND_ATTACK_S set "G1_FACE_COMMAND_ATTACK_S=0.30"
 REM Starter thresholds from this Quest Pro's preview observations. Recheck after
 REM changing headset fit; these remain overridable and are not a reliability claim.
 if not defined G1_FACE_WINK_THRESHOLD set "G1_FACE_WINK_THRESHOLD=0.45"

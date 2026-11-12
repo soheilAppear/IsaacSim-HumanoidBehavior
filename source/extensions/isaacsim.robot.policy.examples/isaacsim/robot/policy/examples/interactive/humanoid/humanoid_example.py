@@ -4186,6 +4186,18 @@ class HumanoidExample(BaseSample):
             # Stick peaks remain unscaled, so their established acceleration
             # should remain unchanged too. Facial arming resets hybrid ownership.
             attack /= self._teleop_speed_scale
+        face = self._facial_input
+        facial_command_active = (
+            self._gaze_walking_enabled
+            and face is not None
+            and face.enabled
+            and self._hybrid_locomotion.selection.source != "controller"
+            and face.controller.command.state == "active"
+        )
+        if facial_command_active:
+            # Facial holds need a prompt onset after recognition. This setting
+            # belongs to the active facial owner, leaving gaze and sticks alone.
+            attack = face.command_attack_s
         gaze_heading_correction = (
             self._gaze_walking_enabled
             and (self._facial_input is None or not self._facial_input.enabled)
@@ -4194,13 +4206,8 @@ class HumanoidExample(BaseSample):
             and self._gaze_locomotion.command.target in ("forward", "back")
             and self._gaze_locomotion.config.heading_hold
         )
-        face = self._facial_input
         facial_heading_correction = (
-            self._gaze_walking_enabled
-            and face is not None
-            and face.enabled
-            and self._hybrid_locomotion.selection.source != "controller"
-            and face.controller.command.state == "active"
+            facial_command_active
             and face.controller.command.target in ("forward", "back", "strafe_left", "strafe_right")
             and face.controller.heading_status["active"]
         )
@@ -4221,8 +4228,8 @@ class HumanoidExample(BaseSample):
             )
             # Heading feedback corrects an observed error, so its yaw component
             # responds faster as translation requests increase. Translation and
-            # deliberate turns keep their slower scaled ramp; stale gaze/face
-            # state cannot affect a different owner. Scale 1 stays unchanged.
+            # deliberate turns keep their owner's attack setting; stale gaze/face
+            # state cannot affect a different owner.
             heading_correction = gaze_heading_correction or facial_heading_correction
             axis_attack = 0.30 / self._teleop_speed_scale if axis == 2 and heading_correction else attack
             alpha = 1.0 - math.exp(-max(float(dt), 0.0) / (release if decelerating else axis_attack))

@@ -179,6 +179,9 @@ class TestFacialSceneControls(unittest.TestCase):
         ):
             self.scene.update_facial(self.command("confirming", action, 0.5))
             self.assertEqual(self.status_label(), label)
+        for action, label in (("turn_left", "OPEN R EYE"), ("turn_right", "OPEN L EYE")):
+            self.scene.update_facial(self.command("blink_pause", action, 0.0))
+            self.assertEqual(self.status_label(), label)
 
     def test_facial_updates_preserve_meshes_and_bindings_without_resync(self) -> None:
         def geometry() -> dict:

@@ -40,6 +40,7 @@ class TestFacialIntegrationControls(unittest.TestCase):
             "G1_FACE_BACKWARD_SPEED": "0.15",
             "G1_FACE_LATERAL_SPEED": "0.15",
             "G1_FACE_YAW_SPEED": "0.25",
+            "G1_FACE_COMMAND_ATTACK_S": "0.30",
             "G1_OPTICAL_HANDS_ONLY": "0",
             "G1_GRASP_MODE": "physical",
             "G1_WEBCAM_ENABLED": "0",
@@ -187,7 +188,24 @@ class TestFacialIntegrationControls(unittest.TestCase):
                 self.assertAlmostEqual(config.heading_max_yaw_speed, expected[2])
                 self.assertAlmostEqual(config.heading_filter_s, 0.15 / example._teleop_speed_scale)
 
-    def test_face_translations_correct_heading_with_fast_yaw_and_original_translation_ramp(self) -> None:
+    def test_face_command_attack_is_bounded_and_reported(self) -> None:
+        for value in ("0.10", "0.30", "0.65", "1.0"):
+            with self.subTest(value=value):
+                example = self.make_example(G1_FACE_COMMAND_ATTACK_S=value)
+                self.assertEqual(example._facial_input.command_attack_s, float(value))
+                self.assertEqual(example.facial_locomotion_status()["command_attack_s"], float(value))
+        for value in ("bad", "", "nan", "inf", "-inf", "0.09", "1.01"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "G1_FACE_COMMAND_ATTACK_S"):
+                    self.make_example(G1_FACE_COMMAND_ATTACK_S=value)
+
+    def test_face_command_attack_defaults_without_a_launcher(self) -> None:
+        with patch.dict(os.environ):
+            os.environ.pop("G1_FACE_COMMAND_ATTACK_S", None)
+            integration = FACIAL_INTEGRATION.FacialLocomotionIntegration(self.ex)
+        self.assertEqual(integration.command_attack_s, 0.30)
+
+    def test_face_translations_use_prompt_onset_and_keep_faster_heading_correction(self) -> None:
         for action, weights, translation in (
             ("forward", {"JawDrop": 0.9}, (0.60, 0)),
             ("back", {"LipPuckerL": 0.9, "LipPuckerR": 0.9}, (-0.45, 0)),
@@ -212,7 +230,7 @@ class TestFacialIntegrationControls(unittest.TestCase):
                 np.testing.assert_allclose(
                     self.ex._base_command.numpy(),
                     (
-                        *[value * (1 - math.exp(-0.03 / 0.90)) for value in translation],
+                        *[value * (1 - math.exp(-0.03 / 0.30)) for value in translation],
                         -0.40 * (1 - math.exp(-0.03 / 0.10)),
                     ),
                     rtol=1e-6,
@@ -227,15 +245,31 @@ class TestFacialIntegrationControls(unittest.TestCase):
                 self.tick()
                 self.assert_zero_buffers()
 
-    def test_face_explicit_turn_keeps_deliberate_turn_ramp(self) -> None:
+    def test_face_explicit_turn_uses_facial_attack_without_heading_ramp(self) -> None:
         self.use_fast_profile()
         self.activate(EyesClosedL=0.9)
         self.assertFalse(self.ex.facial_locomotion_status()["heading"]["active"])
         self.ex._teleop_input_dt = 0.03
         self.ex._smooth_base_command(self.ex._controller_command, 0.005)
         np.testing.assert_allclose(
-            self.ex._base_command.numpy(), (0, 0, 0.75 * (1 - math.exp(-0.03 / 0.90))), rtol=1e-6
+            self.ex._base_command.numpy(), (0, 0, 0.75 * (1 - math.exp(-0.03 / 0.30))), rtol=1e-6
         )
+
+    def test_custom_face_attack_changes_only_the_active_facial_ramp(self) -> None:
+        self.use_fast_profile()
+        self.ex._facial_input.command_attack_s = 0.65
+        self.activate(EyesClosedL=0.9)
+        self.ex._teleop_input_dt = 0.03
+        self.ex._smooth_base_command(self.ex._controller_command, 0.005)
+        self.assertAlmostEqual(float(self.ex._base_command[2]), 0.75 * (1 - math.exp(-0.03 / 0.65)), places=6)
+
+        # Invalid input removes active ownership; an old facial setting cannot
+        # accelerate a later non-facial command through the common filter.
+        self.valid = False
+        self.tick()
+        self.assertNotEqual(self.ex._facial_input.controller.command.state, "active")
+        self.ex._smooth_base_command(torch.tensor([0, 0, 1.20]), 0.005)
+        self.assertAlmostEqual(float(self.ex._base_command[2]), 1.20 * (1 - math.exp(-0.03 / 0.90)), places=6)
 
     def test_stale_face_heading_cannot_change_joystick_or_disabled_face_response(self) -> None:
         self.use_fast_profile()

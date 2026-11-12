@@ -603,8 +603,12 @@ The shared launcher speed scale defaults to **3**: facial requests are **0.60 m/
 forward, 0.45 m/s backward/sideways, and 0.75 rad/s turning**. This increases the
 requested speeds; achieved speed depends on the gait and simulation performance.
 Set `$env:G1_TELEOP_SPEED_SCALE='1'` before launch to restore the previous request
-profile. Joystick peaks and acceleration remain unchanged. Face/gaze translation
-and deliberate turns use a 0.90-second attack at scale 3. Gaze Forward/Back and facial
+profile. Joystick peaks and acceleration remain unchanged. Facial translation and
+deliberate turns now use a **0.30-second command attack** to respond sooner after
+recognition; `G1_FACE_COMMAND_ATTACK_S` accepts 0.10–1.0 seconds. This changes the
+command ramp, not the requested speed limits, and does not establish an increase
+in measured physical speed. Gaze keeps its 0.90-second attack at scale 3 and its
+existing speeds. Gaze Forward/Back and facial
 forward/back/sideways heading corrections share the scaled heading gain and cap,
 with a 0.05-second error filter and 0.10-second yaw response at that scale
 (0.15/0.30 seconds at scale 1). Release remains 0.06 seconds.
@@ -622,7 +626,11 @@ holding only one eye closed can select a turn after a longer **0.5 seconds** of
 continuous confirmation. Brief uneven reopening sends no command, but a prolonged
 uneven blink can resemble this deliberate hold. A clear change to another direction
 uses the normal confirmation interval; you do not have to relax your entire face
-between commands. A deliberate wink takes priority over mouth
+between commands. If conflicting signals interrupt an already held expression,
+movement pauses. Keep that expression held and make it clear again to reconfirm
+and resume; switching to a different expression is unnecessary. True release
+cancels the held command, and invalid tracking still requires neutral recovery.
+A deliberate wink takes priority over mouth
 movement that accompanies it. Closing both eyes pauses a held mouth command;
 reopening them while holding the same mouth expression resumes it after confirmation.
 The original translation heading is retained across these blink pauses. A calibrated
@@ -650,18 +658,18 @@ attempts began by closing both eyes, which the previous rule blocked. Per-expres
 thresholds are available in the
 [operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
 uses starter thresholds from the local Quest Pro preview observations. Recheck them
-after headset-fit changes. After the recognition consistency
-and latest heading/wink-continuation fixes, **1,219 offline tests passed**.
-Native physical validation passed all six facial
-commands at the **3× request profile** with simulated face input. The native run also passed right-wink/mouth
-overlap, continuation hysteresis, weak-wink rejection, the sustained post-blink wink,
-forward blink pause/resume with the original heading retained, and stale-input
-stopping checks; arm/finger updaters continued throughout. Facial Forward's held-end
-heading error was **2.11°**, peak error **2.71°**, and peak sideways deviation **2.70 cm**.
-These passed the **3° held-end / 6° sampled peak / 5 cm cross-track** limits; the run
-does not establish zero drift or repeatable loaded performance. The earlier
-anchored-preview check predates this recognition fix. Reliable real winks and
-simultaneous box carrying remain acceptance checks.
+after headset-fit changes. The current hold-recovery and facial-onset version passed
+**1,228 offline tests** and native physical checks for **all six facial commands**
+at the 3× request profile with a **0.30-second attack**. Each direction paused on
+ambiguity and resumed the same held expression after confirmation. Arm and finger
+updaters each ran **10,904 times**. Translation stayed within the **3° held-end /
+6° sampled peak / 5 cm cross-track** limits; Forward measured **0.99° / 2.50° /
+3.42 cm**. The route used one-second holds and a 2.5-second backward hold (the
+initial 1.5-second route was refused for insufficient lateral clearance beside the
+table; collision checks stayed enabled). These simulated-input checks do not
+establish a measured speed increase, repeatable wearer recognition, or box carrying.
+The live zero-command balance limitation remains unresolved; see the
+[operator validation record](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks).
 The approved right-side calibration supplied separate right-eye and right-lip
 settings. A separately approved verification recording contained **2,004 valid
 samples out of 2,004**. Its offline replay, supplied with synthetic XR readiness,

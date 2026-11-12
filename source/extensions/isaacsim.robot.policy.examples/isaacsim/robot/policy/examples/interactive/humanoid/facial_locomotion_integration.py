@@ -35,6 +35,12 @@ class FacialLocomotionIntegration:
         preview = os.environ.get("G1_FACE_PREVIEW", "1").strip().lower()
         if preview not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
             raise ValueError("G1_FACE_PREVIEW must be a boolean")
+        try:
+            self.command_attack_s = float(os.environ.get("G1_FACE_COMMAND_ATTACK_S", "0.30"))
+        except ValueError as error:
+            raise ValueError("G1_FACE_COMMAND_ATTACK_S must be a finite number from 0.10 to 1.0 seconds") from error
+        if not math.isfinite(self.command_attack_s) or not 0.10 <= self.command_attack_s <= 1.0:
+            raise ValueError("G1_FACE_COMMAND_ATTACK_S must be a finite number from 0.10 to 1.0 seconds")
         speed_scale = host._teleop_speed_scale
         heading = host._gaze_locomotion.config
         config = FacialLocomotionConfig(
@@ -285,6 +291,7 @@ class FacialLocomotionIntegration:
                 "neutral_s": self.controller.config.neutral_s,
             },
             "speed_scale": self.host._teleop_speed_scale,
+            "command_attack_s": self.command_attack_s,
             "speeds": {
                 "forward_m_s": self.controller.config.forward_speed,
                 "backward_m_s": self.controller.config.backward_speed,

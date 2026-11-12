@@ -344,10 +344,11 @@ class TestGazeIntegrationControls(unittest.TestCase):
         # Keep a stale active gaze command while another source owns the input.
         self.ex._facial_input = types.SimpleNamespace(
             enabled=True,
+            command_attack_s=0.30,
             controller=types.SimpleNamespace(command=types.SimpleNamespace(state="active", target="turn_left")),
         )
         self.ex._smooth_base_command(torch.tensor([0, 0, 0.75]), 0.005)
-        self.assertAlmostEqual(float(self.ex._base_command[2]), 0.75 * (1 - math.exp(-0.03 / 0.90)), places=6)
+        self.assertAlmostEqual(float(self.ex._base_command[2]), 0.75 * (1 - math.exp(-0.03 / 0.30)), places=6)
         self.ex._base_command[:] = 0
         self.ex._facial_input = None
         self.ex._hybrid_locomotion.select(

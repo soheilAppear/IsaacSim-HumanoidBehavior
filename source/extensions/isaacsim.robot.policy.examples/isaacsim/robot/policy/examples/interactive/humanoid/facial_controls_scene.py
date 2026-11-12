@@ -28,6 +28,8 @@ class FacialControlsScene(GazeControlsScene):
         "face_confirm": ("HOLD FACE", "dwelling"),
         "face_unavailable": ("NO FACE DATA", "no_eye"),
         "blink_pause": ("OPEN EYES", "dwelling"),
+        "face_pause_turn_left": ("OPEN R EYE", "dwelling"),
+        "face_pause_turn_right": ("OPEN L EYE", "dwelling"),
         "face_confirm_turn_left": ("HOLD L WINK", "dwelling"),
         "face_confirm_turn_right": ("HOLD R WINK", "dwelling"),
         "face_confirm_forward": ("HOLD MOUTH", "dwelling"),
@@ -137,6 +139,8 @@ class FacialControlsScene(GazeControlsScene):
         }.get(command.state, command.state)
         if command.state == "confirming" and command.target in self._ACTION_LABELS:
             state = f"face_confirm_{command.target}"
+        elif command.state == "blink_pause" and command.target in ("turn_left", "turn_right"):
+            state = f"face_pause_{command.target}"
         self.update(
             {
                 "state": state,

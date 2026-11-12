@@ -909,12 +909,141 @@ class TestFacialLocomotionControls(unittest.TestCase):
             self.assertEqual(result.velocity, (0, 0, 0))
 
     def test_hold_has_no_distance_or_time_deadline(self) -> None:
+        for action in EXPRESSIONS:
+            with self.subTest(action=action):
+                self.setUp()
+                activated = self.activate(action)
+                for index in range(300):
+                    self.pose = (index * 0.03, 0, 0)
+                    result = self.tick(action)
+                    self.assertEqual(result.state, "active")
+                    self.assertEqual(result.velocity, activated.velocity)
+                    self.assertEqual(result.activation_count, 1)
+                    self.assertIsNone(result.activated_action)
+
+    def test_all_established_holds_recover_after_ambiguity_inside_release_band(
+        self,
+    ) -> None:
+        for action in EXPRESSIONS:
+            with self.subTest(action=action):
+                self.setUp()
+                activated = self.activate(action)
+                held = dict.fromkeys(EXPRESSIONS[action], 0.4)
+                if action.startswith("turn"):
+                    opposite = "EyesClosedR" if action == "turn_left" else "EyesClosedL"
+                    ambiguous = {**held, opposite: 0.3, "MouthRight": 0.9}
+                else:
+                    other = "MouthRight" if action == "forward" else "JawDrop"
+                    ambiguous = {**held, other: 0.26, "EyesClosedR": 0.2}
+                for _ in range(6):
+                    paused = self.tick(ambiguous)
+                    self.assertFalse(any(paused.velocity))
+                    self.assertEqual(paused.target, action)
+                    self.assertTrue(paused.stop_immediately)
+                for _ in range(4):
+                    pending = self.tick(held)
+                    self.assertFalse(any(pending.velocity))
+                    self.assertEqual(pending.activation_count, 1)
+                resumed = self.tick(held)
+                self.assertEqual(resumed.velocity, activated.velocity)
+                self.assertEqual(resumed.activation_count, 1)
+                self.assertIsNone(resumed.activated_action)
+
+    def test_calibrated_right_hold_recovers_without_requiring_activation_weight_again(
+        self,
+    ) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+        )
+        self.neutral()
+        for _ in range(11):
+            result = self.tick({"EyesClosedR": 0.31, "EyesClosedL": 0.14, "MouthRight": 1})
+        self.assertEqual(result.activated_action, "turn_right")
+        paused = self.tick({"EyesClosedR": 0.26, "EyesClosedL": 0.21, "MouthRight": 1})
+        self.assertFalse(any(paused.velocity))
+        # Resume must pass the strict opposite-eye start gate, not the active
+        # continuation hysteresis; a new .26 closure cannot activate on its own.
+        for _ in range(15):
+            result = self.tick({"EyesClosedR": 0.26, "EyesClosedL": 0.16, "MouthRight": 1})
+            self.assertFalse(any(result.velocity))
+        for _ in range(10):
+            result = self.tick({"EyesClosedR": 0.26, "EyesClosedL": 0.14, "MouthRight": 1})
+            self.assertFalse(any(result.velocity))
+        result = self.tick({"EyesClosedR": 0.26, "EyesClosedL": 0.14, "MouthRight": 1})
+        self.assertEqual(result.velocity, (0, 0, -self.config.yaw_speed))
+        self.assertEqual(result.activation_count, 1)
+        self.assertIsNone(result.activated_action)
+
+    def test_pending_recovery_requires_distinct_fresh_samples(self) -> None:
         self.activate("forward")
-        for index in range(250):
-            self.pose = (index * 0.03, 0, 0)
+        self.tick({"JawDrop": 0.9, "MouthRight": 0.3, "EyesClosedR": 0.2})
+        for _ in range(20):
+            result = self.tick("forward", fresh=False)
+            self.assertFalse(any(result.velocity))
+        for _ in range(4):
+            self.assertFalse(any(self.tick("forward").velocity))
+        self.assertGreater(self.tick("forward").velocity[0], 0)
+
+    def test_mouth_conflict_then_blink_preserves_heading_and_resumes_same_hold(
+        self,
+    ) -> None:
+        self.activate("forward")
+        conflict = {"JawDrop": 0.9, "MouthRight": 0.3}
+        self.assertFalse(any(self.tick(conflict).velocity))
+        for _ in range(4):
+            result = self.tick({**conflict, "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+            self.assertEqual(result.target, "forward")
+            self.assertFalse(any(result.velocity))
+        self.pose = (0, 0, 0.2)
+        for _ in range(5):
             result = self.tick("forward")
-        self.assertEqual(result.state, "active")
         self.assertGreater(result.velocity[0], 0)
+        self.assertLess(result.velocity[2], 0)
+        self.assertAlmostEqual(self.controller.heading_status["target_yaw_rad"], 0)
+        self.assertEqual(result.activation_count, 1)
+
+    def test_real_release_or_invalid_tracking_discards_each_paused_hold(self) -> None:
+        for action in EXPRESSIONS:
+            for invalid in (False, True):
+                with self.subTest(action=action, invalid=invalid):
+                    self.setUp()
+                    self.activate(action)
+                    if action.startswith("turn"):
+                        opposite = "EyesClosedR" if action == "turn_left" else "EyesClosedL"
+                        conflict = {**EXPRESSIONS[action], opposite: 0.4}
+                    else:
+                        other = "MouthRight" if action == "forward" else "JawDrop"
+                        conflict = {
+                            **EXPRESSIONS[action],
+                            other: 0.3,
+                            "EyesClosedR": 0.2,
+                        }
+                    self.assertFalse(any(self.tick(conflict).velocity))
+                    self.tick(valid=not invalid)
+                    weak_hold = dict.fromkeys(EXPRESSIONS[action], 0.4)
+                    for _ in range(15):
+                        result = self.tick(weak_hold)
+                        self.assertFalse(any(result.velocity))
+                        self.assertEqual(result.activation_count, 1)
+                    self.assertEqual(self.activate(action).activation_count, 2)
+
+    def test_confirmed_wink_replaces_paused_mouth_identity_and_blocks_lip_crosstalk(
+        self,
+    ) -> None:
+        self.activate("strafe_right")
+        self.tick({"MouthRight": 0.9, "JawDrop": 0.3, "EyesClosedR": 0.2})
+        for _ in range(5):
+            result = self.tick({"MouthRight": 0.9, "EyesClosedR": 0.9})
+        self.assertEqual(result.activated_action, "turn_right")
+        for _ in range(15):
+            result = self.tick("strafe_right")
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.activation_count, 2)
+        self.assertEqual(self.activate("strafe_right").activation_count, 3)
 
     def test_heading_correction_uses_current_robot_heading_for_side_step(self) -> None:
         self.activate("strafe_left")
