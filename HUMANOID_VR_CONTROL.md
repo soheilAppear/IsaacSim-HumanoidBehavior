@@ -1049,6 +1049,15 @@ left movement. This confirms one live recognition check in fixed-base preview,
 not repeatability, a false-activation rate or physical walking while handling boxes.
 The fixed-base mode was used because the live walking scene's motion guard had
 detected actual zero-command foot-supported drift before collection began.
+The retained robot-only snapshot showed **0.118 m/s net root movement** and
+**0.125 m/s foot-support movement**, with zero operator/filtered movement requests.
+Three subsequent owned-process checks—neutral arms, a three-second transition to
+the captured arm targets, and a 0.25-second target transition—each remained stable
+for **15.02 simulation seconds** with the normal motor/contact/guard paths. The
+fast transition reached **2.706 rad/s** measured arm-joint velocity. These checks
+do not reproduce the original live hand trajectory or the XR-to-arm mapping, so
+they neither explain the pause nor justify weakening its guard. That live balance
+issue remains unresolved; the heading and recognition checks above are narrower.
 
 Before the recognition consistency fix, the **native Isaac anchored-preview check
 passed all six commands using simulated face input**, with the base remaining
