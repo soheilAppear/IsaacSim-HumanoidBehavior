@@ -59,6 +59,10 @@ from isaacsim.robot.policy.examples.interactive.humanoid.bimanual_grasp import B
 from isaacsim.robot.policy.examples.interactive.humanoid.comfort_camera import ComfortCameraFilter
 from isaacsim.robot.policy.examples.interactive.humanoid.controller_locomotion import ControllerLocomotion
 from isaacsim.robot.policy.examples.interactive.humanoid.factory_route import FactoryRoutePlanner
+from isaacsim.robot.policy.examples.interactive.humanoid.facial_controls_scene import FacialControlsScene
+from isaacsim.robot.policy.examples.interactive.humanoid.facial_locomotion_integration import (
+    FacialLocomotionIntegration,
+)
 from isaacsim.robot.policy.examples.interactive.humanoid.gaze_controls_scene import GazeControlsScene
 from isaacsim.robot.policy.examples.interactive.humanoid.gaze_locomotion import GazeLocomotion, GazeLocomotionConfig
 from isaacsim.robot.policy.examples.interactive.humanoid.grasp_controller import ContactGraspController
@@ -238,6 +242,12 @@ class HumanoidExample(BaseSample):
             raise ValueError("G1_LOCOMOTION_INPUT must be pointing, controller, or gaze")
         self._gaze_walking_enabled = self._locomotion_input_mode == "gaze"
         self._gaze_locomotion = GazeLocomotion(self._read_gaze_locomotion_config())
+        face_enabled = os.environ.get("G1_FACE_ENABLED", "0").strip().lower()
+        if face_enabled not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
+            raise ValueError("G1_FACE_ENABLED must be a boolean")
+        self._face_feature_enabled = face_enabled in ("1", "true", "yes", "on")
+        if self._face_feature_enabled and not self._gaze_walking_enabled:
+            raise ValueError("Facial controls require the gaze profile; use tools/launch_facial_walking.bat")
         controller_override = os.environ.get("G1_GAZE_CONTROLLER_OVERRIDE", "1").strip().lower()
         if controller_override not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
             raise ValueError("G1_GAZE_CONTROLLER_OVERRIDE must be a boolean")
@@ -260,10 +270,11 @@ class HumanoidExample(BaseSample):
             and stop_feedback in ("1", "true", "yes", "on")
         )
         self._walking_stop_regulator = WalkingStopRegulator()
-        self._gaze_controls = GazeControlsScene(
+        self._gaze_controls = (FacialControlsScene if self._face_feature_enabled else GazeControlsScene)(
             backwards_enabled=self._gaze_locomotion.config.backward_speed > 0.0,
             preview=self._gaze_locomotion.config.preview,
         )
+        self._facial_input = FacialLocomotionIntegration(self) if self._face_feature_enabled else None
         self._gaze_eye_valid = False
         if self._gaze_walking_enabled:
             # Preview fixes the pelvis to the world, so a preview selection
@@ -1550,6 +1561,8 @@ class HumanoidExample(BaseSample):
 
     async def load_world_async(self) -> None:
         """Release camera stage handles before the base class replaces the stage."""
+        if self._facial_input is not None:
+            self._facial_input.close()
         self._timeline_stopped = True
         self._timeline_navigation_sub = None
         self._navigation_scene.cleanup()
@@ -1566,6 +1579,8 @@ class HumanoidExample(BaseSample):
 
     async def clear_async(self) -> None:
         """Detach the frame callback before asynchronous stage destruction starts."""
+        if self._facial_input is not None:
+            self._facial_input.close()
         self._timeline_stopped = True
         self._timeline_navigation_sub = None
         self._navigation_scene.cleanup()
@@ -1670,6 +1685,8 @@ class HumanoidExample(BaseSample):
             self._xr_core = None
             carb.log_warn(f"HumanoidExample: XRCore unavailable for VR controller input: {e}")
         self._sync_controller_xr_tools()
+        if self._facial_input is not None:
+            self._facial_input.start()
         # Quest Pro eye-gaze tracker (optional). Imported lazily so a failure here can
         # never break example registration; gaze.csv falls back to HMD-forward gaze.
         self._eye_gaze_tracker = None
@@ -1795,6 +1812,8 @@ class HumanoidExample(BaseSample):
         This also runs after stage replacement, so cleanup helpers must tolerate
         invalid native handles and an already closed recording session.
         """
+        if self._facial_input is not None:
+            self._facial_input.close()
         self._restore_controller_xr_tools()
         self._restore_robot_head_xr_orientation()
         self._timeline_navigation_sub = None
@@ -4506,6 +4525,7 @@ class HumanoidExample(BaseSample):
             "gesture_walking_enabled": self._gesture_locomotion_enabled,
             "locomotion_input": self._locomotion_input_mode,
             "gaze_locomotion": self.gaze_locomotion_status() if self._gaze_walking_enabled else None,
+            "facial_locomotion": self.facial_locomotion_status(),
             "optical_hands_only": self._optical_hands_only,
             "pointing_navigation_enabled": self._pointing_navigation_enabled,
             "walking_policy": getattr(self.g1, "walking_policy_name", None),
@@ -7773,6 +7793,8 @@ class HumanoidExample(BaseSample):
 
     def _reset_gesture_locomotion(self) -> None:
         """Require a new deliberate gesture after resets, recentering, or faults."""
+        if self._facial_input is not None:
+            self._facial_input.reset()
         # Stopping must precede optional visual/scene updates, which can fail
         # during stage teardown without leaving a previous command alive.
         if self._gesture_locomotion_enabled or self._gaze_walking_enabled:
@@ -8427,7 +8449,33 @@ class HumanoidExample(BaseSample):
             )
         else:
             status["hybrid"] = None
+        if self._facial_input is not None and self._facial_input.enabled:
+            face = self._facial_input.controller.command
+            status.update(
+                source="face",
+                state=face.state,
+                target=face.target,
+                detail=face.detail,
+                requested_velocity=face.velocity,
+                stop_immediately=face.stop_immediately,
+            )
         return status
+
+    def set_facial_locomotion_enabled(self, enabled: bool) -> dict:
+        """Explicitly enable or disable facial body input in the facial launcher profile.
+
+        The headset's FACE ON/OFF gaze switch calls the same ownership change.
+        Enabling requires a fresh neutral face before any expression can move.
+        """
+        if self._facial_input is None:
+            raise RuntimeError("Launch with tools/launch_facial_walking.bat to use facial controls")
+        return self._facial_input.set_enabled(enabled)
+
+    def facial_locomotion_status(self) -> dict:
+        """Report face recognition and local transport health without changing control state."""
+        if self._facial_input is None:
+            return {"available": False, "enabled": False}
+        return self._facial_input.status()
 
     def _update_controller_command(self, dt: float) -> None:
         """Poll XR actions and recording inputs, optionally allowing locomotion.
@@ -8444,6 +8492,8 @@ class HumanoidExample(BaseSample):
         if self._gaze_walking_enabled:
             self._update_headset_gait_command(dt)  # Record head motion without using it as intent.
             try:
+                if self._facial_input is not None and self._facial_input.update(dt):
+                    return
                 if self._gaze_controller_override_enabled:
                     self._update_hybrid_locomotion(dt)
                 else:
@@ -8580,6 +8630,8 @@ class HumanoidExample(BaseSample):
         Clear can also invoke equivalent cleanup. Subscription removal, session
         finalization, and setting restoration therefore tolerate repeated calls.
         """
+        if self._facial_input is not None:
+            self._facial_input.close()
         self._restore_controller_xr_tools()
         self._restore_robot_head_xr_orientation()
         self._timeline_navigation_sub = None

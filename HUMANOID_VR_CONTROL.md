@@ -37,6 +37,12 @@ optical hands free. Its default preview anchors the base; a fresh `--move` launc
 enables physical walking/turning immediately on a tracked button hit, continuing while
 the same button remains fixated and stopping when the operator looks away.
 
+The experimental [facial-expression profile](#facial-expression-locomotion) builds on
+that EEG-branch setup. Quest Pro wink and mouth signals select body movement while
+both hands remain available. Hold a deliberate expression to move and relax to stop.
+An in-headset **FACE ON/OFF** control selects facial or existing gaze locomotion.
+It starts with facial control off and anchored preview enabled.
+
 The following September 2026 observations describe specific historical tests and
 operator reports. They do not establish acceptance of every subsequent revision.
 
@@ -659,6 +665,226 @@ explicit interface action, not a claim that gaze reveals general mental intent.
 Live eye-tracker calibration, in-headset readability, and picking up/carrying a
 box while walking remain operator acceptance checks. See the
 [validation details](docs/humanoid-control.md#gaze-buttons-and-optical-hands).
+
+### Facial-expression locomotion
+
+`feat/facial-locomotion` starts from `eeg-brainbit-integration` and retains its
+BrainBit tools, gaze buttons, joystick override, optical hands, grasping, and
+recordings. Facial input uses Quest Pro tracking through **Steam Link's OSC output**.
+The receiver runs inside this project's humanoid sample and needs no VRCFaceTracking
+installation. The [Steam Link module's documented protocol](https://github.com/danwillm/VRCFT-SteamLink)
+identifies the `/sl/xrfb/facew/` expression and `/sl/xrfb/facec/` confidence messages.
+Head direction and the gaze ray do not substitute for these signals.
+
+#### Connect Quest Pro face tracking
+
+1. Enable **Eye Tracking** and **Natural Facial Expressions** on Quest Pro. Allow
+   Steam Link to use them in the headset's app permissions.
+2. Connect through the headset's **Steam Link** app to SteamVR on this PC.
+3. Open **SteamVR Settings**, show **Advanced Settings**, and select **Steam Link**.
+   Enable **Enable OSC**, **Share eye tracking data to other apps on this PC**, and
+   **Share face tracking data to other apps on this PC via OSC**.
+4. Set Steam Link's **OSC output port** to **9015 (ALT)**. This must match
+   `G1_FACE_OSC_PORT`, whose default is `9015`.
+5. Close other receivers using that port, including a running Steam Link module in
+   VRCFaceTracking. Only one copy of the Isaac facial receiver or standalone probe
+   can own the port at a time. The receiver listens on this PC's loopback interface.
+
+These instructions apply to **Steam Link**, the connection already used for this
+project. Meta Quest Link/Air Link and Virtual Desktop have different transports.
+Working eye gaze alone does not establish that face expressions are being sent.
+
+To check the connection before launching Isaac, wear the headset and run:
+
+```powershell
+python tools/face_tracking_probe.py --seconds 15 --port 9015
+```
+
+The probe prints `valid`, confidence, and expression weights, then exits and releases
+the port. Move each expression during the observation and check that the corresponding
+weight changes. `valid: true` means the receiver has recent required expression and
+confidence messages. It does not prove that the headset is capturing new frames or
+that gestures can be distinguished reliably. Do not run this probe while Isaac's
+facial receiver is open.
+
+#### Preview, then enable movement
+
+Save your scene and exit the previous Isaac instance. In PowerShell at the
+repository root, start the anchored preview:
+
+```powershell
+cd C:/Users/Soheil/Documents/GitHub/IsaacSim-HumanoidBehavior
+.\tools\launch_facial_walking.bat --preview
+```
+
+Open **Window → Examples → Robotics Examples → Policy → Humanoid**, click **LOAD**,
+then **Play**. Enable **Start XR** in the XR panel if it is not already active,
+using the same OpenXR/Virtual Reality Experience setup as the gaze profile.
+
+The four gaze buttons remain available. Find **FACE OFF** beside the controls and
+look at it for **0.7 seconds** to switch facial control on. Look away after selection
+before using the toggle again. Relax your face and open both eyes briefly to arm
+recognition. The status should show usable tracking before expressions can select
+movement. In preview, expressions report commands while the robot's base stays
+anchored. Hands and arms remain usable.
+
+After checking the mappings in preview, exit Isaac and relaunch with:
+
+```powershell
+.\tools\launch_facial_walking.bat --move
+```
+
+Repeat **LOAD → Play → Start XR** if needed, then enable **FACE ON** in the headset.
+Facial control begins off on each new scene. The `--move` scene also enables the
+existing gaze and joystick movement paths. Preview and movement use different base
+topology, so switch them by exiting and relaunching.
+
+| Deliberate expression | Movement while held | Input signal |
+|---|---|---|
+| Close only the left eye, keep the right eye open | Turn left | `EyesClosedL` |
+| Close only the right eye, keep the left eye open | Turn right | `EyesClosedR` |
+| Move the mouth/lips toward your left | Sidestep left | `MouthLeft` |
+| Move the mouth/lips toward your right | Sidestep right | `MouthRight` |
+| Open the mouth | Walk forward | `JawDrop` |
+| Pucker both sides of the lips | Walk backward | `LipPuckerL` and `LipPuckerR` |
+| Relax the face and open both eyes | Request zero movement | Neutral expression |
+| Close both eyes | Request zero movement | Bilateral closure |
+
+The default **hold** mode confirms a single deliberate expression for **0.18 seconds**
+before requesting movement. Keep holding it to continue. Relaxing, an ambiguous
+combination, or invalid/stale face input requests a stop. A physical robot needs time
+to brake; the zero request is not an instantaneous halt. A normal two-eye blink
+cannot select a turn. A long uneven blink or squint may still resemble a deliberate
+wink, so recognition needs testing with the individual wearer.
+After releasing a command, return to a neutral face with both eyes open for
+**0.25 seconds** before starting another. Directly changing from one expression to
+another does not bypass this neutral check. The launcher starts with individual
+activation thresholds of **0.55 for winks, 0.45 for jaw opening, 0.40 for puckering,
+and 0.65 for sideways lips**, with a **0.35 release threshold**. These starter values
+come from this headset's preview observations and need rechecking after fit changes.
+
+While **FACE ON** owns locomotion, looking at a direction button does not issue a
+second body command. The gaze data and hand/arm control continue independently.
+Switch **FACE OFF** to return to gaze-button movement. A deliberate controller-stick
+override cancels/disarms facial control and uses the existing joystick handling.
+Pause, Stop, Reset, or an interrupted tracking/session requires the appropriate
+rearming sequence. Existing articulation, fall, and unintended-motion guards remain
+active.
+
+**Switch FACE OFF before speaking.** Mouth tracking measures movement, not intent,
+and cannot reliably distinguish a spoken word from a locomotion gesture. Opening
+the mouth or puckering during speech can match the command. The explicit toggle
+lets you talk while using the usual gaze controls instead.
+
+The desktop TCP utility exposes the same arm/disarm action and status:
+
+```powershell
+python tools/kit_exec.py "print(EX.facial_locomotion_status())"
+python tools/kit_exec.py "EX.set_facial_locomotion_enabled(True)"
+python tools/kit_exec.py "EX.set_facial_locomotion_enabled(False)"
+```
+
+#### Facial tuning and checks
+
+Set overrides in PowerShell **before launching**. Face speeds are independent of
+the existing gaze speeds.
+
+| Environment setting | Default | Meaning |
+|---|---:|---|
+| `G1_FACE_OSC_PORT` | `9015` | Local Steam Link face-data destination |
+| `G1_FACE_MODE` | `hold` | Move while the expression remains deliberate |
+| `G1_FACE_DISTANCE_M` | `0.15` | Requested translation in optional `step` mode |
+| `G1_FACE_TURN_DEG` | `10` | Requested yaw change in optional `step` mode |
+| `G1_FACE_FORWARD_SPEED` | `0.20` | Forward request in m/s |
+| `G1_FACE_BACKWARD_SPEED` | `0.15` | Reverse request in m/s |
+| `G1_FACE_LATERAL_SPEED` | `0.15` | Sidestep request in m/s |
+| `G1_FACE_YAW_SPEED` | `0.25` | Turn request in rad/s |
+| `G1_FACE_ACTIVATION_THRESHOLD` | `0.65` | Shared activation threshold for every expression without its own override |
+| `G1_FACE_WINK_THRESHOLD` | `0.55` | Left/right eye closure |
+| `G1_FACE_JAW_THRESHOLD` | `0.45` | Forward mouth opening |
+| `G1_FACE_PUCKER_THRESHOLD` | `0.40` | Backward bilateral lip puckering |
+| `G1_FACE_MOUTH_SIDE_THRESHOLD` | `0.65` | Left/right mouth movement |
+| `G1_FACE_RELEASE_THRESHOLD` | `0.35` | Shared release threshold, below every activation threshold |
+| `G1_FACE_CONFIRM_S` | `0.18` | Required deliberate-expression confirmation time in seconds |
+| `G1_FACE_NEUTRAL_S` | `0.25` | Required neutral interval before another expression in seconds |
+
+For example, `$env:G1_FACE_FORWARD_SPEED = '0.30'` adjusts facial forward speed for
+the next launch. Supported caps are **0.65 m/s forward**, **0.35 m/s reverse**,
+**0.30 m/s lateral**, and **0.40 rad/s yaw**. The launcher defaults to preview even
+if an earlier terminal session set a movement environment variable. Only its first
+`--move` argument enables physical motion.
+
+Expression thresholds may need individual tuning. The launcher supplies the starter
+values above. When constructing the controller directly, an expression threshold
+of `None` falls back to `G1_FACE_ACTIVATION_THRESHOLD`. Do not put the literal string
+`None` in an environment variable. Set a numeric value from **0.40 to 1.0**, above
+the release threshold.
+For example, `$env:G1_FACE_JAW_THRESHOLD = '0.50'` changes only mouth-opening
+activation for the next launch. To restore the launcher's starter value, use
+`Remove-Item Env:G1_FACE_JAW_THRESHOLD -ErrorAction SilentlyContinue`.
+
+Choose a threshold between the measured neutral range and the sustained deliberate
+expression range from the probe, then check it in anchored preview. Lowering a value
+can improve detection and also increase accidental activation. It cannot separate
+two expressions whose measured channels overlap. These examples illustrate the
+settings and are not a calibrated profile for this wearer; launcher defaults remain
+unchanged.
+
+An optional `$env:G1_FACE_MODE = 'step'` selects one bounded command per gesture.
+In that mode a deliberate wink fires only after the closed eye reopens, and a
+mouth gesture fires after confirmation. The robot then completes the requested
+distance or angle while you relax, ignores extra gestures during the move, and
+requires neutral before another. Set `G1_FACE_MODE` back to `hold` for the requested
+relax-to-stop interaction. Disabling facial input, tracking loss, and control faults
+still interrupt a step.
+
+Acceptance checks for the wearer are a neutral face, ordinary blinks, deliberate
+left/right winks, each mouth gesture, relaxation, and speaking with facial control
+off. Confirm that the intended command is stable, no command appears for ordinary
+blinking, and relaxation stops the request. Then verify simultaneous optical hand
+motion and a box-handling attempt during short movements. Software tests and
+simulated inputs do not establish the wearer's tracking quality, comfort, or successful
+pickup/carry/place performance. Live facial tracking acceptance remains pending.
+
+**11 November 2026 connection check:** an eight-second Quest Pro/Steam Link
+observation returned valid, recent face data on **755 of 758 receiver polls**, with
+reported upper- and lower-face confidence of **1.0**. Polls are receiver observations,
+not a count of independent captured headset frames. This confirms the local
+connection for that interval. The guided six-expression recognition check and
+native robot-movement validation are separate from that connection check.
+
+The first guided hardware preview recognized **mouth-left and mouth-right** commands.
+A later calibration observation also recognized **puckering/backward** and a further
+trial recognized **jaw-opening/forward**. Reliable left/right wink recognition still
+needs tuning and repeat trials. These observations are not a six-command hardware acceptance pass or a
+measured false-activation rate.
+
+The **native Isaac anchored-preview check passed all six commands using simulated
+face input**, with the base remaining anchored. The rendered controls were also
+reviewed for readability. **Native physical validation also passed all six commands**
+with the real walking actor and simulated facial input. Forward traveled 0.174 m,
+backward 0.629 m, left/right sidesteps 0.111/0.139 m, and left/right turns
+0.290/0.343 radians during the selected holds. Each movement passed measured stopping
+checks, including stale-input cancellation. Arm and finger updater methods each ran
+9,747 times; this proves execution alongside walking, not successful hand tracking
+or box carrying. Box handling with facial locomotion remains an operator acceptance check.
+
+The complete offline suite passed **1,157 tests** after integration, including the
+new transport, gesture, ownership, and real-USD HUD checks. The launcher and gesture
+checks also passed after the starter threshold updates. In the running Quest Pro
+preview, the wearer confirmed that the robot scene and FACE OFF control were visible.
+
+Reproduce native validation with the installed Isaac Python wrapper, using separate
+processes for preview and physical movement. The scripts close their owned simulator.
+
+```powershell
+& 'C:/Users/Soheil/Downloads/isaac-sim-standalone-6.1.0-windows-x86_64/python.bat' tools/validate_facial_walking.py --mode preview --output-dir output/facial_validation --ext-path source/extensions/isaacsim.robot.policy.examples --enable isaacsim.robot.policy.examples-5.2.11 --/app/vulkan=false --/app/extensions/fsWatcherEnabled=0 --/metricsAssembler/changeListenerEnabled=false
+& 'C:/Users/Soheil/Downloads/isaac-sim-standalone-6.1.0-windows-x86_64/python.bat' tools/validate_facial_walking.py --mode move --back-hold-s 5 --output-dir output/facial_validation --ext-path source/extensions/isaacsim.robot.policy.examples --enable isaacsim.robot.policy.examples-5.2.11 --/app/vulkan=false --/app/extensions/fsWatcherEnabled=0 --/metricsAssembler/changeListenerEnabled=false
+```
+
+The physical validation backs away through the walking controller for five seconds
+to obtain turn clearance. It does not reposition the root or alter the warehouse.
+Headset transport and real facial/hand gestures are separate from this synthetic replay.
 
 ### Experimental gesture walking
 

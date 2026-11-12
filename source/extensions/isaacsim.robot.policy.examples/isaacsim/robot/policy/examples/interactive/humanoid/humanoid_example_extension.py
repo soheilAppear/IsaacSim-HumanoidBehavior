@@ -87,6 +87,22 @@ class HumanoidExampleExtension(omni.ext.IExt):
             overview += "Keep pointing to walk, and open your hand to stop. Gaze does not steer walking. "
         else:
             overview = "The G1 stands anchored in place. Walking and turning inputs are disabled. "
+        if sample._face_feature_enabled:
+            face_mode = (
+                "Facial preview (base anchored). "
+                if sample._facial_input.controller.config.preview
+                else "Facial walking. "
+            )
+            overview = (
+                face_mode
+                + "Look between the controls, then dwell on FACE OFF for 0.7 seconds to enable facial control. "
+                + "Relax your face with both eyes open to arm. Hold a left/right wink to turn, move lips left/right "
+                + "to sidestep, open your mouth to walk forward, or pucker to reverse. Relax to stop. "
+                + "Use one expression at a time. Both-eye blinks and conflicting expressions stop the request. "
+                + "Look at FACE ON to switch back to gaze, especially before speaking. "
+                + "Check gesture recognition in preview before enabling physical movement.\n\n"
+                + overview
+            )
         overview += "Arms, fingers, gaze, and recording remain active."
         overview += " The robot-mounted view follows tracked head rotation through a stabilized neck-and-eye motion; room-scale headset translation does not move it."
         overview += "\n\nHand tracking: move individual fingers and thumb opposition. Reach with an open hand, "

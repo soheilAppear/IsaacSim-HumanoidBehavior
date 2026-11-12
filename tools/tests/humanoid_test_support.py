@@ -151,6 +151,30 @@ HYBRID_LOCOMOTION = load_source("interactive/humanoid/hybrid_locomotion.py")
 GAZE_LOCOMOTION = load_source("interactive/humanoid/gaze_locomotion.py", Real=Real)
 WALKING_STOP = load_source("interactive/humanoid/walking_stop.py", Real=Real)
 GAZE_CONTROLS_SCENE = load_source("interactive/humanoid/gaze_controls_scene.py")
+_face_spec = importlib.util.spec_from_file_location(
+    "humanoid_test_face_tracking_input", PACKAGE / "interactive/humanoid/face_tracking_input.py"
+)
+FACIAL_INPUT = importlib.util.module_from_spec(_face_spec)
+sys.modules[_face_spec.name] = FACIAL_INPUT
+_face_spec.loader.exec_module(FACIAL_INPUT)
+FACIAL_LOCOMOTION = load_source(
+    "interactive/humanoid/facial_locomotion.py",
+    Real=Real,
+    TYPE_CHECKING=False,
+    GazeLocomotion=GAZE_LOCOMOTION.GazeLocomotion,
+    GazeLocomotionConfig=GAZE_LOCOMOTION.GazeLocomotionConfig,
+)
+FACIAL_SCENE = load_source(
+    "interactive/humanoid/facial_controls_scene.py", GazeControlsScene=GAZE_CONTROLS_SCENE.GazeControlsScene
+)
+FACIAL_INTEGRATION = load_source(
+    "interactive/humanoid/facial_locomotion_integration.py",
+    SteamLinkFaceInput=FACIAL_INPUT.SteamLinkFaceInput,
+    FacialLocomotion=FACIAL_LOCOMOTION.FacialLocomotion,
+    FacialLocomotionConfig=FACIAL_LOCOMOTION.FacialLocomotionConfig,
+    GazeLocomotion=GAZE_LOCOMOTION.GazeLocomotion,
+    GazeLocomotionConfig=GAZE_LOCOMOTION.GazeLocomotionConfig,
+)
 _bimanual_spec = importlib.util.spec_from_file_location(
     "humanoid_test_bimanual_grasp", PACKAGE / "interactive/humanoid/bimanual_grasp.py"
 )
@@ -181,6 +205,8 @@ HUMANOID = load_source(
     GazeLocomotionConfig=GAZE_LOCOMOTION.GazeLocomotionConfig,
     WalkingStopRegulator=WALKING_STOP.WalkingStopRegulator,
     GazeControlsScene=GAZE_CONTROLS_SCENE.GazeControlsScene,
+    FacialControlsScene=FACIAL_SCENE.FacialControlsScene,
+    FacialLocomotionIntegration=FACIAL_INTEGRATION.FacialLocomotionIntegration,
     BimanualGraspMonitor=BIMANUAL_GRASP.BimanualGraspMonitor,
     ComfortCameraFilter=COMFORT_CAMERA.ComfortCameraFilter,
     create_tall_packages=TALL_PACKAGES.create_tall_packages,

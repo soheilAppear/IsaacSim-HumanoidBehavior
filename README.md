@@ -19,7 +19,8 @@ operating the project does not require building the whole simulator.
 [Developer guide and validation](docs/humanoid-control.md) ·
 [Performance](docs/humanoid-control.md#performance-and-cpu-physics) ·
 [Learning pipeline](learning/README.md) ·
-[Optional EEG development](#eeg-teleoperation-development)
+[Optional EEG development](#eeg-teleoperation-development) ·
+[Facial locomotion](#facial-expression-locomotion)
 
 [![G1 carton lift beside the operator's webcam view](docs/readme/g1-carton-lift-webcam.png)](docs/readme/g1-quest-webcam-highlights.mp4?raw=true)
 
@@ -40,6 +41,12 @@ The experimental [gaze-button profile](#gaze-buttons-with-both-hands-free) leave
 both hands available for manipulation, with optical/controller fallback and a
 controller-stick movement override. It starts with an anchored preview;
 physical walking requires a separate launch with `--move`.
+
+The `feat/facial-locomotion` branch adds an experimental
+[facial-expression profile](#facial-expression-locomotion) on top of the EEG branch.
+Quest Pro wink and mouth signals request walking, sidestepping, and turning while
+both hands remain available. Hold an expression to move and relax to stop, with an
+explicit in-headset facial-control toggle and an anchored preview for initial checks.
 
 Use [the operating guide](HUMANOID_VR_CONTROL.md) for launch and controls,
 [the developer guide](docs/humanoid-control.md#runtime-and-data-flow) for the control
@@ -63,6 +70,7 @@ launcher is an alias for it.
 | Camera | Stabilized robot frame follows travel; HMD orientation rotates the view and its eye offset around the measured neck. Torso roll/pitch, gait bob, and real-world head translation are excluded |
 | Gaze | Existing eye-tracking and highlighting behavior is retained; recordings label real eye input separately from HMD-forward fallback |
 | Gaze buttons | Experimental gaze controls activate immediately and move while fixated; look away to stop. Controller sticks can override gaze, and optical/controller hand input remains available. Anchored preview is the default |
+| Facial locomotion | Experimental Steam Link OSC input maps deliberate winks and mouth expressions to body movement while held. Facial input starts off, with a gaze-operated on/off toggle. Anchored preview is the default; wearer acceptance is pending |
 | Physics | CPU: 100 Hz stationary / 200 Hz walking; rendering requests 90 Hz stationary / 60 Hz walking |
 | Recording | Enabled by default: sensor CSVs, metadata, and a PNG image sequence |
 | Controller walking | Left stick moves forward/backward/sideways; right stick turns. Grip/trigger manipulation and optical hands remain available; controller face buttons/stick clicks are unused, and blue pointing navigation is disabled but retained |
@@ -549,6 +557,56 @@ activation, and all four physical directions passed with synthetic eyes. Each
 release was observed for five simulation seconds without a fault; simulated eye
 loss immediately cleared Forward's command. Arm/finger updates continued. Live
 eye tracking and carrying a gripped box remain separate acceptance checks.
+
+### Facial-expression locomotion
+
+This branch keeps the EEG tools and existing gaze-button/controller/hand behavior,
+and adds a Quest Pro facial-input profile. Enable eye tracking and Natural Facial
+Expressions in the headset, allow Steam Link's permissions, then enable its OSC,
+eye-data, and face-data sharing under **SteamVR Settings → Steam Link**. Set its
+OSC output port to **9015 (ALT)**. Only one receiver can use this port at once.
+
+From the repository root, start with anchored preview:
+
+```powershell
+.\tools\launch_facial_walking.bat --preview
+```
+
+Open the **Humanoid** example, **LOAD → Play**, and **Start XR** if needed. Look at
+the **FACE OFF** toggle for **0.7 seconds** to enable facial control, then relax your
+face with both eyes open to arm it. Hold a deliberate expression to preview the
+command. The base stays fixed in preview.
+
+| Expression | Body command while held |
+|---|---|
+| Left/right wink | Turn left/right |
+| Mouth moved left/right | Sidestep left/right |
+| Open mouth | Forward |
+| Pucker lips | Backward |
+| Relax face | Stop request |
+
+After checking recognition, exit Isaac and launch
+`.\tools\launch_facial_walking.bat --move`. Facial control starts off until explicitly
+enabled. **FACE ON** selects facial body input; **FACE OFF** restores gaze buttons.
+Both hands remain available, and deliberate joystick input cancels facial control.
+Ordinary two-eye blinks do not select turns. **Switch FACE OFF before speaking**,
+because spoken mouth movements can resemble locomotion expressions.
+
+See the [facial operator instructions](HUMANOID_VR_CONTROL.md#facial-expression-locomotion)
+for transport setup, tuning, arming, and verification. This is an experimental input
+method. Software/simulated-input checks do not establish reliable wearer recognition
+or successful box handling while moving; live facial acceptance is pending.
+An **11 November 2026** eight-second connection probe received valid face data on
+**755 of 758 polls**, with both reported confidence values at **1.0**. This verifies
+the connection during that interval. Guided hardware checks recognized mouth-left,
+mouth-right, and later puckering/backward and mouth-opening/forward; winks still need
+reliability tuning. All six simulated commands passed the native anchored-preview
+check. Per-expression thresholds are available in the
+[operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
+uses starter thresholds from the local Quest Pro preview observations. They still
+require validation for the wearer and headset fit. Native preview and physical
+tests passed all six commands using simulated facial input; reliable real winks
+and simultaneous box carrying remain acceptance checks.
 
 ### Retained pointing navigation
 
