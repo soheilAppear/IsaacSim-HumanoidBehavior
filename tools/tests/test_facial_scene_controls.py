@@ -17,7 +17,7 @@ FACE = load_source("interactive/humanoid/facial_controls_scene.py", GazeControls
 
 
 class TestFacialSceneControls(unittest.TestCase):
-    """Verify facial feedback remains useful during a wink and leaves gaze geometry intact."""
+    """Verify facial feedback and mode masking without rebuilding gaze geometry."""
 
     def setUp(self) -> None:
         self.stage = Usd.Stage.CreateInMemory()
@@ -211,21 +211,85 @@ class TestFacialSceneControls(unittest.TestCase):
             self.scene.update_facial(self.command("idle"))
         self.assertEqual(changes, [])
 
-    def test_face_mode_dims_only_gaze_buttons_and_restores_original_colors(self) -> None:
-        def color(name: str) -> tuple:
-            shader = UsdShade.Shader(self.stage.GetPrimAtPath(f"{self.scene.root_path}/Materials/{name}/Shader"))
-            return tuple(shader.GetInput("emissiveColor").Get())
+    def test_face_mode_hides_whole_button_groups_and_restores_them(self) -> None:
+        # Include a populated progress ring: masking only labels/arrows or the
+        # unfilled ring would leave parts of the movement controls in the headset.
+        self.scene.update({"state": "active", "target": "forward", "progress": 1.0})
+        prim_paths = tuple(str(prim.GetPath()) for prim in self.stage.Traverse())
+        materials = self.stage.GetPrimAtPath(f"{self.scene.root_path}/Materials")
+        colors = {
+            str(prim.GetPath()): UsdShade.Shader(prim).GetInput("emissiveColor").Get()
+            for prim in Usd.PrimRange(materials)
+            if prim.IsA(UsdShade.Shader)
+        }
+        notices = self.observe_changes()
+        for enabled in (True, False, True, False):
+            self.scene.update_face_toggle(enabled, 0)
+            cache = UsdGeom.XformCache()
+            for button in self.scene.BUTTON_CENTERS:
+                group = self.stage.GetPrimAtPath(f"{self.scene.root_path}/{button}")
+                operations = UsdGeom.Xformable(group).GetOrderedXformOps()
+                self.assertEqual(len(operations), 1)
+                self.assertEqual(operations[0].Get(), Gf.Vec3d(0, 0, 2 * self.scene.DEPTH if enabled else 0))
+                children = list(group.GetChildren())
+                self.assertEqual({prim.GetName() for prim in children}, {"Panel", "Label", "Arrow", "Ring", "Progress"})
+                for mesh in children:
+                    self.assertEqual(
+                        UsdGeom.Imageable(mesh).ComputeVisibility(),
+                        UsdGeom.Tokens.invisible if enabled else UsdGeom.Tokens.inherited,
+                    )
+                    point = UsdGeom.Mesh(mesh).GetPointsAttr().Get()[0]
+                    camera_point = cache.GetLocalToWorldTransform(mesh).Transform(Gf.Vec3d(point))
+                    self.assertGreater(camera_point[2], 0) if enabled else self.assertLess(camera_point[2], 0)
+                self.assertEqual(self.scene.hit_test(*self.ray(button=button)), None if enabled else button)
+            for name in ("FaceToggle", "FaceToggleHint", "Title", "StatusBacking"):
+                prim = self.stage.GetPrimAtPath(f"{self.scene.root_path}/{name}")
+                self.assertEqual(UsdGeom.Imageable(prim).ComputeVisibility(), UsdGeom.Tokens.inherited)
+                point = UsdGeom.Mesh(prim).GetPointsAttr().Get()[0]
+                self.assertLess(cache.GetLocalToWorldTransform(prim).Transform(Gf.Vec3d(point))[2], 0)
+            self.assertTrue(self.scene.hit_test_face_toggle(*self.ray()))
+            self.assertEqual(tuple(str(prim.GetPath()) for prim in self.stage.Traverse()), prim_paths)
+        self.assertEqual(
+            {path: UsdShade.Shader(self.stage.GetPrimAtPath(path)).GetInput("emissiveColor").Get() for path in colors},
+            colors,
+        )
+        self.assertTrue(notices)
+        self.assertTrue(all(not resynced for resynced, _ in notices))
 
-        names = (*self.scene.BUTTON_CENTERS, "face_gaze_text", "text", "face_on", "face_off")
-        original = {name: color(name) for name in names}
-        self.scene.update_face_toggle(True, 0)
-        expected = tuple(Gf.Vec3f(*self.scene._STATE_COLORS["disabled"]))
-        for name in (*self.scene.BUTTON_CENTERS, "face_gaze_text"):
-            self.assertEqual(color(name), expected)
-        for name in ("text", "face_on", "face_off"):
-            self.assertEqual(color(name), original[name])
+    def test_hidden_controls_stay_hidden_during_face_feedback_and_camera_motion(self) -> None:
+        self.scene.update_face_toggle(True, 0.5)
+        pose = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), 60))
+        pose.SetTranslateOnly(Gf.Vec3d(2, -1, 1.5))
+        self.scene.set_camera_pose(pose)
+        for action in self.scene.BUTTON_CENTERS:
+            self.scene.update_facial(self.command("active", action, 1.0))
+            self.assertEqual(self.status_label(), "RUNNING")
+            self.assertTrue(self.is_drawn(f"FeedbackAction/{action}"))
+            for eye_x in (-0.032, 0.032):
+                self.assertIsNone(self.scene.hit_test(*self.ray(button=action, pose=pose, eye_x=eye_x)))
+                self.assertTrue(self.scene.hit_test_face_toggle(*self.ray(pose=pose, eye_x=eye_x)))
+            for button in self.scene.BUTTON_CENTERS:
+                group = self.stage.GetPrimAtPath(f"{self.scene.root_path}/{button}")
+                self.assertEqual(UsdGeom.Imageable(group).ComputeVisibility(), UsdGeom.Tokens.invisible)
         self.scene.update_face_toggle(False, 0)
-        self.assertEqual({name: color(name) for name in names}, original)
+        for button in self.scene.BUTTON_CENTERS:
+            self.assertEqual(self.scene.hit_test(*self.ray(button=button, pose=pose)), button)
+
+    def test_disabled_back_annotation_is_hidden_and_remains_disabled_after_restore(self) -> None:
+        self.scene.cleanup()
+        self.scene = FACE.FacialControlsScene(backwards_enabled=False)
+        self.addCleanup(self.scene.cleanup)
+        self.scene.create(self.stage)
+        self.scene.set_camera_pose(Gf.Matrix4d(1))
+        disabled = self.stage.GetPrimAtPath(f"{self.scene.root_path}/back/Disabled")
+        for enabled in (True, False):
+            self.scene.update_face_toggle(enabled, 0)
+            self.assertEqual(
+                UsdGeom.Imageable(disabled).ComputeVisibility(),
+                UsdGeom.Tokens.invisible if enabled else UsdGeom.Tokens.inherited,
+            )
+            self.assertIsNone(self.scene.hit_test(*self.ray(button="back")))
+            self.assertTrue(self.scene.hit_test_face_toggle(*self.ray()))
 
     def test_hud_remains_nonphysical_and_survives_recreate(self) -> None:
         for prim in self.stage.Traverse():

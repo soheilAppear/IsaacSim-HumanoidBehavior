@@ -8,15 +8,16 @@ from __future__ import annotations
 import math
 
 from isaacsim.robot.policy.examples.interactive.humanoid.gaze_controls_scene import GazeControlsScene
-from pxr import Gf, Usd, UsdGeom, UsdShade
+from pxr import Gf, Usd, UsdGeom
 
 
 class FacialControlsScene(GazeControlsScene):
-    """Keep the four gaze buttons and add a separate, gaze-operated face switch.
+    """Show gaze movement buttons only while the separate facial switch is off.
 
     The switch sits beneath the right-hand buttons and leaves the center clear.
     Geometry is created once. Runtime updates only change preauthored materials,
-    transforms, and ring topology, following the existing headset HUD strategy.
+    transforms, visibility, and progress rings. Hidden movement groups also move
+    behind the camera, following the existing headset HUD masking strategy.
     """
 
     FACE_CENTER = (0.55, -0.49)
@@ -50,20 +51,16 @@ class FacialControlsScene(GazeControlsScene):
         super().create(stage)
         self._face_display = None
         self._face_ring_count = 0
-        # Use an independent material for button text. Recoloring the base
-        # `text` material would also dim the toggle and other operating hints.
-        self._materials["face_gaze_text"] = self._make_material("face_gaze_text", (0.9, 0.95, 1.0))
+        self._face_movement_masks = {}
         for button in self.BUTTON_CENTERS:
-            if button != "back" or self.backwards_enabled:
-                label = stage.GetPrimAtPath(f"{self.root_path}/{button}/Label")
-                UsdShade.MaterialBindingAPI(label).Bind(self._materials["face_gaze_text"])
-        self._face_button_color_inputs = {}
-        for name, color in {**self._BUTTON_COLORS, "face_gaze_text": (0.9, 0.95, 1.0)}.items():
-            shader = UsdShade.Shader(stage.GetPrimAtPath(f"{self._materials[name].GetPath()}/Shader"))
-            self._face_button_color_inputs[name] = (
-                (shader.GetInput("diffuseColor"), shader.GetInput("emissiveColor")),
-                Gf.Vec3f(*color),
-            )
+            group = UsdGeom.Xform(stage.GetPrimAtPath(f"{self.root_path}/{button}"))
+            transform = group.AddTranslateOp()
+            transform.Set(Gf.Vec3d(0))
+            visibility = UsdGeom.Imageable(group).CreateVisibilityAttr(UsdGeom.Tokens.inherited)
+            # Mask the parent so panels, labels, arrows, both rings and optional
+            # disabled text disappear together. Preauthor both attributes here:
+            # mode changes never create/delete prims or rewrite transform order.
+            self._face_movement_masks[button] = (transform, visibility)
         x, y = self.FACE_CENTER
         self._backing_plate(self.root_path + "/FaceToggle", x, y, self.HALF_WIDTH, self.FACE_HALF_HEIGHT)
         for enabled, label in ((False, "FACE OFF"), (True, "FACE ON")):
@@ -78,6 +75,12 @@ class FacialControlsScene(GazeControlsScene):
             self.root_path + "/FaceToggleProgress", self._ring_points(x, y, 0.092, 0.098), [], "dwelling"
         )
         self.update_face_toggle(False, 0.0)
+
+    def hit_test(self, origin: object, direction: object, max_distance: float | None = None) -> str | None:
+        """Exclude hidden movement buttons while leaving the separate face toggle usable."""
+        if getattr(self, "_face_display", False):
+            return None
+        return super().hit_test(origin, direction, max_distance)
 
     def hit_test_face_toggle(self, origin: object, direction: object, max_distance: float | None = None) -> bool:
         """Test the same displayed camera frame and occlusion rules as the gaze buttons."""
@@ -116,11 +119,13 @@ class FacialControlsScene(GazeControlsScene):
         if self._face_display != enabled:
             self._set_opacity("face_on", enabled)
             self._set_opacity("face_off", not enabled)
-            for inputs, original_color in self._face_button_color_inputs.values():
-                color = Gf.Vec3f(*self._STATE_COLORS["disabled"]) if enabled else original_color
-                for shader_input in inputs:
-                    if shader_input.Get() != color:
-                        shader_input.Set(color)
+            translation = Gf.Vec3d(0, 0, 2 * self.DEPTH if enabled else 0)
+            token = UsdGeom.Tokens.invisible if enabled else UsdGeom.Tokens.inherited
+            for transform, visibility in self._face_movement_masks.values():
+                if transform.Get() != translation:
+                    transform.Set(translation)
+                if visibility.Get() != token:
+                    visibility.Set(token)
             self._face_display = enabled
         count = int(max(0.0, min(1.0, progress)) * self.RING_SEGMENTS) if math.isfinite(progress) else 0
         if count != self._face_ring_count:

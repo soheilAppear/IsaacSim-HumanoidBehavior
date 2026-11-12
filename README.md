@@ -615,7 +615,9 @@ with a 0.05-second error filter and 0.10-second yaw response at that scale
 
 After checking recognition, exit Isaac and launch
 `.\tools\launch_facial_walking.bat --move`. Facial control starts off until explicitly
-enabled. **FACE ON** selects facial body input; **FACE OFF** restores gaze buttons.
+enabled. **FACE ON** selects facial body input and hides the four gaze movement
+buttons. The FACE toggle and facial status stay visible. **FACE OFF** restores the
+buttons and gaze movement immediately.
 Both hands remain available, and deliberate joystick input cancels facial control.
 Ordinary two-eye blinks do not select turns. **Switch FACE OFF before speaking**,
 because spoken mouth movements can resemble locomotion expressions.
@@ -659,7 +661,8 @@ thresholds are available in the
 [operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
 uses starter thresholds from the local Quest Pro preview observations. Recheck them
 after headset-fit changes. The current hold-recovery and facial-onset version passed
-**1,228 offline tests** and native physical checks for **all six facial commands**
+**1,230 offline tests** after the facial-mode button visibility update, plus native
+physical checks for **all six facial commands**
 at the 3× request profile with a **0.30-second attack**. Each direction paused on
 ambiguity and resumed the same held expression after confirmation. Arm and finger
 updaters each ran **10,904 times**. Translation stayed within the **3° held-end /

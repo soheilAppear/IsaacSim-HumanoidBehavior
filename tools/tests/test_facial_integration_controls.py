@@ -376,6 +376,7 @@ class TestFacialIntegrationControls(unittest.TestCase):
             self.assertEqual(self.ex._gaze_locomotion.command.state, "awaiting_release")
             self.assertEqual(self.ex._facial_input.enabled, enabled)
             self.assertEqual(self.ex._facial_input.controller.command.state, "awaiting_neutral")
+            self.ex._gaze_controls.update_face_toggle.assert_called_with(enabled, 0.0)
 
     def test_stick_override_disarms_face_with_zero_handoff_tick(self) -> None:
         self.activate(JawDrop=0.9)
@@ -417,6 +418,7 @@ class TestFacialIntegrationControls(unittest.TestCase):
                 self.assertFalse(self.ex._facial_input.enabled)
                 self.assert_zero_buffers()
                 self.assertEqual(self.ex._facial_input.controller.command.state, "awaiting_neutral")
+                self.ex._gaze_controls.update_face_toggle.assert_called_with(False, 0.0)
 
     def test_close_releases_receiver_and_forgets_sample(self) -> None:
         self.activate(JawDrop=0.9)

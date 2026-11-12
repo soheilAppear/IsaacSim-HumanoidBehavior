@@ -772,7 +772,8 @@ Open **Window → Examples → Robotics Examples → Policy → Humanoid**, clic
 then **Play**. Enable **Start XR** in the XR panel if it is not already active,
 using the same OpenXR/Virtual Reality Experience setup as the gaze profile.
 
-The four gaze buttons remain available. Find **FACE OFF** beside the controls and
+The four gaze buttons are visible while facial control is off. Find **FACE OFF**
+beside the controls and
 look at it for **0.7 seconds** to switch facial control on. Look away after selection
 before using the toggle again. Relax your face and open both eyes briefly to arm
 recognition. The status should show usable tracking before expressions can select
@@ -878,9 +879,11 @@ The in-headset status identifies what recognition needs:
   recovers, relax your face to rearm. Stronger expressions cannot repair a missing
   or low-confidence tracking stream.
 
-While **FACE ON** owns locomotion, looking at a direction button does not issue a
-second body command. The gaze data and hand/arm control continue independently.
-Switch **FACE OFF** to return to gaze-button movement. A deliberate controller-stick
+While **FACE ON** owns locomotion, all four gaze movement buttons disappear,
+including their labels and progress rings, and their hidden gaze targets are disabled.
+The FACE toggle, status and command feedback remain visible so you can switch back.
+The gaze data and hand/arm control continue independently. Switch **FACE OFF** to
+restore the four buttons and gaze-button movement. A deliberate controller-stick
 override cancels/disarms facial control and uses the existing joystick handling.
 Pause, Stop, Reset, or an interrupted tracking/session requires the appropriate
 rearming sequence. Existing articulation, fall, and unintended-motion guards remain
@@ -1103,11 +1106,15 @@ controlled achieved-speed comparison with previous runs. These results establish
 bounded motion in this test, not zero drift, reliable wearer recognition or loaded
 performance. The unresolved live zero-command balance limitation remains unchanged.
 
-The complete offline suite passed **1,228 tests in 16.870 seconds**, including
+The complete offline suite passed **1,230 tests in 17.197 seconds** after the
+facial-mode button visibility update, including
 transport, expression recovery, source ownership, command-ramp behavior and real-USD
 HUD checks. No new facial recording was made for this update. The earlier wearer
 preview confirmed visibility of the robot scene and FACE OFF control; live
 recognition repeatability and simultaneous box handling remain acceptance checks.
+The button visibility change was also checked in the rendered head-camera view
+with physics paused: FACE ON hid all four button groups, FACE OFF restored them,
+and the separate toggle remained visible and selectable throughout.
 
 Reproduce native validation with the installed Isaac Python wrapper, using separate
 processes for preview and physical movement. The scripts close their owned simulator.
