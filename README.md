@@ -592,21 +592,42 @@ Both hands remain available, and deliberate joystick input cancels facial contro
 Ordinary two-eye blinks do not select turns. **Switch FACE OFF before speaking**,
 because spoken mouth movements can resemble locomotion expressions.
 
+Hold mode confirms a clear expression for **0.18 seconds**. After both eyes close,
+holding only one eye closed can select a turn after a longer **0.5 seconds** of
+continuous confirmation. Brief uneven reopening sends no command, but a prolonged
+uneven blink can resemble this deliberate hold. A clear change to another direction
+uses the normal confirmation interval; you do not have to relax your entire face
+between commands. A deliberate wink takes priority over mouth
+movement that accompanies it. Closing both eyes pauses a held mouth command;
+reopening them while holding the same mouth expression resumes it after confirmation.
+Starting a mouth command requires both eyes clearly open. If a partial wink occurs
+with mouth movement, the mouth must relax before it can select a separate command;
+reopening the eyes alone cannot turn that wink's mouth movement into a sidestep.
+Relaxing still requests a stop. Initial arming and tracking recovery require
+**0.25 seconds** of neutral face with both eyes open.
+
 See the [facial operator instructions](HUMANOID_VR_CONTROL.md#facial-expression-locomotion)
 for transport setup, tuning, arming, and verification. This is an experimental input
 method. Software/simulated-input checks do not establish reliable wearer recognition
 or successful box handling while moving; live facial acceptance is pending.
 An **11 November 2026** eight-second connection probe received valid face data on
 **755 of 758 polls**, with both reported confidence values at **1.0**. This verifies
-the connection during that interval. Guided hardware checks recognized mouth-left,
-mouth-right, and later puckering/backward and mouth-opening/forward; winks still need
-reliability tuning. All six simulated commands passed the native anchored-preview
-check. Per-expression thresholds are available in the
+the connection during that interval. Guided hardware checks recognized the four
+mouth-command mappings; mouth-left was also observed with the adjusted threshold.
+A later live check observed **left-turn activation** with the new 0.5-second
+post-blink rule and valid tracking. This is one successful observation, not a
+repeatability result; reliable left/right wink operation remains unverified. Earlier
+attempts began by closing both eyes, which the previous rule blocked. Per-expression
+thresholds are available in the
 [operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
 uses starter thresholds from the local Quest Pro preview observations. They still
-require validation for the wearer and headset fit. Native preview and physical
-tests passed all six commands using simulated facial input; reliable real winks
-and simultaneous box carrying remain acceptance checks.
+require validation for the wearer and headset fit. After the recognition consistency
+fix, **1,175 offline tests passed** and native physical validation passed all six
+commands with simulated face input. The native run also passed right-wink/mouth
+overlap, weak-wink rejection, the sustained post-blink wink, forward blink pause/resume,
+and stale-input stopping checks; arm/finger updaters continued throughout. The earlier
+anchored-preview check predates this recognition fix. Reliable real winks and
+simultaneous box carrying remain acceptance checks.
 
 ### Retained pointing navigation
 

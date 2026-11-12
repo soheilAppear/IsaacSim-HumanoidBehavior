@@ -164,7 +164,7 @@ class TestFacialIntegrationControls(unittest.TestCase):
         self.ex.g1.robot.get_velocities.assert_not_called()
         self.assertEqual(preview._g1_locomotion, "stationary")
 
-    def test_relaxation_stops_hold_and_requires_neutral_before_next_gesture(self) -> None:
+    def test_relaxation_stops_hold_and_next_gesture_requires_only_confirmation(self) -> None:
         self.activate(JawDrop=0.9)
         self.ex._base_command[:] = self.ex._controller_command
         command = self.tick()
@@ -179,10 +179,20 @@ class TestFacialIntegrationControls(unittest.TestCase):
             values.append(float(self.ex._base_command[0]))
         self.assertTrue(all(a > b > 0 for a, b in zip([0.2, *values], values)))
         self.assertLess(values[-1], 0.01)
-        for _ in range(5):
-            command = self.tick(MouthLeft=0.9)
+        # Releasing stops the old command, but must not lock out a new one.
+        # The new expression still needs fresh, sustained confirmation.
+        command = self.tick(MouthLeft=0.9)
+        self.assertEqual(command.state, "confirming")
         self.assertEqual(command.activation_count, 1)
         self.assertEqual(command.velocity, (0, 0, 0))
+        for _ in range(2):
+            command = self.tick(MouthLeft=0.9)
+        self.assertEqual(command.activation_count, 2)
+        self.assertEqual(command.last_action, "strafe_left")
+        np.testing.assert_allclose(self.ex._controller_command.numpy(), (0, 0.15, 0))
+        for _ in range(5):
+            command = self.tick(MouthLeft=0.9)
+        self.assertEqual(command.activation_count, 2)
 
     def test_stale_invalid_and_lost_xr_session_cancel_active_face_motion(self) -> None:
         for failure in ("age", "valid", "session", "brake"):

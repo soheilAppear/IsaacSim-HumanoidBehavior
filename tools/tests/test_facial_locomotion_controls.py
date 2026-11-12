@@ -105,6 +105,8 @@ class TestFacialLocomotionControls(unittest.TestCase):
         config = FACE.FacialLocomotionConfig()
         self.assertTrue(config.preview)
         self.assertEqual(config.control_mode, "hold")
+        self.assertEqual(config.eye_open_threshold, 0.15)
+        self.assertEqual(config.post_blink_wink_confirm_s, 0.5)
         self.assertEqual((config.distance_m, config.turn_degrees), (0.15, 10))
         self.assertEqual(FACE.FacialLocomotion().command.velocity, (0, 0, 0))
 
@@ -118,7 +120,9 @@ class TestFacialLocomotionControls(unittest.TestCase):
             "yaw_speed": (0, 0.401),
             "activation_threshold": (0.39, 1.01),
             "release_threshold": (-0.01, 0.51),
+            "eye_open_threshold": (-0.01, 0.351),
             "confirm_s": (0.079, 1.01),
+            "post_blink_wink_confirm_s": (0.079, 5.01),
             "neutral_s": (0.099, 1.01),
             "max_sample_age_s": (0.049, 1.01),
             "max_gesture_s": (0.399, 5.01),
@@ -134,6 +138,8 @@ class TestFacialLocomotionControls(unittest.TestCase):
             replace(self.config, activation_threshold=0.4, release_threshold=0.4)
         with self.assertRaises(ValueError):
             replace(self.config, confirm_s=0.8, max_gesture_s=0.8)
+        with self.assertRaises(ValueError):
+            replace(self.config, confirm_s=0.4, post_blink_wink_confirm_s=0.3)
         with self.assertRaises(ValueError):
             replace(self.config, preview=1)
         with self.assertRaises(TypeError):
@@ -279,7 +285,7 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.neutral()
         self.assertEqual(self.controller.command.activation_count, 0)
 
-    def test_staggered_blinks_reject_closure_and_reopening_tails(self) -> None:
+    def test_staggered_blinks_reject_short_closure_and_reopening_tails(self) -> None:
         for first, second in (("turn_left", "turn_right"), ("turn_right", "turn_left")):
             with self.subTest(first=first):
                 self.setUp()
@@ -287,11 +293,80 @@ class TestFacialLocomotionControls(unittest.TestCase):
                 self.tick(first)
                 self.tick(first)
                 self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
-                for _ in range(12):
+                for _ in range(6):
                     result = self.tick(second)
                     self.assertEqual(result.activation_count, 0)
                 self.neutral()
                 self.assertEqual(self.activate(first).activation_count, 1)
+
+    def test_one_fresh_clear_reopening_after_blink_allows_next_confirmed_wink(self) -> None:
+        self.neutral()
+        self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        for _ in range(8):
+            self.assertEqual(self.tick("turn_left").activation_count, 0)
+        # A brief full reopening separates the new gesture from the blink tail;
+        # the new wink still needs its complete confirmation interval.
+        self.tick({"EyesClosedL": 0.05, "EyesClosedR": 0.03})
+        for _ in range(4):
+            self.assertEqual(self.tick("turn_left").activation_count, 0)
+        self.assertEqual(self.tick("turn_left").activated_action, "turn_left")
+
+    def test_cached_or_partial_reopening_does_not_rearm_blink_latch(self) -> None:
+        self.neutral()
+        self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        self.tick(fresh=False)
+        self.tick({"EyesClosedL": 0.2, "EyesClosedR": 0.2})
+        for _ in range(8):
+            result = self.tick("turn_right")
+            self.assertEqual(result.activation_count, 0)
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.state, "confirming")
+            self.assertEqual(result.target, "turn_right")
+        self.assertIn("longer after the blink", result.detail)
+
+    def test_sustained_post_blink_wink_activates_once_at_longer_confirmation(self) -> None:
+        for action in ("turn_left", "turn_right"):
+            with self.subTest(action=action):
+                self.setUp()
+                self.neutral()
+                for _ in range(8):
+                    result = self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+                    self.assertFalse(any(result.velocity))
+                for _ in range(10):
+                    result = self.tick(action)
+                    self.assertEqual(result.activation_count, 0)
+                    self.assertFalse(any(result.velocity))
+                result = self.tick(action)
+                self.assertEqual(result.activated_action, action)
+                self.assertEqual(result.activation_count, 1)
+                self.assertTrue(any(result.velocity))
+                for _ in range(20):
+                    result = self.tick(action)
+                    self.assertEqual(result.activation_count, 1)
+                    self.assertIsNone(result.activated_action)
+                self.assertFalse(any(self.tick().velocity))
+
+    def test_post_blink_wink_confirmation_restarts_on_ambiguity(self) -> None:
+        self.neutral()
+        self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        for _ in range(8):
+            self.tick("turn_left")
+        self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.4})
+        for _ in range(10):
+            self.assertEqual(self.tick("turn_left").activation_count, 0)
+        self.assertEqual(self.tick("turn_left").activated_action, "turn_left")
+
+    def test_post_blink_cached_or_stale_samples_cannot_complete_wink(self) -> None:
+        self.neutral()
+        self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        self.tick("turn_right")
+        for _ in range(20):
+            self.assertEqual(self.tick("turn_right", fresh=False).activation_count, 0)
+        self.tick("turn_right", sample_changes={"age_s": 0.3})
+        for _ in range(20):
+            result = self.tick("turn_right")
+            self.assertEqual(result.activation_count, 0)
+            self.assertFalse(any(result.velocity))
 
     def test_bilateral_closure_during_turn_stops_immediately(self) -> None:
         self.activate("turn_left")
@@ -301,8 +376,8 @@ class TestFacialLocomotionControls(unittest.TestCase):
         for _ in range(10):
             self.assertEqual(self.tick("turn_right").activation_count, 1)
 
-    def test_mouth_and_eye_or_two_mouth_expressions_are_ignored(self) -> None:
-        for expression in ({"JawDrop": 0.9, "EyesClosedL": 0.9}, {"JawDrop": 0.9, "MouthRight": 0.9}):
+    def test_two_mouth_expressions_are_ignored_without_latching_neutral(self) -> None:
+        for expression in ({"JawDrop": 0.9, "MouthRight": 0.9}, {"MouthLeft": 0.9, "MouthRight": 0.9}):
             with self.subTest(expression=expression):
                 self.setUp()
                 self.neutral()
@@ -314,14 +389,182 @@ class TestFacialLocomotionControls(unittest.TestCase):
         for _ in range(10):
             self.assertEqual(self.tick({"LipPuckerL": 0.9}).activation_count, 0)
 
-    def test_direct_gesture_switch_stops_and_requires_neutral(self) -> None:
+    def test_direct_gesture_switch_stops_then_confirms_without_full_neutral(self) -> None:
         self.activate("forward")
         result = self.tick("strafe_left")
         self.assertTrue(result.stop_immediately)
         self.assertEqual(result.velocity, (0, 0, 0))
-        for _ in range(10):
+        for _ in range(3):
             self.assertEqual(self.tick("strafe_left").activation_count, 1)
-        self.assertEqual(self.activate("strafe_left").activation_count, 2)
+        result = self.tick("strafe_left")
+        self.assertEqual(result.activated_action, "strafe_left")
+        self.assertEqual(result.activation_count, 2)
+        self.assertGreater(result.velocity[1], 0)
+        self.assertEqual(result.velocity[0], 0)
+
+    def test_weak_eye_onset_recovers_without_neutral_deadlock(self) -> None:
+        self.use_config(wink_threshold=0.55, release_threshold=0.35)
+        self.neutral()
+        for _ in range(4):
+            result = self.tick({"EyesClosedL": 0.45, "EyesClosedR": 0.40})
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.activation_count, 0)
+        for _ in range(5):
+            result = self.tick({"EyesClosedL": 0.8})
+        self.assertEqual(result.activated_action, "turn_left")
+
+    def test_partial_opposite_eye_interrupts_confirmation_without_disarming(self) -> None:
+        self.use_config(wink_threshold=0.55, release_threshold=0.35)
+        self.neutral()
+        self.tick({"EyesClosedL": 0.8})
+        self.tick({"EyesClosedL": 0.8, "EyesClosedR": 0.4})
+        for _ in range(4):
+            self.assertEqual(self.tick({"EyesClosedL": 0.8}).activation_count, 0)
+        self.assertEqual(self.tick({"EyesClosedL": 0.8}).activated_action, "turn_left")
+
+    def test_wink_priority_accepts_lower_face_crosstalk_without_combining_motion(self) -> None:
+        self.neutral()
+        for _ in range(5):
+            result = self.tick({"EyesClosedR": 0.9, "MouthRight": 1.0, "JawDrop": 0.9})
+        self.assertEqual(result.activated_action, "turn_right")
+        self.assertEqual(result.velocity, (0, 0, -0.25))
+        for _ in range(20):
+            result = self.tick({"EyesClosedR": 0.9, "MouthRight": 1.0})
+            self.assertEqual(result.velocity, (0, 0, -0.25))
+            self.assertEqual(result.activation_count, 1)
+
+    def test_wink_crosstalk_cannot_become_sidestepping_when_eye_reopens(self) -> None:
+        self.neutral()
+        for _ in range(5):
+            self.tick({"EyesClosedR": 0.9, "MouthRight": 1.0})
+        for _ in range(15):
+            result = self.tick({"MouthRight": 1.0})
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.activation_count, 1)
+        self.tick()
+        for _ in range(5):
+            result = self.tick("strafe_right")
+        self.assertEqual(result.activated_action, "strafe_right")
+
+    def test_measured_weak_right_wink_cannot_start_or_leave_a_lingering_sidestep(self) -> None:
+        self.use_config(wink_threshold=0.45, mouth_side_threshold=0.45, release_threshold=0.35)
+        self.neutral()
+        # Observed during the prompted right wink: the eyelid signal is below
+        # wink activation but its accompanying lip signal is a strong sidestep.
+        for left, right, mouth in ((0.110, 0.223, 0.908), (0.056, 0.190, 0.772), (0.134, 0.286, 0.805)):
+            for _ in range(8):
+                result = self.tick({"EyesClosedL": left, "EyesClosedR": right, "MouthRight": mouth})
+                self.assertEqual(result.activation_count, 0)
+                self.assertFalse(any(result.velocity))
+                self.assertEqual(result.state, "blink_pause")
+        for _ in range(8):
+            result = self.tick({"MouthRight": 0.9})
+            self.assertEqual(result.activation_count, 0)
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.state, "confirming")
+        self.tick()
+        for _ in range(5):
+            result = self.tick({"EyesClosedL": 0.053, "EyesClosedR": 0.019, "MouthRight": 0.9})
+        self.assertEqual(result.activated_action, "strafe_right")
+        self.assertEqual(result.velocity, (0, -self.config.lateral_speed, 0))
+
+    def test_partial_eye_closure_pauses_existing_mouth_and_reopens_without_new_event(self) -> None:
+        self.use_config(release_threshold=0.35)
+        self.activate("strafe_right")
+        for _ in range(8):
+            result = self.tick({"MouthRight": 0.9, "EyesClosedL": 0.110, "EyesClosedR": 0.223})
+            self.assertEqual(result.state, "blink_pause")
+            self.assertEqual(result.target, "strafe_right")
+            self.assertTrue(result.stop_immediately)
+            self.assertFalse(any(result.velocity))
+        for _ in range(5):
+            result = self.tick({"MouthRight": 0.9, "EyesClosedL": 0.053, "EyesClosedR": 0.019})
+        self.assertEqual(result.velocity, (0, -self.config.lateral_speed, 0))
+        self.assertEqual(result.activation_count, 1)
+        self.assertIsNone(result.activated_action)
+
+    def test_eye_open_gate_is_configurable_and_does_not_change_step_mode(self) -> None:
+        expression = {"JawDrop": 0.9, "EyesClosedR": 0.12}
+        for mode, eye_limit, expected_count in (("hold", 0.10, 0), ("hold", 0.15, 1), ("step", 0.10, 1)):
+            with self.subTest(mode=mode, eye_limit=eye_limit):
+                self.setUp()
+                self.use_config(control_mode=mode, eye_open_threshold=eye_limit)
+                self.neutral()
+                for _ in range(8):
+                    result = self.tick(expression)
+                self.assertEqual(result.activation_count, expected_count)
+
+    def test_active_mouth_blink_pauses_then_resumes_without_new_activation(self) -> None:
+        self.activate("forward")
+        for _ in range(3):
+            result = self.tick({"JawDrop": 0.9, "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+            self.assertEqual(result.state, "blink_pause")
+            self.assertEqual(result.target, "forward")
+            self.assertTrue(result.stop_immediately)
+            self.assertFalse(any(result.velocity))
+        for _ in range(4):
+            result = self.tick("forward")
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.activation_count, 1)
+        result = self.tick("forward")
+        self.assertGreater(result.velocity[0], 0)
+        self.assertEqual(result.activation_count, 1)
+        self.assertIsNone(result.activated_action)
+
+    def test_staggered_blink_during_mouth_hold_keeps_paused_mouth_identity(self) -> None:
+        self.activate("forward")
+        self.tick({"JawDrop": 0.9, "EyesClosedL": 0.9})
+        self.tick({"JawDrop": 0.9, "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        for _ in range(6):
+            result = self.tick({"JawDrop": 0.9, "EyesClosedR": 0.9})
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.target, "turn_right")
+            self.assertEqual(result.activation_count, 1)
+        for _ in range(5):
+            result = self.tick("forward")
+        self.assertGreater(result.velocity[0], 0)
+        self.assertEqual(result.activation_count, 1)
+        self.assertIsNone(result.activated_action)
+
+    def test_release_or_tracking_loss_during_blink_cannot_resume_old_mouth(self) -> None:
+        for tracking_loss in (False, True):
+            with self.subTest(tracking_loss=tracking_loss):
+                self.setUp()
+                self.activate("forward")
+                self.tick({"JawDrop": 0.9, "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+                if tracking_loss:
+                    self.tick("forward", valid=False)
+                    for _ in range(10):
+                        self.assertFalse(any(self.tick("forward").velocity))
+                else:
+                    self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+                    for _ in range(6):
+                        result = self.tick()
+                        self.assertFalse(any(result.velocity))
+                    for _ in range(5):
+                        result = self.tick("forward")
+                    self.assertEqual(result.activated_action, "forward")
+                    self.assertEqual(result.activation_count, 2)
+
+    def test_ambiguous_mouth_recovers_to_clean_direction_without_neutral(self) -> None:
+        self.neutral()
+        for _ in range(10):
+            result = self.tick({"JawDrop": 0.9, "MouthRight": 0.9})
+            self.assertFalse(any(result.velocity))
+        for _ in range(5):
+            result = self.tick("forward")
+        self.assertEqual(result.activated_action, "forward")
+
+    def test_preview_mouth_blink_resume_never_emits_velocity_or_duplicate_event(self) -> None:
+        self.use_config(preview=True)
+        self.activate("forward")
+        self.tick({"JawDrop": 0.9, "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        for _ in range(10):
+            result = self.tick("forward")
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.activation_count, 1)
+            self.assertIsNone(result.activated_action)
+        self.assertEqual(result.state, "preview")
 
     def test_preview_recognizes_all_holds_and_always_zeroes_velocity(self) -> None:
         self.use_config(preview=True)

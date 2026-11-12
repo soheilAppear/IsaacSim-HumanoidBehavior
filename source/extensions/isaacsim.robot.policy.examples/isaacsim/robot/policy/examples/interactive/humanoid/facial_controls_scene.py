@@ -27,6 +27,13 @@ class FacialControlsScene(GazeControlsScene):
         "face_neutral": ("RELAX FACE", "ready"),
         "face_confirm": ("HOLD FACE", "dwelling"),
         "face_unavailable": ("NO FACE DATA", "no_eye"),
+        "blink_pause": ("OPEN EYES", "dwelling"),
+        "face_confirm_turn_left": ("HOLD L WINK", "dwelling"),
+        "face_confirm_turn_right": ("HOLD R WINK", "dwelling"),
+        "face_confirm_forward": ("HOLD MOUTH", "dwelling"),
+        "face_confirm_back": ("HOLD PUCKER", "dwelling"),
+        "face_confirm_strafe_left": ("HOLD L LIPS", "dwelling"),
+        "face_confirm_strafe_right": ("HOLD R LIPS", "dwelling"),
     }
     _ACTION_LABELS = {
         **GazeControlsScene._ACTION_LABELS,
@@ -128,6 +135,8 @@ class FacialControlsScene(GazeControlsScene):
             "confirming": "face_confirm",
             "unavailable": "face_unavailable",
         }.get(command.state, command.state)
+        if command.state == "confirming" and command.target in self._ACTION_LABELS:
+            state = f"face_confirm_{command.target}"
         self.update(
             {
                 "state": state,

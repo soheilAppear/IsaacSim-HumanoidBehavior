@@ -155,7 +155,8 @@ class TestFacialSceneControls(unittest.TestCase):
             ("idle", "FACE READY"),
             ("awaiting_neutral", "RELAX FACE"),
             ("awaiting_release", "RELAX FACE"),
-            ("confirming", "HOLD FACE"),
+            ("confirming", "HOLD L LIPS"),
+            ("blink_pause", "OPEN EYES"),
             ("unavailable", "NO FACE DATA"),
             ("preview", "PREVIEW"),
             ("active", "RUNNING"),
@@ -167,6 +168,17 @@ class TestFacialSceneControls(unittest.TestCase):
                 self.assertEqual(self.status_label(), label)
                 feedback = self.stage.GetPrimAtPath(f"{self.scene.root_path}/FeedbackAction")
                 self.assertEqual(feedback.GetAttribute("gazeControls:label").Get(), "STEP LEFT")
+
+    def test_confirmation_feedback_names_the_pending_expression(self) -> None:
+        for action, label in (
+            ("turn_left", "HOLD L WINK"),
+            ("turn_right", "HOLD R WINK"),
+            ("forward", "HOLD MOUTH"),
+            ("back", "HOLD PUCKER"),
+            ("strafe_right", "HOLD R LIPS"),
+        ):
+            self.scene.update_facial(self.command("confirming", action, 0.5))
+            self.assertEqual(self.status_label(), label)
 
     def test_facial_updates_preserve_meshes_and_bindings_without_resync(self) -> None:
         def geometry() -> dict:

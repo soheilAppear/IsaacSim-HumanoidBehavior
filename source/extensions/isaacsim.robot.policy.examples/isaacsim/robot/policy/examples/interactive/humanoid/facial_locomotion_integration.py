@@ -58,7 +58,9 @@ class FacialLocomotionIntegration:
                 else None
             ),
             release_threshold=float(os.environ.get("G1_FACE_RELEASE_THRESHOLD", "0.25")),
+            eye_open_threshold=float(os.environ.get("G1_FACE_EYE_OPEN_THRESHOLD", "0.15")),
             confirm_s=float(os.environ.get("G1_FACE_CONFIRM_S", "0.18")),
+            post_blink_wink_confirm_s=float(os.environ.get("G1_FACE_POST_BLINK_WINK_CONFIRM_S", "0.50")),
             neutral_s=float(os.environ.get("G1_FACE_NEUTRAL_S", "0.25")),
         )
         self.controller = FacialLocomotion(config)
@@ -235,7 +237,9 @@ class FacialLocomotionIntegration:
                 "pucker": self.controller._threshold_for("back"),
                 "mouth_side": self.controller._threshold_for("strafe_left"),
                 "release": self.controller.config.release_threshold,
+                "eye_open": self.controller.config.eye_open_threshold,
                 "confirm_s": self.controller.config.confirm_s,
+                "post_blink_wink_confirm_s": self.controller.config.post_blink_wink_confirm_s,
                 "neutral_s": self.controller.config.neutral_s,
             },
             "transport": self.receiver.diagnostics(),

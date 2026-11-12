@@ -17,11 +17,15 @@ if not defined G1_FACE_LATERAL_SPEED set "G1_FACE_LATERAL_SPEED=0.15"
 if not defined G1_FACE_YAW_SPEED set "G1_FACE_YAW_SPEED=0.25"
 REM Starter thresholds from this Quest Pro's preview observations. Recheck after
 REM changing headset fit; these remain overridable and are not a reliability claim.
-if not defined G1_FACE_WINK_THRESHOLD set "G1_FACE_WINK_THRESHOLD=0.55"
+if not defined G1_FACE_WINK_THRESHOLD set "G1_FACE_WINK_THRESHOLD=0.45"
 if not defined G1_FACE_JAW_THRESHOLD set "G1_FACE_JAW_THRESHOLD=0.45"
 if not defined G1_FACE_PUCKER_THRESHOLD set "G1_FACE_PUCKER_THRESHOLD=0.40"
-if not defined G1_FACE_MOUTH_SIDE_THRESHOLD set "G1_FACE_MOUTH_SIDE_THRESHOLD=0.65"
+if not defined G1_FACE_MOUTH_SIDE_THRESHOLD set "G1_FACE_MOUTH_SIDE_THRESHOLD=0.45"
 if not defined G1_FACE_RELEASE_THRESHOLD set "G1_FACE_RELEASE_THRESHOLD=0.35"
+REM Mouth commands require clearly open eyes; a weak wink must not become a sidestep.
+if not defined G1_FACE_EYE_OPEN_THRESHOLD set "G1_FACE_EYE_OPEN_THRESHOLD=0.15"
+REM A deliberate held wink may start with a bilateral blink; confirm its one-eye hold longer.
+if not defined G1_FACE_POST_BLINK_WINK_CONFIRM_S set "G1_FACE_POST_BLINK_WINK_CONFIRM_S=0.50"
 
 REM Forward raw arguments once; the gaze wrapper consumes the leading mode flag.
 REM This preserves quoted Isaac arguments and its fixed-base preview guarantee.

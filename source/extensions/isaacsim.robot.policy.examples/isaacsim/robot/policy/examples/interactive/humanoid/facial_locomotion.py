@@ -8,8 +8,10 @@ measures travel, heading and settling, while the caller retains the physical gai
 balance guards and all hand controls. No expression updates a robot root pose.
 Hold mode moves only while an expression remains held and stops upon relaxation.
 Optional step mode commits winks on reopening and mouth gestures on confirmation,
-then finishes one short movement independently of expression. A bilateral blink
-poisons the entire cycle until neutral. Stale input or lost readiness cancels all
+then finishes one short movement independently of expression. Hold mode handles
+eye and mouth intent separately: winks take priority over incidental mouth motion,
+and a blink pauses a held mouth request until the eyes reopen and it is reconfirmed.
+Stale input or lost readiness cancels all
 intent. This module owns no sockets, XR devices, scene prims or simulator callbacks.
 """
 
@@ -55,7 +57,9 @@ class FacialLocomotionConfig:
         pucker_threshold: Optional bilateral-pucker activation threshold; None uses the shared threshold.
         mouth_side_threshold: Optional left/right mouth activation threshold; None uses the shared threshold.
         release_threshold: Maximum weight permitted in neutral and unused channels.
+        eye_open_threshold: Maximum closure per eye for hold-mode mouth motion; independent of wink detection.
         confirm_s: Sustained wall-time confirmation on distinct input samples.
+        post_blink_wink_confirm_s: Longer hold confirmation for a unilateral wink following a bilateral blink.
         neutral_s: Sustained neutral interval required before a new gesture.
         max_sample_age_s: Maximum accepted receive age and update interruption.
         max_gesture_s: Maximum duration for completing a unilateral wink.
@@ -78,7 +82,9 @@ class FacialLocomotionConfig:
     pucker_threshold: float | None = None
     mouth_side_threshold: float | None = None
     release_threshold: float = 0.25
+    eye_open_threshold: float = 0.15
     confirm_s: float = 0.18
+    post_blink_wink_confirm_s: float = 0.5
     neutral_s: float = 0.25
     max_sample_age_s: float = 0.25
     max_gesture_s: float = 2.0
@@ -98,7 +104,9 @@ class FacialLocomotionConfig:
             ("yaw_speed", 0.01, 0.40),
             ("activation_threshold", 0.40, 1.0),
             ("release_threshold", 0.0, 0.50),
+            ("eye_open_threshold", 0.0, 0.35),
             ("confirm_s", 0.08, 1.0),
+            ("post_blink_wink_confirm_s", 0.08, 5.0),
             ("neutral_s", 0.10, 1.0),
             ("max_sample_age_s", 0.05, 1.0),
             ("max_gesture_s", 0.40, 5.0),
@@ -118,6 +126,8 @@ class FacialLocomotionConfig:
                 raise ValueError(f"release_threshold must be smaller than {name}")
         if self.max_gesture_s <= self.confirm_s:
             raise ValueError("max_gesture_s must exceed confirm_s")
+        if self.post_blink_wink_confirm_s < self.confirm_s:
+            raise ValueError("post_blink_wink_confirm_s must be at least confirm_s")
 
 
 @dataclass(frozen=True)
@@ -125,7 +135,8 @@ class FacialLocomotionCommand:
     """Publish recognition and body-forward/body-left/yaw-left intent.
 
     ``activated_action`` is an event on one update only. ``busy`` covers physical
-    travel and measured settling; new expressions during that period are ignored.
+    travel and measured settling. Step mode ignores new expressions during that
+    period; hold mode can stop and reconfirm a different direction.
     ``neutral_ready`` permits a new expression after a valid neutral interval.
     ``stop_immediately`` asks the caller to clear the velocity smoothing filter.
     """
@@ -146,10 +157,13 @@ class FacialLocomotionCommand:
 class FacialLocomotion:
     """Convert deliberate expressions into supervised base movement.
 
-    Both eyes must remain open for mouth commands. A wink requires the opposite
-    eye and all mouth channels to remain neutral throughout its recognition cycle.
-    Any conflicting expression requires a fresh neutral interval. The caller must
-    explicitly enable this controller before speaking or eating can create intent.
+    Startup and tracking recovery require a neutral face. In hold mode, a qualified
+    unilateral wink owns the request even when the mouth moves with it. Short
+    asymmetric blink tails do not become turns. A clearly unilateral closure
+    held beyond the longer post-blink interval can deliberately start a turn. A held
+    mouth command pauses during eye closure and resumes after open-eye confirmation.
+    Clean direction changes reconfirm without requiring the entire face to relax.
+    The caller must explicitly enable this controller before expressions create intent.
 
     Args:
         config: Validated gesture and movement configuration, or preview defaults.
@@ -213,6 +227,14 @@ class FacialLocomotion:
         self._neutral_since_s: float | None = None
         self._candidate: str | None = None
         self._candidate_since_s: float | None = None
+        self._wink_confirmed = False
+        self._blink_blocked = False
+        self._hold_paused_action: str | None = None
+        self._mouth_armed = False
+
+    def _clear_hold_candidate(self) -> None:
+        """Restart confirmation without discarding the preceding neutral arming."""
+        self._candidate = self._candidate_since_s = None
         self._wink_confirmed = False
 
     def _publish(
@@ -310,7 +332,7 @@ class FacialLocomotion:
         return None, False
 
     def _recognize(self, values: dict[str, float], now_s: float) -> str | None:
-        """Accumulate a deliberate gesture only across distinct fresh samples."""
+        """Accumulate a step-mode gesture only across distinct fresh samples."""
         action, neutral = self._classify(values)
         if self._candidate in ("turn_left", "turn_right"):
             candidate = self._candidate
@@ -339,9 +361,6 @@ class FacialLocomotion:
             if action == candidate:
                 if elapsed + 1e-12 >= self.config.confirm_s:
                     self._wink_confirmed = True
-                    if self.config.control_mode == "hold":
-                        self._clear_recognition()
-                        return candidate
                 self._publish(
                     "wink_release" if self._wink_confirmed else "confirming",
                     "Reopen the winked eye to turn" if self._wink_confirmed else "Confirming deliberate wink",
@@ -412,23 +431,165 @@ class FacialLocomotion:
                 return action
         return None
 
-    def _held_expression(self, values: dict[str, float]) -> tuple[bool, bool]:
-        """Apply release hysteresis while rejecting a second active expression."""
+    def _update_blink_latch(self, values: dict[str, float]) -> None:
+        """Require longer wink confirmation after a bilateral closure.
+
+        A fresh clearly-both-open sample clears the latch for normal confirmation.
+        Otherwise a subsequent unilateral closure must complete the configured
+        longer hold before the caller clears this latch and starts turning.
+        """
+        left, right = values["EyesClosedL"], values["EyesClosedR"]
+        if left >= self._threshold_for("turn_left") and right >= self._threshold_for("turn_right"):
+            self._blink_blocked = True
+        elif max(left, right) <= self.config.eye_open_threshold:
+            self._blink_blocked = False
+
+    def _hold_wink(self, values: dict[str, float], *, continuing: str | None = None) -> str | None:
+        """Select only a clear unilateral closure, independently of lower-face cross-talk."""
         low = self.config.release_threshold
-        if max(values[name] for name in REQUIRED_WEIGHTS) <= low:
-            return False, False
-        names = {
-            "turn_left": ("EyesClosedL",),
-            "turn_right": ("EyesClosedR",),
-            "forward": ("JawDrop",),
-            "back": ("LipPuckerL", "LipPuckerR"),
-            "strafe_left": ("MouthLeft",),
-            "strafe_right": ("MouthRight",),
-        }[self._action]
-        held = min(values[name] for name in names) > low and all(
-            values[name] <= low for name in REQUIRED_WEIGHTS if name not in names
-        )
-        return held, not held
+        for action, closed, opened in (
+            ("turn_left", "EyesClosedL", "EyesClosedR"),
+            ("turn_right", "EyesClosedR", "EyesClosedL"),
+        ):
+            threshold = low if continuing == action else self._threshold_for(action)
+            closed_enough = values[closed] > threshold if continuing == action else values[closed] >= threshold
+            if closed_enough and values[opened] <= low:
+                return action
+        return None
+
+    def _hold_mouth(self, values: dict[str, float], *, continuing: str | None = None) -> str | None:
+        """Require one mouth command while ignoring eye channels for blink-paused intent."""
+        low = self.config.release_threshold
+        for action, names in (
+            ("forward", ("JawDrop",)),
+            ("back", ("LipPuckerL", "LipPuckerR")),
+            ("strafe_left", ("MouthLeft",)),
+            ("strafe_right", ("MouthRight",)),
+        ):
+            threshold = low if continuing == action else self._threshold_for(action)
+            weight = min(values[name] for name in names)
+            expressive = weight > threshold if continuing == action else weight >= threshold
+            if expressive and all(values[name] <= low for name in REQUIRED_WEIGHTS[2:] if name not in names):
+                return action
+        return None
+
+    def _update_hold(self, values: dict[str, float], *, fresh: bool, **motion) -> FacialLocomotionCommand:
+        """Resolve held gestures without allowing a transient to permanently lock them out."""
+        now_s = motion["now_s"]
+        low = self.config.release_threshold
+        # A relaxed mouth can tolerate more weight than a clearly open eye. Using
+        # its release threshold here misreads a weak wink plus cheek motion as a
+        # sidestep, even though the wink never reaches its activation threshold.
+        eyes_open = max(values["EyesClosedL"], values["EyesClosedR"]) <= self.config.eye_open_threshold
+        mouth_neutral = max(values[name] for name in REQUIRED_WEIGHTS[2:]) <= low
+        if fresh:
+            self._update_blink_latch(values)
+            if mouth_neutral:
+                self._mouth_armed = True
+        if not self._neutral_ready:
+            if fresh and eyes_open and mouth_neutral:
+                if self._neutral_since_s is None:
+                    self._neutral_since_s = now_s
+                if now_s - self._neutral_since_s + 1e-12 >= self.config.neutral_s:
+                    self._neutral_ready = True
+            elif fresh:
+                self._neutral_since_s = None
+            return self._publish(
+                "idle" if self._neutral_ready else "awaiting_neutral",
+                "Ready for one deliberate expression" if self._neutral_ready else "Relax your face with both eyes open",
+            )
+
+        current = self._action or self._hold_paused_action
+        wink = self._hold_wink(values, continuing=self._action)
+        mouth = self._hold_mouth(values, continuing=current)
+        preserve_mouth = current is not None and not current.startswith("turn") and mouth == current and not eyes_open
+        if not eyes_open and not mouth_neutral and not preserve_mouth:
+            # A newly arriving mouth signal during eye closure may be wink
+            # cross-talk. Do not let it turn into translation on reopening. An
+            # established mouth hold is exempt so ordinary blinks can resume it.
+            self._mouth_armed = False
+        # A clear wink has explicit priority. Natural cheek/lip movement during a
+        # right wink must not turn it into a sidestep, including after release.
+        if wink is not None:
+            desired = wink
+            if self._action in ("turn_left", "turn_right"):
+                self._mouth_armed = mouth_neutral
+            if preserve_mouth:
+                # One eyelid often leads an ordinary blink. Retain the mouth
+                # request until a deliberate wink actually completes confirmation.
+                self._hold_paused_action = current
+        elif preserve_mouth:
+            if self._action is not None:
+                self._advance_motion(held=False, release_immediately=True, **motion)
+                if self.command.state == "fault":
+                    return self.command
+            self._hold_paused_action = current
+            self._clear_hold_candidate()
+            return self._publish(
+                "blink_pause", "Open both eyes to resume the held mouth command", target=current, stop_immediately=True
+            )
+        elif eyes_open and self._mouth_armed:
+            desired = mouth
+        else:
+            desired = None
+
+        if self._action is not None and desired == self._action:
+            return self._advance_motion(**motion)
+        old_action = self._action
+        if old_action is not None:
+            # Clear the previous velocity before confirming a different direction.
+            self._advance_motion(held=False, release_immediately=desired is not None or not eyes_open, **motion)
+            if self.command.state == "fault":
+                return self.command
+        resuming = desired is not None and desired == self._hold_paused_action
+        if not resuming and not preserve_mouth:
+            self._hold_paused_action = None
+        if desired is None:
+            self._clear_hold_candidate()
+            state = "idle" if eyes_open and mouth_neutral else "confirming"
+            detail = (
+                "Ready for another expression" if eyes_open and mouth_neutral else "Waiting for one clear expression"
+            )
+            if self._blink_blocked:
+                state = "blink_pause"
+                detail = "Open both eyes once after a blink before another wink"
+            elif not eyes_open and self._hold_paused_action is None:
+                state = "blink_pause"
+                detail = "Open both eyes before a new mouth command, or make one clear wink"
+            elif eyes_open and not self._mouth_armed:
+                detail = "Relax your mouth after eye closure before a new mouth command"
+            return self._publish(
+                state,
+                detail,
+                stop_immediately=old_action is not None and not (eyes_open and mouth_neutral),
+            )
+        if not fresh:
+            return self._publish("confirming", "Waiting for a fresh expression sample", target=desired)
+        if self._candidate != desired:
+            self._candidate = desired
+            self._candidate_since_s = now_s
+        elapsed = now_s - self._candidate_since_s
+        post_blink_wink = self._blink_blocked and desired.startswith("turn")
+        confirmation_s = self.config.post_blink_wink_confirm_s if post_blink_wink else self.config.confirm_s
+        if elapsed + 1e-12 < confirmation_s:
+            return self._publish(
+                "confirming",
+                (
+                    "Hold this unilateral wink longer after the blink"
+                    if post_blink_wink
+                    else "Reconfirming the held mouth command" if resuming else "Hold one deliberate expression briefly"
+                ),
+                target=desired,
+                progress=elapsed / confirmation_s,
+                stop_immediately=old_action is not None,
+            )
+        self._action = desired
+        self._hold_paused_action = None
+        self._clear_hold_candidate()
+        if desired.startswith("turn"):
+            self._blink_blocked = False
+            self._mouth_armed = mouth_neutral
+        return self._advance_motion(activating=True, count_activation=not resuming, **motion)
 
     @staticmethod
     def _movement_pose(
@@ -449,6 +610,7 @@ class FacialLocomotion:
         linear_speed_m_s: float,
         yaw_speed_rad_s: float,
         activating: bool = False,
+        count_activation: bool = True,
         held: bool = True,
         release_immediately: bool = False,
     ) -> FacialLocomotionCommand:
@@ -473,7 +635,7 @@ class FacialLocomotion:
             return self._inhibit(result.detail, fault=True)
         if activating and result.activated_action is None:
             return self._inhibit("Valid measured robot pose and speeds are required")
-        if activating:
+        if activating and count_activation:
             self._last_action = action
             self._activation_count += 1
         velocity = result.velocity
@@ -482,7 +644,10 @@ class FacialLocomotion:
         preview_held = self.config.preview and self.config.control_mode == "hold" and held
         if result.state not in ("active", "stopping") and not preview_held:
             self._action = None
-            self._clear_recognition()
+            if self.config.control_mode == "hold":
+                self._clear_hold_candidate()
+            else:
+                self._clear_recognition()
         state = "awaiting_neutral" if result.state == "awaiting_release" else result.state
         if state == "preview":
             detail = (
@@ -509,7 +674,7 @@ class FacialLocomotion:
             target=action,
             progress=result.progress,
             velocity=velocity,
-            activated_action=action if activating else None,
+            activated_action=action if activating and count_activation else None,
             stop_immediately=result.stop_immediately,
         )
 
@@ -569,10 +734,9 @@ class FacialLocomotion:
             linear_speed_m_s=linear_speed_m_s,
             yaw_speed_rad_s=yaw_speed_rad_s,
         )
+        if self.config.control_mode == "hold":
+            return self._update_hold(values, fresh=fresh, **arguments)
         if self._action is not None:
-            if self.config.control_mode == "hold":
-                held, immediate = self._held_expression(values)
-                return self._advance_motion(held=held, release_immediately=immediate, **arguments)
             return self._advance_motion(**arguments)
         if not fresh:
             return self._publish(

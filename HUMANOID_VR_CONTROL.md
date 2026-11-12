@@ -751,17 +751,62 @@ topology, so switch them by exiting and relaunching.
 | Close both eyes | Request zero movement | Bilateral closure |
 
 The default **hold** mode confirms a single deliberate expression for **0.18 seconds**
-before requesting movement. Keep holding it to continue. Relaxing, an ambiguous
-combination, or invalid/stale face input requests a stop. A physical robot needs time
-to brake; the zero request is not an instantaneous halt. A normal two-eye blink
-cannot select a turn. A long uneven blink or squint may still resemble a deliberate
-wink, so recognition needs testing with the individual wearer.
-After releasing a command, return to a neutral face with both eyes open for
-**0.25 seconds** before starting another. Directly changing from one expression to
-another does not bypass this neutral check. The launcher starts with individual
-activation thresholds of **0.55 for winks, 0.45 for jaw opening, 0.40 for puckering,
-and 0.65 for sideways lips**, with a **0.35 release threshold**. These starter values
+before requesting movement. Keep holding it to continue; relaxing requests a stop.
+Switching directly to another clear expression stops the old request and confirms
+the new one for the same **0.18 seconds**. Intermediate or ambiguous signals also
+stop the request and restart confirmation when a clear expression returns, without
+locking recognition until the whole face relaxes. Initial arming and recovery after
+invalid/stale tracking still require a neutral face with both eyes open for
+**0.25 seconds**. A physical robot needs time to brake; a zero request is not an
+instantaneous halt.
+
+A deliberate unilateral wink takes priority over accompanying mouth movement.
+The remaining mouth movement cannot become a sidestep or other mouth command after
+the wink until the mouth returns to neutral. Closing both eyes requests zero movement.
+Afterward, clearly holding only one eye closed can select its turn after **0.5 seconds**
+of continuous confirmation, without first reopening both eyes. Brief asymmetric
+reopening sends no command. Opening both eyes clears the blink state; a later clean
+wink uses the normal **0.18-second** confirmation. Tracking loss still requires the
+initial neutral recovery sequence.
+
+This accepts deliberate winks that begin with a two-eye closure, as requested for
+this wearer. A prolonged uneven blink can produce the same signal as a deliberate
+held wink and may therefore select a turn. Test both ordinary blinking and intended
+turns in preview before relying on this setting.
+
+If a mouth command is already active, blinking pauses its movement request. Keep
+holding the same mouth expression and reopen both eyes to resume after the
+**0.18-second confirmation**,
+without a new activation. Relaxing the mouth during this pause cancels the held
+command. A long uneven blink or squint may still resemble a deliberate wink, so
+recognition needs testing with the individual wearer.
+
+Starting a mouth command requires both eye-closure weights at or below **0.15**,
+which is stricter than the general expression-release threshold. A partial eye
+closure with mouth movement blocks new mouth commands until the mouth relaxes;
+reopening the eyes while keeping the mouth displaced does not select a sidestep.
+This catches weak winks whose mouth motion is stronger than their eye signal.
+It does not turn a weak wink into a recognized turn. An already active mouth
+command retains the blink pause/resume behavior described above.
+The same clear-eye threshold applies to initial hold-mode arming and blink recovery.
+
+The launcher starts with individual
+activation thresholds of **0.45 for winks, 0.45 for jaw opening, 0.40 for puckering,
+and 0.45 for sideways lips**, with a **0.35 release threshold**. These starter values
 come from this headset's preview observations and need rechecking after fit changes.
+
+The in-headset status identifies what recognition needs:
+
+- **RELAX FACE**: open both eyes and relax your mouth for the initial or recovery
+  neutral interval.
+- **HOLD L/R WINK**, **HOLD MOUTH**, **HOLD PUCKER**, or **HOLD L/R LIPS**: a specific
+  command is being confirmed. The usual interval is **0.18 seconds**; a wink after
+  both eyes close requires **0.5 seconds** of clear unilateral closure.
+- **OPEN EYES**: eye closure blocks recognition. Reopen both eyes; if a mouth
+  command was already active, keeping that expression resumes it after confirmation.
+- **NO FACE DATA**: usable face data is missing. The movement request is cleared; after tracking
+  recovers, relax your face to rearm. Stronger expressions cannot repair a missing
+  or low-confidence tracking stream.
 
 While **FACE ON** owns locomotion, looking at a direction button does not issue a
 second body command. The gaze data and hand/arm control continue independently.
@@ -800,13 +845,15 @@ the existing gaze speeds.
 | `G1_FACE_LATERAL_SPEED` | `0.15` | Sidestep request in m/s |
 | `G1_FACE_YAW_SPEED` | `0.25` | Turn request in rad/s |
 | `G1_FACE_ACTIVATION_THRESHOLD` | `0.65` | Shared activation threshold for every expression without its own override |
-| `G1_FACE_WINK_THRESHOLD` | `0.55` | Left/right eye closure |
+| `G1_FACE_WINK_THRESHOLD` | `0.45` | Left/right eye closure |
 | `G1_FACE_JAW_THRESHOLD` | `0.45` | Forward mouth opening |
 | `G1_FACE_PUCKER_THRESHOLD` | `0.40` | Backward bilateral lip puckering |
-| `G1_FACE_MOUTH_SIDE_THRESHOLD` | `0.65` | Left/right mouth movement |
+| `G1_FACE_MOUTH_SIDE_THRESHOLD` | `0.45` | Left/right mouth movement |
 | `G1_FACE_RELEASE_THRESHOLD` | `0.35` | Shared release threshold, below every activation threshold |
+| `G1_FACE_EYE_OPEN_THRESHOLD` | `0.15` | Maximum closure on each eye for hold-mode arming, mouth authorization, and blink recovery |
 | `G1_FACE_CONFIRM_S` | `0.18` | Required deliberate-expression confirmation time in seconds |
-| `G1_FACE_NEUTRAL_S` | `0.25` | Required neutral interval before another expression in seconds |
+| `G1_FACE_POST_BLINK_WINK_CONFIRM_S` | `0.5` | Continuous unilateral wink confirmation after both eyes closed; hold mode only |
+| `G1_FACE_NEUTRAL_S` | `0.25` | Neutral interval for initial arming/tracking recovery; also required between gestures in optional step mode |
 
 For example, `$env:G1_FACE_FORWARD_SPEED = '0.30'` adjusts facial forward speed for
 the next launch. Supported caps are **0.65 m/s forward**, **0.35 m/s reverse**,
@@ -819,6 +866,12 @@ values above. When constructing the controller directly, an expression threshold
 of `None` falls back to `G1_FACE_ACTIVATION_THRESHOLD`. Do not put the literal string
 `None` in an environment variable. Set a numeric value from **0.40 to 1.0**, above
 the release threshold.
+`G1_FACE_EYE_OPEN_THRESHOLD` is a separate clear-eye limit with an allowed range of
+**0.0 to 0.35**; it does not follow those activation-threshold bounds. Raising it
+can allow partial eye closures to qualify as open eyes, weakening weak-wink rejection.
+`G1_FACE_POST_BLINK_WINK_CONFIRM_S` accepts **0.08 to 5.0 seconds** and must be at
+least `G1_FACE_CONFIRM_S`. Shortening it makes uneven blinking more likely to select
+a turn; increasing it makes deliberate turns after a blink slower to start.
 For example, `$env:G1_FACE_JAW_THRESHOLD = '0.50'` changes only mouth-opening
 activation for the next launch. To restore the launcher's starter value, use
 `Remove-Item Env:G1_FACE_JAW_THRESHOLD -ErrorAction SilentlyContinue`.
@@ -839,9 +892,11 @@ relax-to-stop interaction. Disabling facial input, tracking loss, and control fa
 still interrupt a step.
 
 Acceptance checks for the wearer are a neutral face, ordinary blinks, deliberate
-left/right winks, each mouth gesture, relaxation, and speaking with facial control
-off. Confirm that the intended command is stable, no command appears for ordinary
-blinking, and relaxation stops the request. Then verify simultaneous optical hand
+left/right winks, each mouth gesture, direct direction changes, relaxation, and
+speaking with facial control off. Confirm that a wink still selects the intended
+turn when the mouth moves with it, ordinary blinks never select a turn, and blinking
+during a held mouth command pauses and then resumes that same command. Relaxation
+must stop the request. Then verify simultaneous optical hand
 motion and a box-handling attempt during short movements. Software tests and
 simulated inputs do not establish the wearer's tracking quality, comfort, or successful
 pickup/carry/place performance. Live facial tracking acceptance remains pending.
@@ -853,25 +908,55 @@ not a count of independent captured headset frames. This confirms the local
 connection for that interval. The guided six-expression recognition check and
 native robot-movement validation are separate from that connection check.
 
-The first guided hardware preview recognized **mouth-left and mouth-right** commands.
-A later calibration observation also recognized **puckering/backward** and a further
-trial recognized **jaw-opening/forward**. Reliable left/right wink recognition still
-needs tuning and repeat trials. These observations are not a six-command hardware acceptance pass or a
-measured false-activation rate.
+Guided hardware recordings recognized **jaw-opening/forward**, **puckering/backward**,
+and **mouth-right/sidestep-right**. Mouth-left required a stronger expression or
+lower threshold; a later preview recognized it with the **0.45** threshold.
+The wink trials supplied valid tracking but began with bilateral closure followed
+by unilateral closure, which the previous rule rejected. The wearer then selected
+acceptance of a clearly held unilateral wink after **0.5 seconds**. A later live
+observation showed **active left turn**, activation count **2**, both tracking
+confidence values at **1.0**, and no reported control fault. This confirms an observed
+left-turn activation with the revised recognizer; it is not a repeatability or
+false-activation measurement. Reliable left/right wink operation remains unverified,
+and right-wink acceptance is still pending.
+These observations are not a six-command hardware acceptance pass or a measured
+false-activation rate.
 
-The **native Isaac anchored-preview check passed all six commands using simulated
-face input**, with the base remaining anchored. The rendered controls were also
-reviewed for readability. **Native physical validation also passed all six commands**
-with the real walking actor and simulated facial input. Forward traveled 0.174 m,
-backward 0.629 m, left/right sidesteps 0.111/0.139 m, and left/right turns
-0.290/0.343 radians during the selected holds. Each movement passed measured stopping
-checks, including stale-input cancellation. Arm and finger updater methods each ran
-9,747 times; this proves execution alongside walking, not successful hand tracking
-or box carrying. Box handling with facial locomotion remains an operator acceptance check.
+Before the recognition consistency fix, the **native Isaac anchored-preview check
+passed all six commands using simulated face input**, with the base remaining
+anchored. The rendered controls were also reviewed for readability. That preview run
+does not validate the revised recognition behavior.
 
-The complete offline suite passed **1,157 tests** after integration, including the
-new transport, gesture, ownership, and real-USD HUD checks. The launcher and gesture
-checks also passed after the starter threshold updates. In the running Quest Pro
+**Native physical validation passed after the consistency fix**, using the real
+walking actor and simulated facial input. Forward traveled 0.182 m, backward
+0.647 m, left/right sidesteps 0.101/0.138 m, and left/right turns 0.295/0.435 radians
+during the selected holds. The right turn remained active when `MouthRight=1` was
+added to its wink. During held forward motion, a bilateral blink cleared requested
+and filtered velocity, reopening required fresh confirmation, and resuming forward
+retained the original activation count. Every direction passed measured stopping
+checks, including the final stale-input cancellation; brief unilateral closure and
+bilateral blinks selected no command. Scene reset also disarmed facial control.
+Arm and finger updater methods each ran **11,314 times**; this proves execution
+alongside walking, not successful hand tracking or box carrying. The local report is
+`output/facial_post_blink_validation/face-move-20261112T033529Z-87b7dab1.json`.
+Reliable wearer recognition and box handling remain operator acceptance checks.
+
+The final native run also passed the weak-wink regression: eye-closure weights
+`0.110/0.223` with `MouthRight=0.908`, followed by both eyes opening while the mouth
+remained displaced. Both intervals kept requested and filtered movement at zero,
+with no sidestep activation. Relaxing the mouth restored readiness before the
+six-direction movement route. The sustained post-blink check also passed: after a
+bilateral blink, a **0.25-second** unilateral closure sent zero motion, continuing
+the same closure through the **0.5-second** confirmation produced exactly one left
+turn, and relaxation stopped it. This run used strong synthetic expressions and
+the core activation thresholds, so it does not calibrate the launcher's starter
+thresholds to a wearer.
+
+The complete offline suite passed **1,175 tests** after the recognition consistency
+changes, including the weak-wink guard and sustained post-blink wink. These include
+transport, gesture transitions, control ownership, and real-USD HUD checks. The regressions cover
+wink/mouth overlap, blink pause and recovery, direct changes between clear expressions,
+and tracking-loss rearming. In the running Quest Pro
 preview, the wearer confirmed that the robot scene and FACE OFF control were visible.
 
 Reproduce native validation with the installed Isaac Python wrapper, using separate

@@ -245,6 +245,59 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
         _require(face.controller.command.activation_count == count, "Bilateral blink activated")
         report["blink_rejection_passed"] = True
 
+        report["phase"] = "weak_wink_mouth_rejection"
+        # This observed combination is a partial right-eye closure with strong
+        # accompanying mouth motion. It must not be interpreted as a sidestep.
+        fixture["expression"] = {"EyesClosedL": 0.110, "EyesClosedR": 0.223, "MouthRight": 0.908}
+        await wait_sim(face.controller.config.confirm_s + 0.10)
+        report["weak_wink_mouth"] = snapshot()
+        _require(face.controller.command.activation_count == count, "Weak wink selected a mouth command")
+        _require(not any(face.controller.command.velocity), "Weak wink emitted facial velocity")
+        _require(not any(float(value) for value in example._base_command), "Weak wink retained filtered intent")
+        fixture["expression"] = {"MouthRight": 0.908}
+        await wait_sim(face.controller.config.confirm_s + 0.10)
+        report["weak_wink_mouth_after_reopening"] = snapshot()
+        _require(face.controller.command.activation_count == count, "Reopening promoted wink overlap to a sidestep")
+        _require(not any(face.controller.command.velocity), "Wink mouth overlap moved after eye reopening")
+        _require(not any(float(value) for value in example._base_command), "Reopening retained filtered intent")
+        await neutral()
+        report["weak_wink_mouth_rejection_passed"] = True
+
+        report["phase"] = "post_blink_wink"
+        # A brief uneven reopening remains a blink. The wearer may deliberately
+        # hold one eye closed afterward for the longer configured confirmation.
+        fixture["expression"] = {"EyesClosedL": 0.9, "EyesClosedR": 0.9}
+        await wait_sim(0.30)
+        _require(face.controller.command.activation_count == count, "Bilateral closure selected a turn")
+        fixture["expression"] = "turn_left"
+        post_blink_confirm = face.controller.config.post_blink_wink_confirm_s
+        await wait_sim(post_blink_confirm / 2)
+        report["post_blink_short_unilateral"] = snapshot()
+        _require(face.controller.command.activation_count == count, "Brief post-blink closure selected a turn")
+        _require(not any(face.controller.command.velocity), "Brief post-blink closure emitted velocity")
+        _require(not any(float(value) for value in example._base_command), "Brief post-blink closure retained intent")
+        await wait_sim(post_blink_confirm / 2 + 0.05)
+        report["post_blink_wink_activated"] = snapshot()
+        _require(face.controller.command.activation_count == count + 1, "Held post-blink wink did not activate once")
+        _require(
+            face.controller.command.busy and face.controller.command.target == "turn_left",
+            "Held post-blink wink did not select the left turn",
+        )
+        if not preview:
+            _require(face.controller.command.velocity[2] > 0, "Held post-blink wink selected the wrong turn direction")
+        await wait_sim(0.10)
+        _require(face.controller.command.activation_count == count + 1, "Held post-blink wink repeated activation")
+        fixture["expression"] = None
+        await wait_sim(0.02)
+        _require(not any(face.controller.command.velocity), "Relaxing a post-blink wink retained facial velocity")
+        await neutral(5.0 if not preview else 0.35)
+        _require(
+            max(abs(float(value)) for value in example._base_command) < 1e-5,
+            "Post-blink turn did not clear filtered intent after relaxation",
+        )
+        report["post_blink_wink_stopped"] = snapshot()
+        report["post_blink_wink_passed"] = True
+
         for action in ACTIONS:
             report["phase"] = action
             await neutral()
@@ -261,6 +314,19 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
             )
             _require(face.controller.command.last_action == action, "Wrong facial action selected")
             entry["activated"] = snapshot()
+            if action == "turn_right":
+                # Real Quest winks can move the mouth on the same side. This must
+                # not cancel an already qualified turn or select a sidestep.
+                fixture["expression"] = {"EyesClosedR": 0.9, "MouthRight": 1.0}
+                await wait_sim(face.controller.config.confirm_s + 0.05)
+                entry["mouth_overlap"] = snapshot()
+                command = face.controller.command
+                _require(command.busy and command.target == "turn_right", "Mouth overlap cancelled the right wink")
+                _require(command.activation_count == baseline + 1, "Mouth overlap repeated the right-turn activation")
+                if not preview:
+                    _require(command.velocity[2] < 0, "Mouth overlap changed the right-turn direction")
+                    _require(not any(command.velocity[:2]), "Mouth overlap added translation to a right turn")
+                entry["mouth_overlap_passed"] = True
             await wait_sim(duration)
             entry["held"] = snapshot()
             _require(face.controller.command.activation_count == baseline + 1, "Held expression repeated activation")
@@ -269,6 +335,36 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
             _require(
                 counts["finger_updates"] > counts_before["finger_updates"], "Finger updater stopped during locomotion"
             )
+            if action == "forward":
+                # An ordinary blink pauses the request. Holding the same mouth
+                # expression through reopening resumes it after confirmation,
+                # without requiring full facial neutral or counting a new action.
+                fixture["expression"] = {"JawDrop": 0.9, "EyesClosedL": 0.9, "EyesClosedR": 0.9}
+                await wait_sim(0.05)
+                entry["blink_paused"] = snapshot()
+                command = face.controller.command
+                _require(command.state == "blink_pause", "Held forward did not enter blink pause")
+                _require(command.target == "forward", "Blink pause discarded the held mouth target")
+                _require(not any(command.velocity), "Blink pause retained facial velocity")
+                _require(
+                    not any(float(value) for value in example._base_command), "Blink pause retained filtered intent"
+                )
+                _require(command.activation_count == baseline + 1, "Blink pause counted a new activation")
+                await wait_sim(0.25)
+                fixture["expression"] = "forward"
+                await wait_sim(0.05)
+                entry["blink_reconfirming"] = snapshot()
+                command = face.controller.command
+                _require(command.state == "confirming", "Open eyes did not reconfirm the held mouth expression")
+                _require(not any(command.velocity), "Blink recovery moved before confirmation")
+                await wait_sim(face.controller.config.confirm_s + 0.05)
+                entry["blink_resumed"] = snapshot()
+                command = face.controller.command
+                _require(command.busy and command.target == "forward", "Held forward did not resume after the blink")
+                _require(command.activation_count == baseline + 1, "Blink recovery counted a new forward activation")
+                if not preview:
+                    _require(command.velocity[0] > 0, "Blink recovery did not restore forward intent")
+                entry["blink_pause_resume_passed"] = True
             # The last translation exercises stale input while still holding.
             fixture["stale"] = action == "forward"
             if action != "forward":
