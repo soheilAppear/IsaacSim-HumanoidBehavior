@@ -672,6 +672,12 @@ movement during the wink did not trigger a sidestep, and 1,007 neutral samples s
 no command.
 XR was off during that recording, so this verifies the calibrated recognizer against
 the recorded facial signals rather than end-to-end headset locomotion.
+A later approved **30-second anchored XR preview** received **855/855 valid and
+ready samples**. It selected one right turn and maintained it across **263 observed
+samples spanning 8.45 seconds**, despite accompanying right-lip movement. The turn
+stopped when the opposite eye closed; 334 neutral-weight samples produced no
+selection. This is one live recognition check, not a repeatability result or a
+physical walking/box-carrying check.
 The separately reported unsolicited Isaac GUI exits remain unresolved; see the
 [recorded exit evidence](HUMANOID_VR_CONTROL.md#isaac-window-exits-unexpectedly).
 

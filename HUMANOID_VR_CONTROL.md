@@ -1035,6 +1035,21 @@ recorded right-side expressions, but this does not establish end-to-end XR locom
 or repeatable wearer performance. Further facial recording requires the wearer's
 agreement before collection.
 
+A later approved **30-second anchored XR preview** is stored locally as
+`output/right_face_calibration_20261112T045007Z.json`. All **855 records** were valid,
+XR-ready and had distinct sequences. The runtime selected one right turn at
+**9.208 seconds**; 263 consecutive observed samples retained that command through
+**17.657 seconds**, spanning **8.449 seconds**. Accompanying `MouthRight=1` did not
+select translation. Opposite-eye closure above the continuation limit stopped the
+turn at 17.691 seconds, and fully open eyes returned to idle at 17.799 seconds.
+All **334 neutral-weight samples** produced no preview command or activation.
+Right-lip selections at 24.984 and 25.983 seconds were separated by an actual signal
+interruption; brief intermediate pucker/left-lip signals did not select backward or
+left movement. This confirms one live recognition check in fixed-base preview,
+not repeatability, a false-activation rate or physical walking while handling boxes.
+The fixed-base mode was used because the live walking scene's motion guard had
+detected actual zero-command foot-supported drift before collection began.
+
 Before the recognition consistency fix, the **native Isaac anchored-preview check
 passed all six commands using simulated face input**, with the base remaining
 anchored. The rendered controls were also reviewed for readability. That preview run
