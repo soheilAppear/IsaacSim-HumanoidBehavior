@@ -275,6 +275,123 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.tick()
         self.assertEqual(self.controller.command.activation_count, 0)
 
+    def test_pending_winks_confirm_through_their_hold_band_after_activation_crossing(self) -> None:
+        for action, eye, peak, held, ticks in (
+            ("turn_left", "EyesClosedL", 0.46, 0.40, 4),
+            ("turn_right", "EyesClosedR", 0.31, 0.28, 10),
+        ):
+            with self.subTest(action=action):
+                self.setUp()
+                self.use_config(
+                    wink_threshold=0.45,
+                    release_threshold=0.35,
+                    right_wink_threshold=0.30,
+                    right_wink_release_threshold=0.20,
+                    right_wink_confirm_s=0.50,
+                )
+                self.neutral()
+                result = self.tick({eye: peak, "MouthRight": 1.0})
+                self.assertEqual(result.target, action)
+                self.assertEqual(result.activation_count, 0)
+                for _ in range(ticks - 1):
+                    result = self.tick({eye: held, "MouthRight": 1.0})
+                    self.assertEqual(result.state, "confirming")
+                    self.assertFalse(any(result.velocity))
+                result = self.tick({eye: held, "MouthRight": 1.0})
+                self.assertEqual(result.activated_action, action)
+                self.assertEqual(result.activation_count, 1)
+                self.assertEqual(result.velocity[:2], (0, 0))
+                self.assertEqual(result.velocity[2], self.config.yaw_speed * (1 if action == "turn_left" else -1))
+                for _ in range(20):
+                    result = self.tick({eye: held, "MouthRight": 1.0})
+                    self.assertEqual(result.activation_count, 1)
+                    self.assertIsNone(result.activated_action)
+
+    def test_pending_right_wink_requires_a_fresh_activation_crossing(self) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+        )
+        self.neutral()
+        for _ in range(20):
+            self.assertEqual(self.tick({"EyesClosedR": 0.28, "MouthRight": 1}).activation_count, 0)
+        self.tick({"EyesClosedR": 0.31, "MouthRight": 1}, fresh=False)
+        for _ in range(20):
+            result = self.tick({"EyesClosedR": 0.28, "MouthRight": 1})
+            self.assertEqual(result.activation_count, 0)
+            self.assertFalse(any(result.velocity))
+
+    def test_pending_right_wink_seed_is_cleared_by_release_conflict_and_tracking_failure(self) -> None:
+        interruptions = (
+            ({"EyesClosedR": 0.20}, {}),
+            ({"EyesClosedR": 0.28, "EyesClosedL": 0.151}, {}),
+            ({"EyesClosedR": 0.9, "EyesClosedL": 0.9}, {}),
+            ({"EyesClosedR": 0.28}, {"valid": False}),
+            ({"EyesClosedR": 0.28}, {"sample_changes": {"age_s": 0.251}}),
+            ({"EyesClosedR": 0.28}, {"enabled": False}),
+            ({"EyesClosedR": 0.28}, {"ready": False}),
+        )
+        for expression, arguments in interruptions:
+            with self.subTest(expression=expression, arguments=arguments):
+                self.setUp()
+                self.use_config(
+                    wink_threshold=0.45,
+                    release_threshold=0.35,
+                    right_wink_threshold=0.30,
+                    right_wink_release_threshold=0.20,
+                    right_wink_confirm_s=0.50,
+                )
+                self.neutral()
+                self.tick({"EyesClosedR": 0.31})
+                for _ in range(5):
+                    self.tick({"EyesClosedR": 0.28})
+                self.assertFalse(any(self.tick(expression, **arguments).velocity))
+                for _ in range(20):
+                    result = self.tick({"EyesClosedR": 0.28, "MouthRight": 1})
+                    self.assertEqual(result.activation_count, 0)
+                    self.assertFalse(any(result.velocity))
+                self.neutral()
+                self.tick({"EyesClosedR": 0.31})
+                for _ in range(10):
+                    result = self.tick({"EyesClosedR": 0.28})
+                self.assertEqual(result.activated_action, "turn_right")
+
+    def test_post_blink_pending_hysteresis_retains_the_longer_confirmation(self) -> None:
+        self.use_config(wink_threshold=0.45, release_threshold=0.35)
+        self.neutral()
+        self.tick({"EyesClosedL": 0.9, "EyesClosedR": 0.9})
+        self.tick({"EyesClosedL": 0.46})
+        for _ in range(9):
+            result = self.tick({"EyesClosedL": 0.40})
+            self.assertEqual(result.activation_count, 0)
+            self.assertFalse(any(result.velocity))
+        self.assertEqual(self.tick({"EyesClosedL": 0.40}).activated_action, "turn_left")
+
+    def test_pending_right_wink_in_hold_band_owns_intent_over_active_lips(self) -> None:
+        self.use_config(
+            wink_threshold=0.45,
+            release_threshold=0.35,
+            right_wink_threshold=0.30,
+            right_wink_release_threshold=0.20,
+            right_wink_confirm_s=0.50,
+        )
+        self.activate("strafe_right")
+        self.assertFalse(any(self.tick({"EyesClosedR": 0.31, "MouthRight": 1}).velocity))
+        for _ in range(9):
+            result = self.tick({"EyesClosedR": 0.28, "MouthRight": 1})
+            self.assertEqual(result.target, "turn_right")
+            self.assertFalse(any(result.velocity))
+        result = self.tick({"EyesClosedR": 0.28, "MouthRight": 1})
+        self.assertEqual(result.activated_action, "turn_right")
+        self.assertEqual(result.velocity, (0, 0, -self.config.yaw_speed))
+        for _ in range(15):
+            result = self.tick({"MouthRight": 1})
+            self.assertFalse(any(result.velocity))
+            self.assertEqual(result.activation_count, 2)
+
     def test_lower_right_activation_requires_clearly_open_left_eye(self) -> None:
         for mode in ("hold", "step"):
             for mouth in (0.0, 1.0):

@@ -632,6 +632,11 @@ between commands. If conflicting signals interrupt an already held expression,
 movement pauses. Keep that expression held and make it clear again to reconfirm
 and resume; switching to a different expression is unnecessary. True release
 cancels the held command, and invalid tracking still requires neutral recovery.
+Wink confirmation now tolerates a dip below its activation threshold after a fresh
+sample has started it, provided the winked eye stays above its release threshold.
+For the right eye these remain **0.30 activation / 0.20 release / 0.50 seconds**;
+the other eye must still pass the strict open-eye check during confirmation.
+Actual release, an opposite-eye conflict or invalid tracking restarts recognition.
 A deliberate wink takes priority over mouth
 movement that accompanies it. Closing both eyes pauses a held mouth command;
 reopening them while holding the same mouth expression resumes it after confirmation.
@@ -660,14 +665,15 @@ attempts began by closing both eyes, which the previous rule blocked. Per-expres
 thresholds are available in the
 [operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
 uses starter thresholds from the local Quest Pro preview observations. Recheck them
-after headset-fit changes. The current hold-recovery and facial-onset version passed
-**1,230 offline tests** after the facial-mode button visibility update, plus native
-physical checks for **all six facial commands**
+after headset-fit changes. The pending-wink confirmation update passed
+**1,235 offline tests** and native physical checks for **all six facial commands**
 at the 3× request profile with a **0.30-second attack**. Each direction paused on
 ambiguity and resumed the same held expression after confirmation. Arm and finger
-updaters each ran **10,904 times**. Translation stayed within the **3° held-end /
-6° sampled peak / 5 cm cross-track** limits; Forward measured **0.99° / 2.50° /
-3.42 cm**. The route used one-second holds and a 2.5-second backward hold (the
+updaters each ran **10,914 times**. The right-wink confirmation fixture passed;
+the right-turn route measured **0.943 radians** of right rotation. Translation
+stayed within the **3° held-end / 6° sampled peak / 5 cm cross-track** limits;
+Forward measured **1.73° / 2.96° / 3.06 cm**. The route used one-second holds and a
+2.5-second backward hold (the
 initial 1.5-second route was refused for insufficient lateral clearance beside the
 table; collision checks stayed enabled). These simulated-input checks do not
 establish a measured speed increase, repeatable wearer recognition, or box carrying.
@@ -689,6 +695,14 @@ samples spanning 8.45 seconds**, despite accompanying right-lip movement. The tu
 stopped when the opposite eye closed; 334 neutral-weight samples produced no
 selection. This is one live recognition check, not a repeatability result or a
 physical walking/box-carrying check.
+An approved **14 November** preview recording contained **1,723 valid observations
+out of 1,733** and two brief right-turn previews. The wearer did not hear its spoken
+cues, so the intended prompt windows cannot support calibration; no thresholds
+were changed from it. Replaying it with the confirmation fix produced the same
+events, so the reported right-turn issue is not established as resolved. Audio was
+subsequently confirmed audible, but the wearer deferred another recording.
+In the HUD, **HOLD R WINK** means confirmation, **RUNNING** means an active movement
+request, and **LAST TURN RIGHT** is history that can remain after movement stops.
 The separately reported unsolicited Isaac GUI exits remain unresolved; see the
 [recorded exit evidence](HUMANOID_VR_CONTROL.md#isaac-window-exits-unexpectedly).
 

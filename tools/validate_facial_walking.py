@@ -316,6 +316,14 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
             counts_before = dict(counts)
             baseline = face.controller.command.activation_count
             fixture["expression"] = action
+            if action == "turn_right":
+                # One fresh activation-level sample starts confirmation. The
+                # held eye can then settle below activation without being
+                # released; the other eye must still pass the strict open gate.
+                fixture["expression"] = {"EyesClosedR": 0.31, "EyesClosedL": 0.10, "MouthRight": 1.0}
+                await wait_sim(0.05)
+                _require(not any(face.controller.command.velocity), "Right wink moved before confirmation")
+                fixture["expression"] = {"EyesClosedR": 0.28, "EyesClosedL": 0.10, "MouthRight": 1.0}
             await wait_sim(face.controller._confirmation_for(action) + 0.05)
             _require(
                 face.controller.command.activation_count == baseline + 1, "Expression did not activate exactly once"
@@ -323,6 +331,7 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
             _require(face.controller.command.last_action == action, "Wrong facial action selected")
             entry["activated"] = snapshot()
             if action == "turn_right":
+                entry["pending_wink_hysteresis_passed"] = True
                 # Real Quest winks can move the mouth on the same side. This must
                 # not cancel an already qualified turn or select a sidestep.
                 fixture["expression"] = {"EyesClosedR": 0.9, "MouthRight": 1.0}

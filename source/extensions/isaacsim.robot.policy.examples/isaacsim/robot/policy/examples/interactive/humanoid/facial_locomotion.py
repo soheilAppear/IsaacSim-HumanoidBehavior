@@ -554,12 +554,15 @@ class FacialLocomotion:
         continuing: str | None = None,
         resuming: str | None = None,
     ) -> str | None:
-        """Select only a clear unilateral closure, independently of lower-face cross-talk."""
+        """Apply wink hysteresis after a fresh activation sample starts confirmation."""
         for action, closed, opened in (
             ("turn_left", "EyesClosedL", "EyesClosedR"),
             ("turn_right", "EyesClosedR", "EyesClosedL"),
         ):
-            established = action in (continuing, resuming)
+            # A fresh activation crossing seeds `_candidate`. Keep confirming
+            # while that eye stays above release, using the strict opposite-eye
+            # start gate until activation. Release/conflict clears the candidate.
+            established = action in (continuing, resuming, self._candidate)
             threshold = self._release_for(closed) if established else self._threshold_for(action)
             closed_enough = values[closed] > threshold if established else values[closed] >= threshold
             if closed_enough and values[opened] <= self._opposite_eye_limit(action, continuing=continuing == action):

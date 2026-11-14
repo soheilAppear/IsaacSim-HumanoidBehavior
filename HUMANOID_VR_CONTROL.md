@@ -855,6 +855,12 @@ jaw opening, 0.40 for puckering, 0.45 for left lips, and 0.55 for right lips**. 
 general release threshold is **0.35**; the right eye has its own **0.20** release.
 Right winks confirm for **0.50 seconds**. These starter values
 come from this headset's preview observations and need rechecking after fit changes.
+Once a fresh wink crosses its activation threshold and begins confirmation, its
+own eye can remain above the release threshold without restarting that interval.
+For the right eye, a **0.30** crossing may therefore continue confirming at a value
+above **0.20**. A release at or below 0.20, conflicting opposite-eye closure or
+invalid tracking cancels that confirmation. This does not lower the threshold for
+starting a new wink or shorten its **0.50-second** confirmation.
 The lowered independent right-wink threshold requires the left eye clearly open
 (closure at or below **0.15** by default) to start a turn. Once the turn is active,
 left-eye closure up to **0.20** with the launcher defaults is allowed as continuation hysteresis, avoiding
@@ -871,8 +877,15 @@ The in-headset status identifies what recognition needs:
 - **RELAX FACE**: open both eyes and relax your mouth for the initial or recovery
   neutral interval.
 - **HOLD L/R WINK**, **HOLD MOUTH**, **HOLD PUCKER**, or **HOLD L/R LIPS**: a specific
-  command is being confirmed. The usual interval is **0.18 seconds**; the calibrated
+  command is being confirmed; this label alone does not mean movement has started.
+  The usual interval is **0.18 seconds**; the calibrated
   right wink and either wink after both eyes close require **0.5 seconds**.
+- **RUNNING**: the controller is actively requesting movement; physical rotation
+  still depends on the walking actor and simulation advancing.
+- **LAST TURN RIGHT** (or another **LAST** command): the previous accepted command,
+  not proof that it is still active. This history can remain after tracking loss.
+- **OPEN L EYE** / **OPEN R EYE**: the opposite eye is blocking a retained right /
+  left wink. Clear that conflict to reconfirm the held wink.
 - **OPEN EYES**: eye closure blocks recognition. Reopen both eyes; if a mouth
   command was already active, keeping that expression resumes it after confirmation.
 - **NO FACE DATA**: usable face data is missing. The movement request is cleared; after tracking
@@ -1078,38 +1091,54 @@ do not reproduce the original live hand trajectory or the XR-to-arm mapping, so
 they neither explain the pause nor justify weakening its guard. That live balance
 issue remains unresolved; the heading and recognition checks above are narrower.
 
+An approved **14 November 2026** preview recording returned **1,723 valid observations
+out of 1,733** and two brief right-turn preview activations. The wearer reported not
+hearing the spoken cues, so the scheduled prompt windows do not reliably label the
+intended expressions and were not used to retune thresholds. Both right turns
+stopped when opposite left-eye closure exceeded the active **0.20** limit
+(**0.489** and **0.308**). Replay with the pending-wink confirmation fix produced
+the same events. This recording therefore does not establish that the reported
+right-turn problem is fixed: the opposite-eye conflict remains unresolved, while
+the confirmation fix addresses a separate reset of the wink timer. Audio was
+subsequently confirmed audible, but the wearer deferred another recording; no
+further calibration was collected.
+
 Before the recognition consistency fix, the **native Isaac anchored-preview check
 passed all six commands using simulated face input**, with the base remaining
 anchored. The rendered controls were also reviewed for readability. That preview run
 does not validate the revised recognition behavior.
 
-**Native physical validation passed all six actions at the 3× facial request profile
-with the new 0.30-second command attack**, using the real walking actor,
+**Native physical validation passed all six actions after the pending-wink confirmation
+update, at the 3× facial request profile with a 0.30-second command attack**, using
+the real walking actor,
 launcher-calibrated thresholds and simulated facial input. Every action paused on
 an injected ambiguous expression, then resumed that same held command after
 confirmation without requiring a direction switch. The run also passed wink/mouth
 overlap, continuation hysteresis, weak-wink rejection, sustained post-blink wink,
 forward blink/heading recovery, release, stale-input stopping and reset-disarming
-checks. Arm and finger updater methods each ran **10,904 times**; this establishes
+checks. The pending-wink fixture also passed: right-eye closure could fall below
+activation while staying above release without restarting confirmation. The right-turn
+route measured **−0.943 radians** of yaw. Arm and finger updater methods each ran
+**10,914 times**; this establishes
 execution alongside locomotion, not successful hand tracking or box carrying.
 The local report is
-`output/facial_hold_recovery_validation_short_route/face-move-20261112T062316Z-dbaea06b.json`.
+`output/right_wink_pending_native/face-move-20261114T225951Z-d04a4d7f.json`.
 
 The route used **1.0-second holds**, with **2.5 seconds backward** to obtain turning
 clearance. The initial 1.5-second route was refused for insufficient lateral
 clearance beside the table; the shorter route retained the collision checks.
-Forward traveled **0.305 m** and backward **0.948 m** during their selected holds.
+Forward traveled **0.308 m** and backward **0.958 m** during their selected holds.
 All translations passed the **3° held-end heading / 6° sampled peak heading / 5 cm
-cross-track** limits. Forward measured **+0.99° held-end / 2.50° peak / 3.42 cm**;
-backward measured **−1.44° / 2.96° / 4.38 cm**. Different route durations prevent a
+cross-track** limits. Forward measured **−1.73° held-end / 2.96° peak / 3.06 cm**;
+backward measured **−1.61° / 2.93° / 4.24 cm**. Different route durations prevent a
 controlled achieved-speed comparison with previous runs. These results establish
 bounded motion in this test, not zero drift, reliable wearer recognition or loaded
 performance. The unresolved live zero-command balance limitation remains unchanged.
 
-The complete offline suite passed **1,230 tests in 17.197 seconds** after the
-facial-mode button visibility update, including
+The complete offline suite passed **1,235 tests in 21.304 seconds** after the
+pending-wink confirmation update, including
 transport, expression recovery, source ownership, command-ramp behavior and real-USD
-HUD checks. No new facial recording was made for this update. The earlier wearer
+HUD checks. The native results above cover that same confirmation change. The earlier wearer
 preview confirmed visibility of the robot scene and FACE OFF control; live
 recognition repeatability and simultaneous box handling remain acceptance checks.
 The button visibility change was also checked in the rendered head-camera view
