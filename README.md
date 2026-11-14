@@ -447,6 +447,15 @@ Grip release holds the arm while trigger closure remains independent. Webcam inp
 does not substitute. Eye tracking must be enabled, calibrated and exposed by the
 VR runtime to select gaze buttons; a head-direction fallback cannot activate them.
 
+The panels now sit **0.45 m forward of the camera**, reduced from 1 m, with uniform
+scaling to preserve their angular size and spacing from the center eye. This puts
+them in front of more carried boxes while keeping the view center clear. To adjust
+their depth, set `$env:G1_GAZE_HUD_DISTANCE_M='0.45'` before launching; the supported
+range is **0.35–2 m**, using a finite value. The panels remain real, depth-tested
+geometry: an object in front of a panel can still hide it and block selection.
+After such an occlusion, look outside all buttons, then return to a visible button
+to rearm movement.
+
 After checking the preview, exit Isaac and relaunch for physical movement:
 
 ```powershell
@@ -644,11 +653,22 @@ The original translation heading is retained across these blink pauses. A calibr
 right wink starts only with the left eye clearly open (closure at most 0.15). Once
 active, it permits left-eye closure up to 0.20 so small tracking fluctuations do not
 interrupt the held turn; this extra margin cannot start a new turn.
-Starting a mouth command requires both eyes clearly open. If a partial wink occurs
-with mouth movement, the mouth must relax before it can select a separate command;
-reopening the eyes alone cannot turn that wink's mouth movement into a sidestep.
+Starting, switching, or resuming a mouth command requires both eyes clearly open
+(closure at most **0.15** with the launcher defaults). While the same mouth command
+is already active, small eyelid fluctuations up to **0.20** can continue it without
+reconfirmation. This margin is bounded by the configured eye-release thresholds;
+it cannot start a new command or resume a paused one. Larger closure pauses motion,
+clear winks retain priority, and bilateral blinks and invalid tracking still stop
+the movement request. If a partial wink occurs with a new mouth movement, the mouth
+must relax before it can select a separate command; reopening the eyes alone cannot
+turn that wink's mouth movement into a sidestep.
 Relaxing still requests a stop. Initial arming and tracking recovery require
 **0.25 seconds** of neutral face with both eyes open.
+
+While **FACE ON** owns locomotion, facial movement does not depend on where the
+gaze ray hits or its distance to a box. Gaze still operates the visible FACE toggle.
+The reported facial pause while looking at a nearby box has not been isolated in
+a wearer check; the bounded eye-noise fix addresses a reproduced synthetic case.
 
 See the [facial operator instructions](HUMANOID_VR_CONTROL.md#facial-expression-locomotion)
 for transport setup, tuning, arming, and verification. This is an experimental input
@@ -665,14 +685,15 @@ attempts began by closing both eyes, which the previous rule blocked. Per-expres
 thresholds are available in the
 [operator tuning guide](HUMANOID_VR_CONTROL.md#facial-tuning-and-checks); the launcher
 uses starter thresholds from the local Quest Pro preview observations. Recheck them
-after headset-fit changes. The pending-wink confirmation update passed
-**1,235 offline tests** and native physical checks for **all six facial commands**
+after headset-fit changes. The pending-wink, closer-HUD, and held-mouth eye-noise updates passed
+**1,247 offline tests** and native physical checks for **all six facial commands**
 at the 3× request profile with a **0.30-second attack**. Each direction paused on
 ambiguity and resumed the same held expression after confirmation. Arm and finger
-updaters each ran **10,914 times**. The right-wink confirmation fixture passed;
-the right-turn route measured **0.943 radians** of right rotation. Translation
+updaters each ran **10,914 times**. All four mouth movements continued with both eye
+closures at **0.16** after confirmation. The right-wink confirmation fixture passed;
+the right-turn route measured **0.946 radians** of right rotation. Translation
 stayed within the **3° held-end / 6° sampled peak / 5 cm cross-track** limits;
-Forward measured **1.73° / 2.96° / 3.06 cm**. The route used one-second holds and a
+Forward measured **1.48° / 3.02° / 3.27 cm**. The route used one-second holds and a
 2.5-second backward hold (the
 initial 1.5-second route was refused for insufficient lateral clearance beside the
 table; collision checks stayed enabled). These simulated-input checks do not

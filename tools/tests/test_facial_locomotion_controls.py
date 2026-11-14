@@ -454,6 +454,8 @@ class TestFacialLocomotionControls(unittest.TestCase):
             right_mouth_threshold=0.55,
         )
         self.activate("strafe_right")
+        result = self.tick({"MouthRight": 1.0, "EyesClosedL": 0.16, "EyesClosedR": 0.16})
+        self.assertEqual(result.velocity, (0, -self.config.lateral_speed, 0))
         wink = {"EyesClosedL": 0.14, "EyesClosedR": 0.31, "MouthRight": 1.0}
         for index in range(10):
             result = self.tick(wink)
@@ -844,7 +846,7 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.assertEqual(result.velocity, (0, -self.config.lateral_speed, 0))
 
     def test_partial_eye_closure_pauses_existing_mouth_and_reopens_without_new_event(self) -> None:
-        self.use_config(release_threshold=0.35)
+        self.use_config(release_threshold=0.35, right_wink_release_threshold=0.20)
         self.activate("strafe_right")
         for _ in range(8):
             result = self.tick({"MouthRight": 0.9, "EyesClosedL": 0.110, "EyesClosedR": 0.223})
@@ -857,6 +859,98 @@ class TestFacialLocomotionControls(unittest.TestCase):
         self.assertEqual(result.velocity, (0, -self.config.lateral_speed, 0))
         self.assertEqual(result.activation_count, 1)
         self.assertIsNone(result.activated_action)
+
+    def test_active_mouth_tolerates_small_eye_noise_without_reconfirmation(self) -> None:
+        for action in ("forward", "back", "strafe_left", "strafe_right"):
+            for eye_noise in ({"EyesClosedL": 0.16}, {"EyesClosedR": 0.16}, {"EyesClosedL": 0.20, "EyesClosedR": 0.20}):
+                with self.subTest(action=action, eye_noise=eye_noise):
+                    self.setUp()
+                    self.use_config(right_wink_release_threshold=0.20)
+                    active = self.activate(action)
+                    for _ in range(20):
+                        result = self.tick({**EXPRESSIONS[action], **eye_noise})
+                        self.assertEqual(result.state, "active")
+                        self.assertEqual(result.velocity, active.velocity)
+                        self.assertEqual(result.activation_count, 1)
+                        self.assertIsNone(result.activated_action)
+
+    def test_eye_noise_cannot_start_a_new_mouth_command(self) -> None:
+        for action in ("forward", "back", "strafe_left", "strafe_right"):
+            for eye in ("EyesClosedL", "EyesClosedR"):
+                with self.subTest(action=action, eye=eye):
+                    self.setUp()
+                    self.use_config(right_wink_release_threshold=0.20)
+                    self.neutral()
+                    for _ in range(20):
+                        result = self.tick({**EXPRESSIONS[action], eye: 0.16})
+                        self.assertEqual(result.velocity, (0, 0, 0))
+                        self.assertEqual(result.activation_count, 0)
+
+    def test_paused_mouth_requires_clear_eyes_again_before_resuming(self) -> None:
+        for eye in ("EyesClosedL", "EyesClosedR"):
+            with self.subTest(eye=eye):
+                self.setUp()
+                self.use_config(right_wink_release_threshold=0.20)
+                self.activate("forward")
+                result = self.tick({"JawDrop": 0.9, eye: 0.21})
+                self.assertEqual(result.state, "blink_pause")
+                self.assertTrue(result.stop_immediately)
+                self.assertEqual(result.velocity, (0, 0, 0))
+                for _ in range(10):
+                    self.assertEqual(self.tick({"JawDrop": 0.9, eye: 0.16}).velocity, (0, 0, 0))
+                for _ in range(4):
+                    self.assertEqual(self.tick({"JawDrop": 0.9, eye: 0.15}).velocity, (0, 0, 0))
+                result = self.tick({"JawDrop": 0.9, eye: 0.15})
+                self.assertGreater(result.velocity[0], 0)
+                self.assertEqual(result.activation_count, 1)
+                self.assertIsNone(result.activated_action)
+
+    def test_mouth_conflict_or_direction_change_cannot_inherit_active_eye_tolerance(self) -> None:
+        for conflict in (True, False):
+            with self.subTest(conflict=conflict):
+                self.setUp()
+                self.use_config(right_wink_release_threshold=0.20)
+                self.activate("forward")
+                expression = {"MouthRight": 0.9, "EyesClosedL": 0.16}
+                if conflict:
+                    expression["JawDrop"] = 0.9
+                for _ in range(10):
+                    result = self.tick(expression)
+                    self.assertEqual(result.velocity, (0, 0, 0))
+                    self.assertEqual(result.activation_count, 1)
+                for _ in range(10):
+                    result = self.tick({"JawDrop": 0.9, "EyesClosedL": 0.16})
+                    self.assertEqual(result.velocity, (0, 0, 0))
+                    self.assertEqual(result.activation_count, 1)
+
+    def test_active_eye_tolerance_never_tightens_configured_start_gate(self) -> None:
+        self.use_config(right_wink_release_threshold=0.10, eye_open_threshold=0.15)
+        self.neutral()
+        expression = {"JawDrop": 0.9, "EyesClosedL": 0.15, "EyesClosedR": 0.10}
+        for _ in range(5):
+            result = self.tick(expression)
+        self.assertEqual(result.activated_action, "forward")
+        for _ in range(10):
+            self.assertGreater(self.tick(expression).velocity[0], 0)
+        self.assertEqual(self.tick({**expression, "EyesClosedR": 0.101}).velocity, (0, 0, 0))
+
+    def test_active_mouth_eye_tolerance_still_stops_on_blink_or_tracking_loss(self) -> None:
+        for invalid in (True, False):
+            with self.subTest(invalid=invalid):
+                self.setUp()
+                self.use_config(right_wink_release_threshold=0.20)
+                self.activate("forward")
+                noise = {"JawDrop": 0.9, "EyesClosedL": 0.16, "EyesClosedR": 0.16}
+                self.assertGreater(self.tick(noise).velocity[0], 0)
+                result = (
+                    self.tick(noise, valid=False)
+                    if invalid
+                    else self.tick({"JawDrop": 0.9, "EyesClosedL": 0.9, "EyesClosedR": 0.9})
+                )
+                self.assertEqual(result.velocity, (0, 0, 0))
+                self.assertTrue(result.stop_immediately)
+                for _ in range(10):
+                    self.assertEqual(self.tick(noise).velocity, (0, 0, 0))
 
     def test_eye_open_gate_is_configurable_and_does_not_change_step_mode(self) -> None:
         expression = {"JawDrop": 0.9, "EyesClosedR": 0.12}

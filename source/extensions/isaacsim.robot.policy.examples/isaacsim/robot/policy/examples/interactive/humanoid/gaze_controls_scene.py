@@ -60,9 +60,11 @@ class GazeControlsScene:
         backwards_enabled: Whether Back can be selected; otherwise it remains visibly off.
         preview: Whether the heading and last-action feedback describe non-actuating preview.
         root_path: Dedicated absolute prim path owned by this helper.
+        display_distance_m: Camera-forward panel distance, from 0.35 to 2.0 meters.
+            Uniform scaling preserves the central-eye angular layout, including text and rings.
 
     Raises:
-        ValueError: The root path is not an absolute non-root prim path.
+        ValueError: The root path or display distance is invalid.
 
     Example:
 
@@ -81,7 +83,7 @@ class GazeControlsScene:
     }
     #: Camera-local centers, in meters, with forward/back on the left and turns on the right.
     DEPTH = 1.0
-    #: Positive distance ahead of the camera, in meters.
+    #: Canonical authoring depth; the root transform scales it to display_distance_m.
     HALF_WIDTH = 0.17
     HALF_HEIGHT = 0.155
     RING_SEGMENTS = 64
@@ -119,11 +121,23 @@ class GazeControlsScene:
     _ACTION_LABELS = {"forward": "FORWARD", "back": "BACK", "turn_left": "TURN LEFT", "turn_right": "TURN RIGHT"}
 
     def __init__(
-        self, *, backwards_enabled: bool = True, preview: bool = True, root_path: str = "/World/G1_GazeControls"
+        self,
+        *,
+        backwards_enabled: bool = True,
+        preview: bool = True,
+        root_path: str = "/World/G1_GazeControls",
+        display_distance_m: float = 1.0,
     ) -> None:
         path = Sdf.Path(root_path)
         if not path.IsAbsolutePath() or not path.IsPrimPath() or path == Sdf.Path.absoluteRootPath:
             raise ValueError("Gaze controls require an absolute non-root prim path")
+        try:
+            distance = float(display_distance_m)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Gaze display distance must be finite and between 0.35 and 2.0 meters") from error
+        if isinstance(display_distance_m, bool) or not math.isfinite(distance) or not 0.35 <= distance <= 2.0:
+            raise ValueError("Gaze display distance must be finite and between 0.35 and 2.0 meters")
+        self._display_distance_m = distance
         self.backwards_enabled = bool(backwards_enabled)
         self.preview = bool(preview)
         self.root_path = str(path)
@@ -145,6 +159,11 @@ class GazeControlsScene:
         self._last_feedback = None
         self._ring_counts = {}
         self._ring_materials = {}
+
+    @property
+    def display_distance_m(self) -> float:
+        """Return the configured camera-forward distance of the button plane."""
+        return self._display_distance_m
 
     def create(self, stage: Usd.Stage) -> None:
         """Author all nonphysical meshes and materials before updating their state.
@@ -287,7 +306,11 @@ class GazeControlsScene:
         self._last_feedback = ""
 
     def set_camera_pose(self, camera_pose: Gf.Matrix4d) -> None:
-        """Place visuals and cache the identical rigid transform for hit tests.
+        """Scale the complete HUD, then place it with the supplied rigid camera pose.
+
+        Cache the exact displayed transform, including scale, for hit testing.
+        Geometry stays authored at the canonical depth so panels, masks, labels
+        and progress rings remain aligned without rebuilding any prims.
 
         Args:
             camera_pose: Final camera-to-world matrix, including comfort/head rotation.
@@ -325,9 +348,10 @@ class GazeControlsScene:
                 or abs(pose[3][3] - 1) > 1e-8
             ):
                 raise ValueError("Camera transform must be rigid and affine")
-            if self._transform_op.Get() != pose:
-                self._transform_op.Set(pose)
-            self._camera_inverse = pose.GetInverse()
+            displayed_pose = Gf.Matrix4d().SetScale(self.display_distance_m / self.DEPTH) * pose
+            if self._transform_op.Get() != displayed_pose:
+                self._transform_op.Set(displayed_pose)
+            self._camera_inverse = displayed_pose.GetInverse()
             if visibility.Get() != UsdGeom.Tokens.inherited:
                 visibility.Set(UsdGeom.Tokens.inherited)
         except (TypeError, ValueError, RuntimeError) as error:
@@ -369,6 +393,9 @@ class GazeControlsScene:
             if max_distance is not None and (not math.isfinite(max_distance) or max_distance <= 0):
                 return None
             local_origin = self._camera_inverse.Transform(ray_origin)
+            # Normalize in world space only. Keeping the inverse-scale factor
+            # makes the intersection parameter a world-meter distance, matching
+            # the physics occlusion query even when the HUD is closer than 1 m.
             local_direction = self._camera_inverse.TransformDir(ray_direction / length)
             if local_direction[2] >= -1e-9:
                 return None

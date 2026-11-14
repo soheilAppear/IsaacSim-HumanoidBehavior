@@ -10,6 +10,8 @@ set "G1_LOCOMOTION_INPUT=gaze"
 set "G1_POINTING_NAVIGATION=0"
 REM Scale facial/gaze requests once inside the controller; joystick peaks stay unchanged.
 if not defined G1_TELEOP_SPEED_SCALE set "G1_TELEOP_SPEED_SCALE=3"
+REM Keep real stereo panels closer than typical carried boxes; nearer occluders still block selection.
+if not defined G1_GAZE_HUD_DISTANCE_M set "G1_GAZE_HUD_DISTANCE_M=0.45"
 if not defined G1_OPTICAL_HANDS_ONLY set "G1_OPTICAL_HANDS_ONLY=0"
 if not defined G1_GAZE_CONTROLLER_OVERRIDE set "G1_GAZE_CONTROLLER_OVERRIDE=1"
 set "G1_GAZE_PREVIEW=1"

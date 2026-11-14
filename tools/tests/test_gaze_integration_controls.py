@@ -128,6 +128,16 @@ class TestGazeIntegrationControls(unittest.TestCase):
         self.assertTrue(preview._controller_arm_control_enabled)
         self.assertTrue(preview._finger_control_enabled)
 
+    def test_hud_distance_reaches_scene_and_operator_status(self) -> None:
+        for configured in ("0.45", "0.75"):
+            with self.subTest(distance=configured):
+                example = self.make_example(G1_GAZE_HUD_DISTANCE_M=configured)
+                self.assertEqual(example._gaze_controls.display_distance_m, float(configured))
+                self.assertEqual(example.gaze_locomotion_status()["hud_distance_m"], float(configured))
+        for invalid in ("nan", "0.2", "2.1"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.make_example(G1_GAZE_HUD_DISTANCE_M=invalid)
+
     def test_gaze_desktop_camera_frames_side_controls_at_widescreen_aspect(self) -> None:
         stage = Usd.Stage.CreateInMemory()
         self.ex._prepare_robot_head_camera_mount = Mock()

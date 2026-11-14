@@ -30,7 +30,7 @@ class TestGazeControlsScene(unittest.TestCase):
         pose = Gf.Matrix4d(1) if pose is None else pose
         x, y = self.scene.BUTTON_CENTERS[button]
         origin = pose.Transform(Gf.Vec3d(eye_x, 0, 0))
-        target = pose.Transform(Gf.Vec3d(x, y, -self.scene.DEPTH))
+        target = pose.Transform(Gf.Vec3d(x, y, -self.scene.DEPTH) * (self.scene.display_distance_m / self.scene.DEPTH))
         return origin, target - origin
 
     def label(self, suffix: str = "Status") -> str:
@@ -126,6 +126,74 @@ class TestGazeControlsScene(unittest.TestCase):
         self.assertEqual(
             UsdGeom.XformCache().GetLocalToWorldTransform(self.stage.GetPrimAtPath(self.scene.root_path)), actual
         )
+
+    def test_display_distance_is_bounded_and_defaults_to_original_depth(self) -> None:
+        self.assertEqual(self.scene.display_distance_m, 1.0)
+        for distance in (0.35, 0.45, 1.0, 2.0):
+            self.assertEqual(SCENE.GazeControlsScene(display_distance_m=distance).display_distance_m, distance)
+        for distance in (None, True, "bad", math.nan, math.inf, -math.inf, 0, 0.349, 2.001):
+            with self.subTest(distance=distance):
+                with self.assertRaisesRegex(ValueError, "display distance"):
+                    SCENE.GazeControlsScene(display_distance_m=distance)
+
+    def test_scaled_display_preserves_angular_layout_and_rotated_stereo_hits(self) -> None:
+        pose = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1, 2, 3), 73))
+        pose.SetTranslateOnly(Gf.Vec3d(5, -2, 1.7))
+        for distance in (0.35, 0.45, 1.0, 2.0):
+            with self.subTest(distance=distance):
+                self.scene.cleanup()
+                self.scene = SCENE.GazeControlsScene(display_distance_m=distance)
+                self.scene.create(self.stage)
+                self.scene.set_camera_pose(pose)
+                cache = UsdGeom.XformCache()
+                root = self.stage.GetPrimAtPath(self.scene.root_path)
+                self.assertEqual(cache.GetLocalToWorldTransform(root), Gf.Matrix4d().SetScale(distance) * pose)
+                for button in self.scene.BUTTON_CENTERS:
+                    panel = UsdGeom.Mesh(self.stage.GetPrimAtPath(f"{self.scene.root_path}/{button}/Panel"))
+                    transform = cache.GetLocalToWorldTransform(panel.GetPrim())
+                    for point in panel.GetPointsAttr().Get():
+                        camera_point = pose.GetInverse().Transform(transform.Transform(Gf.Vec3d(point)))
+                        self.assertAlmostEqual(camera_point[2], -distance)
+                        self.assertAlmostEqual(camera_point[0] / -camera_point[2], point[0] / -point[2])
+                        self.assertAlmostEqual(camera_point[1] / -camera_point[2], point[1] / -point[2])
+                    for eye_x in (-0.032, 0, 0.032):
+                        self.assertEqual(self.scene.hit_test(*self.ray(button, pose, eye_x)), button)
+                origin = pose.Transform(Gf.Vec3d(0))
+                direction = pose.TransformDir(Gf.Vec3d(0, 0, -1))
+                self.assertIsNone(self.scene.hit_test(origin, direction))
+
+    def test_near_display_keeps_occlusion_distances_in_world_meters(self) -> None:
+        self.scene.cleanup()
+        self.scene = SCENE.GazeControlsScene(display_distance_m=0.45)
+        self.scene.create(self.stage)
+        pose = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1, 2, 3), 73))
+        pose.SetTranslateOnly(Gf.Vec3d(5, -2, 1.7))
+        self.scene.set_camera_pose(pose)
+        for button in self.scene.BUTTON_CENTERS:
+            for eye_x in (-0.032, 0, 0.032):
+                with self.subTest(button=button, eye_x=eye_x):
+                    origin, direction = self.ray(button, pose, eye_x)
+                    self.assertIsNone(self.scene.hit_test(origin, direction * 9, max_distance=0.2))
+                    self.assertEqual(self.scene.hit_test(origin, direction * 9, max_distance=0.6), button)
+                    world_distance = direction.GetLength()
+                    self.assertIsNone(self.scene.hit_test(origin, direction, world_distance - 0.001))
+                    self.assertEqual(self.scene.hit_test(origin, direction, world_distance + 0.001), button)
+
+    def test_near_display_masks_inactive_labels_behind_camera(self) -> None:
+        self.scene.cleanup()
+        self.scene = SCENE.GazeControlsScene(display_distance_m=0.45)
+        self.scene.create(self.stage)
+        pose = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 1, 0), 50))
+        pose.SetTranslateOnly(Gf.Vec3d(5, -2, 1.7))
+        self.scene.set_camera_pose(pose)
+        self.scene.update({"state": "active", "target": "forward", "last_action": "forward"})
+        cache = UsdGeom.XformCache()
+        for suffix in ("Status/active", "Status/idle", "FeedbackAction/forward", "FeedbackAction/back"):
+            prim = self.stage.GetPrimAtPath(f"{self.scene.root_path}/{suffix}")
+            self.assert_mask_translation(prim)
+            point = UsdGeom.Mesh(prim).GetPointsAttr().Get()[0]
+            camera_point = pose.GetInverse().Transform(cache.GetLocalToWorldTransform(prim).Transform(Gf.Vec3d(point)))
+            self.assertLess(camera_point[2], -0.3) if self.is_drawn(prim) else self.assertGreater(camera_point[2], 0)
 
     def test_camera_pose_only_authors_changed_transform_or_visibility(self) -> None:
         self.scene.update({"state": "idle"})

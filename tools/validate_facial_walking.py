@@ -353,10 +353,17 @@ async def _validate(example: object, report: dict, output: Path, run_id: str) ->
                 _require(command.activation_count == baseline + 1, "Opposite-eye noise repeated turn activation")
                 fixture["expression"] = {"EyesClosedR": 0.9, "MouthRight": 1.0}
                 entry["right_wink_hysteresis_passed"] = True
+            elif not action.startswith("turn"):
+                # Keep the same already-qualified mouth hold while both eye
+                # channels fluctuate just above the strict starting gate. This
+                # must preserve intent, heading, and the single activation.
+                fixture["expression"] = dict(EXPRESSIONS[action], EyesClosedL=0.16, EyesClosedR=0.16)
             await wait_sim(duration)
             entry["held"] = snapshot()
             _require(face.controller.command.activation_count == baseline + 1, "Held expression repeated activation")
             _require(face.controller.command.busy, "Held expression stopped before release")
+            if not action.startswith("turn"):
+                entry["held_mouth_eye_hysteresis_passed"] = True
             _require(counts["arm_updates"] > counts_before["arm_updates"], "Arm updater stopped during locomotion")
             _require(
                 counts["finger_updates"] > counts_before["finger_updates"], "Finger updater stopped during locomotion"

@@ -32,7 +32,7 @@ class TestFacialSceneControls(unittest.TestCase):
         pose = Gf.Matrix4d(1) if pose is None else pose
         x, y = self.scene.FACE_CENTER if button is None else self.scene.BUTTON_CENTERS[button]
         origin = pose.Transform(Gf.Vec3d(eye_x, 0, 0))
-        target = pose.Transform(Gf.Vec3d(x, y, -self.scene.DEPTH))
+        target = pose.Transform(Gf.Vec3d(x, y, -self.scene.DEPTH) * (self.scene.display_distance_m / self.scene.DEPTH))
         return origin, target - origin
 
     def is_drawn(self, suffix: str) -> bool:
@@ -105,6 +105,42 @@ class TestFacialSceneControls(unittest.TestCase):
         self.assertFalse(self.scene.hit_test_face_toggle((0, 0, 0), (0, 0, -1)))
         self.assertTrue(self.scene.hit_test_face_toggle(*self.ray()))
         self.assertIsNone(self.scene.hit_test(*self.ray()))
+
+    def test_near_facial_hud_preserves_stereo_occlusion_and_button_masks(self) -> None:
+        self.scene.cleanup()
+        self.scene = FACE.FacialControlsScene(display_distance_m=0.45)
+        self.scene.create(self.stage)
+        pose = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1, 2, 3), 73))
+        pose.SetTranslateOnly(Gf.Vec3d(5, -2, 1.7))
+        self.scene.set_camera_pose(pose)
+        for enabled in (True, False):
+            self.scene.update_face_toggle(enabled, 0.5)
+            cache = UsdGeom.XformCache()
+            for eye_x in (-0.032, 0, 0.032):
+                origin, direction = self.ray(eye_x=eye_x, pose=pose)
+                self.assertFalse(self.scene.hit_test_face_toggle(origin, direction * 9, max_distance=0.2))
+                self.assertTrue(self.scene.hit_test_face_toggle(origin, direction * 9, max_distance=0.6))
+                world_distance = direction.GetLength()
+                self.assertFalse(self.scene.hit_test_face_toggle(origin, direction, world_distance - 0.001))
+                self.assertTrue(self.scene.hit_test_face_toggle(origin, direction, world_distance + 0.001))
+                for button in self.scene.BUTTON_CENTERS:
+                    self.assertEqual(
+                        self.scene.hit_test(*self.ray(button=button, pose=pose, eye_x=eye_x), max_distance=0.6),
+                        None if enabled else button,
+                    )
+            for button in self.scene.BUTTON_CENTERS:
+                group = self.stage.GetPrimAtPath(f"{self.scene.root_path}/{button}")
+                for prim in group.GetChildren():
+                    self.assertEqual(
+                        UsdGeom.Imageable(prim).ComputeVisibility(),
+                        UsdGeom.Tokens.invisible if enabled else UsdGeom.Tokens.inherited,
+                    )
+                    point = UsdGeom.Mesh(prim).GetPointsAttr().Get()[0]
+                    camera_point = pose.GetInverse().Transform(
+                        cache.GetLocalToWorldTransform(prim).Transform(Gf.Vec3d(point))
+                    )
+                    self.assertGreater(camera_point[2], 0) if enabled else self.assertLess(camera_point[2], -0.3)
+            self.assertTrue(self.is_drawn("face_on" if enabled else "face_off"))
 
     def test_occluder_distance_is_world_space_and_equal_depth_is_occluded(self) -> None:
         for eye_x in (-0.032, 0.032):

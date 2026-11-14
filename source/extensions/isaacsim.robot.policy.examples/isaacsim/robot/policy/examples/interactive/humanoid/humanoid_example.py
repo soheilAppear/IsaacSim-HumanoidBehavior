@@ -281,9 +281,13 @@ class HumanoidExample(BaseSample):
             and stop_feedback in ("1", "true", "yes", "on")
         )
         self._walking_stop_regulator = WalkingStopRegulator()
+        # Keep the stereo controls in front of a normally carried box while
+        # retaining their angular layout and actual geometry-based hit tests.
+        self._gaze_hud_distance_m = float(os.environ.get("G1_GAZE_HUD_DISTANCE_M", "0.45"))
         self._gaze_controls = (FacialControlsScene if self._face_feature_enabled else GazeControlsScene)(
             backwards_enabled=self._gaze_locomotion.config.backward_speed > 0.0,
             preview=self._gaze_locomotion.config.preview,
+            display_distance_m=self._gaze_hud_distance_m,
         )
         self._facial_input = FacialLocomotionIntegration(self) if self._face_feature_enabled else None
         self._gaze_eye_valid = False
@@ -8498,6 +8502,7 @@ class HumanoidExample(BaseSample):
             "stop_feedback": self._walking_stop_regulator.status,
             "last_motion_fault": deepcopy(getattr(self, "_last_walking_fault_snapshot", None)),
             "dwell_s": config.dwell_s,
+            "hud_distance_m": self._gaze_hud_distance_m,
             "forward_speed": config.forward_speed,
             "backward_speed": config.backward_speed,
             "yaw_speed": config.yaw_speed,

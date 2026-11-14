@@ -496,6 +496,16 @@ gaze visualization/recording fallback, but it cannot select a locomotion button.
    anchor changes the robot topology: do not try to turn preview into movement
    by toggling an attribute in a running scene.
 
+The side panels sit **0.45 m forward of the camera**, reduced from the previous
+1 m. Their geometry is uniformly scaled with depth to preserve the angular button
+size, spacing, and clear center from the center eye. This reduces obstruction by
+boxes farther from the eyes than the panels. It does not make the controls visible
+through objects: depth testing and gaze-ray occlusion remain active. An object
+in front of a panel can still hide it and block selection. After that happens,
+look outside all buttons and return to an unobstructed button to rearm movement.
+Set `$env:G1_GAZE_HUD_DISTANCE_M='0.45'` before launching to change the depth; it must
+be a finite value in **0.35–2 m**. The facial launcher uses the same setting.
+
 When gaze owns movement, the default **hold** mode starts on the first valid button sample after arming,
 without a fixation timer, and continues only while
 you keep looking at the selected button. Looking directly at another valid,
@@ -586,6 +596,7 @@ an explicit `step` override. Supply settings in the environment before starting 
 | `G1_GAZE_CONTROLLER_OVERRIDE` | `1` | Allow tracked controller sticks to override gaze; `0` keeps eye-only locomotion |
 | `G1_OPTICAL_HANDS_ONLY` | `0` | Allow controller grip/trigger fallback for manipulation; `1` requires optical hands |
 | `G1_GAZE_DWELL_S` | `0` in hold; `0.7` in step | Activation delay in wall seconds; zero activates on the first valid button hit |
+| `G1_GAZE_HUD_DISTANCE_M` | `0.45` | Panel depth forward of the camera, in meters; finite range 0.35–2; angular layout scales with depth |
 | `G1_GAZE_DISTANCE_M` | `0.20` | Step mode only: requested forward/backward distance, in meters |
 | `G1_GAZE_TURN_DEG` | `10` | Step mode only: requested turn angle, in degrees |
 | `G1_TELEOP_SPEED_SCALE` | `3` in gaze/facial launchers | Multiply face/gaze baseline speeds once; range 1–3; direct code default is 1 |
@@ -840,14 +851,24 @@ command. The original translation heading survives same-command blink pauses ins
 of resetting to the robot's yaw after each blink. A long uneven blink or squint may still resemble a deliberate wink, so
 recognition needs testing with the individual wearer.
 
-Starting a mouth command requires both eye-closure weights at or below **0.15**,
-which is stricter than the general expression-release threshold. A partial eye
-closure with mouth movement blocks new mouth commands until the mouth relaxes;
-reopening the eyes while keeping the mouth displaced does not select a sidestep.
-This catches weak winks whose mouth motion is stronger than their eye signal.
-It does not turn a weak wink into a recognized turn. An already active mouth
-command retains the blink pause/resume behavior described above.
-The same clear-eye threshold applies to initial hold-mode arming and blink recovery.
+Starting, switching, or resuming a mouth command requires both eye-closure weights
+at or below **0.15** with the launcher defaults. Once the same mouth command is
+active, small eyelid fluctuations up to **0.20** can continue it without stopping
+and reconfirming. The continuation band uses the more conservative eye-release
+threshold, capped by each eye's own release limit, and never tightens the configured
+start gate. With this headset's calibration, both eyes therefore have the same
+**0.20** continuation limit. Larger closure pauses movement; resuming again requires
+both eyes at or below **0.15** and the usual confirmation. A different or conflicting
+mouth expression cannot inherit the wider active-command band. Clear winks take
+priority, both-eye blinks request zero movement, and invalid tracking still stops
+motion and requires neutral recovery.
+
+A partial eye closure with a new mouth movement blocks new mouth commands until
+the mouth relaxes; reopening the eyes while keeping the mouth displaced does not
+select a sidestep. This catches weak winks whose mouth motion is stronger than their
+eye signal. It does not turn a weak wink into a recognized turn. An already active
+mouth command retains the blink pause/resume behavior described above. The strict
+clear-eye threshold also applies to initial hold-mode arming and blink recovery.
 
 The launcher starts with individual
 activation thresholds of **0.45 for the left wink, 0.30 for the right wink, 0.45 for
@@ -898,6 +919,13 @@ The FACE toggle, status and command feedback remain visible so you can switch ba
 The gaze data and hand/arm control continue independently. Switch **FACE OFF** to
 restore the four buttons and gaze-button movement. A deliberate controller-stick
 override cancels/disarms facial control and uses the existing joystick handling.
+Facial movement itself does not use the gaze ray's hit position or distance to a
+box; gaze still selects the visible FACE toggle. An occluded toggle cannot switch
+facial control off. The reported **FACE ON** pause while looking at a nearby box
+has not been isolated with the wearer. The eye-noise change above fixes a synthetic
+threshold-crossing reproduction; it does not establish that the same cause explains
+that report. No new face-data recording was collected for this report because the
+wearer declined.
 Pause, Stop, Reset, or an interrupted tracking/session requires the appropriate
 rearming sequence. Existing articulation, fall, and unintended-motion guards remain
 active.
@@ -958,7 +986,7 @@ exposes the heading target, measured error and requested correction;
 | `G1_FACE_PUCKER_THRESHOLD` | `0.40` | Backward bilateral lip puckering |
 | `G1_FACE_MOUTH_SIDE_THRESHOLD` | `0.45` | Left/right mouth movement |
 | `G1_FACE_RELEASE_THRESHOLD` | `0.35` | Shared release threshold; right-eye closure uses its separate override |
-| `G1_FACE_EYE_OPEN_THRESHOLD` | `0.15` | Maximum closure on each eye for hold-mode arming, mouth authorization, and blink recovery |
+| `G1_FACE_EYE_OPEN_THRESHOLD` | `0.15` | Maximum closure per eye for arming and starting/switching/resuming mouth commands; active same-mouth holds use bounded release-band tolerance |
 | `G1_FACE_CONFIRM_S` | `0.18` | Required deliberate-expression confirmation time in seconds |
 | `G1_FACE_POST_BLINK_WINK_CONFIRM_S` | `0.5` | Continuous unilateral wink confirmation after both eyes closed; hold mode only |
 | `G1_FACE_NEUTRAL_S` | `0.25` | Neutral interval for initial arming/tracking recovery; also required between gestures in optional step mode |
@@ -1135,15 +1163,30 @@ controlled achieved-speed comparison with previous runs. These results establish
 bounded motion in this test, not zero drift, reliable wearer recognition or loaded
 performance. The unresolved live zero-command balance limitation remains unchanged.
 
-The complete offline suite passed **1,235 tests in 21.304 seconds** after the
-pending-wink confirmation update, including
-transport, expression recovery, source ownership, command-ramp behavior and real-USD
-HUD checks. The native results above cover that same confirmation change. The earlier wearer
+The complete offline suite passed **1,247 tests in 20.694 seconds** after the
+pending-wink, closer-HUD, and held-mouth eye-noise updates, including transport,
+expression recovery, source ownership, command-ramp behavior and real-USD HUD checks.
+A second native run passed all six actions with the same route and speed profile.
+All four confirmed mouth actions continued with both eye closures at **0.16**;
+ambiguity, blink/recovery, release, stale-input and wink-priority checks still passed.
+Arm/finger updaters each ran **10,914 times**. Forward measured **0.301 m** with
+**1.48° held-end / 3.02° peak / 3.27 cm cross-track**; right rotation measured
+**0.946 radians**. This validates synthetic input through the real controller and
+physics, not a loaded box or wearer tracking. The earlier wearer
 preview confirmed visibility of the robot scene and FACE OFF control; live
 recognition repeatability and simultaneous box handling remain acceptance checks.
 The button visibility change was also checked in the rendered head-camera view
 with physics paused: FACE ON hid all four button groups, FACE OFF restored them,
 and the separate toggle remained visible and selectable throughout.
+
+The **0.45 m HUD** also passed a paused native render check with a synthetic box:
+panels stayed visible in front of its **0.6 m** plane from both **±32 mm** eye offsets;
+a **0.2 m** plane hid them. Hit tests agreed using analytic front-face distances
+for that known box. These distances were test fixtures, not live eye/PhysX samples.
+FACE ON hid the four direction controls and FACE OFF restored them. Captures were
+visually reviewed and temporary test geometry removed. Real headset depth comfort,
+eye-ray alignment while carrying, and the reported FACE ON interruption still need
+a wearer check; no new facial data was recorded.
 
 Reproduce native validation with the installed Isaac Python wrapper, using separate
 processes for preview and physical movement. The scripts close their owned simulator.

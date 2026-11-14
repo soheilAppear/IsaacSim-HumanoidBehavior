@@ -69,7 +69,7 @@ class FacialLocomotionConfig:
         mouth_side_threshold: Optional left/right mouth activation threshold; None uses the shared threshold.
         right_mouth_threshold: Optional right-mouth activation override; None uses mouth_side_threshold.
         release_threshold: Maximum weight permitted in neutral and unused channels.
-        eye_open_threshold: Maximum closure per eye for hold-mode mouth motion; independent of wink detection.
+        eye_open_threshold: Maximum eye closure to start/resume mouth motion; active holds tolerate release-band noise.
         confirm_s: Sustained wall-time confirmation on distinct input samples.
         post_blink_wink_confirm_s: Longer hold confirmation for a unilateral wink following a bilateral blink.
         neutral_s: Sustained neutral interval required before a new gesture.
@@ -407,6 +407,17 @@ class FacialLocomotion:
             for name in ("EyesClosedL", "EyesClosedR")
         )
 
+    def _eyes_allow_held_mouth(self, values: dict[str, float]) -> bool:
+        """Tolerate small eyelid noise only during the same already-active mouth hold.
+
+        Use the more conservative eye release band for both eyes, capped by each
+        eye's own release. Never tighten the configured start gate. Starting a
+        different command or resuming after a pause still requires clear eyes.
+        """
+        names = ("EyesClosedL", "EyesClosedR")
+        common_limit = max(self.config.eye_open_threshold, min(self._release_for(name) for name in names))
+        return all(values[name] <= min(common_limit, self._release_for(name)) for name in names)
+
     def _classify(self, values: dict[str, float]) -> tuple[str | None, bool]:
         """Return one unambiguous gesture or neutral, blocking all partial conflicts."""
         low = self.config.release_threshold
@@ -665,6 +676,8 @@ class FacialLocomotion:
             desired = wink
             if self._action in ("turn_left", "turn_right"):
                 self._mouth_armed = mouth_neutral
+        elif self._action is not None and mouth == self._action and self._eyes_allow_held_mouth(values):
+            desired = mouth
         elif eyes_open and (self._mouth_armed or (preserve_mouth and mouth == current)):
             desired = mouth
         else:
